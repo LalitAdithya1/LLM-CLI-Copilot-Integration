@@ -1,4 +1,3 @@
-
 cmake_minimum_required(VERSION 3.15)
 
 # Silence the FetchContent timestamp policy warning
@@ -14,6 +13,12 @@ project(CodingCLI
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# --------------------------------------------------
+# Find required libraries
+# --------------------------------------------------
+find_package(CURL REQUIRED)
+find_package(nlohmann_json REQUIRED)
 
 # --------------------------------------------------
 # Fetch GoogleTest automatically
@@ -38,11 +43,19 @@ add_executable(codeagent
     src/CLIController.cpp
     src/FileManager.cpp
     src/PromptBuilder.cpp
+    src/LLMClient.cpp
+    src/EnvLoader.cpp
 )
 
 target_include_directories(codeagent
     PRIVATE
         ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(codeagent
+    PRIVATE
+        CURL::libcurl
+        nlohmann_json::nlohmann_json
 )
 
 # --------------------------------------------------
@@ -82,12 +95,34 @@ target_link_libraries(PromptBuilderTest
 )
 
 # --------------------------------------------------
+# LLMClient tests
+# --------------------------------------------------
+add_executable(LLMClientTest
+    tests/LLMClientTest.cpp
+    src/LLMClient.cpp
+    src/EnvLoader.cpp
+)
+
+target_include_directories(LLMClientTest
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(LLMClientTest
+    PRIVATE
+        GTest::gtest_main
+        CURL::libcurl
+        nlohmann_json::nlohmann_json
+)
+
+# --------------------------------------------------
 # Test discovery
 # --------------------------------------------------
 include(GoogleTest)
 
 gtest_discover_tests(FileManagerTest)
 gtest_discover_tests(PromptBuilderTest)
+gtest_discover_tests(LLMClientTest)
 
 # --------------------------------------------------
 # Compiler warnings
@@ -96,6 +131,7 @@ if(MSVC)
     target_compile_options(codeagent PRIVATE /W4)
     target_compile_options(FileManagerTest PRIVATE /W4)
     target_compile_options(PromptBuilderTest PRIVATE /W4)
+    target_compile_options(LLMClientTest PRIVATE /W4)
 else()
     target_compile_options(codeagent PRIVATE
         -Wall -Wextra -Wpedantic
@@ -106,6 +142,10 @@ else()
     )
 
     target_compile_options(PromptBuilderTest PRIVATE
+        -Wall -Wextra -Wpedantic
+    )
+
+    target_compile_options(LLMClientTest PRIVATE
         -Wall -Wextra -Wpedantic
     )
 endif()

@@ -1,6 +1,7 @@
 # CMake build files
 build
 .codeagent
+.env
 
 # Compiled files
 *.o
