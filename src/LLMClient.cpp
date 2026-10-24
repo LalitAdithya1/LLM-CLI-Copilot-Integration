@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "EnvLoader.hpp"
+#include "ResponseParser.hpp"
 
 namespace {
 
@@ -231,87 +232,40 @@ bool LLMClient::generateContent(
         return false;
     }
 
+    ResponseParser parser;
+    const ParsedResponse parsedResponse =
+        parser.parseResponse(responseBody);
+
     if (httpStatus < 200 || httpStatus >= 300) {
         std::cerr
             << "Gemini HTTP status: "
             << httpStatus << '\n';
 
-        try {
-            const json errorResponse = json::parse(responseBody);
-
-            if (errorResponse.contains("error") &&
-                errorResponse["error"].is_object() &&
-                errorResponse["error"].contains("message") &&
-                errorResponse["error"]["message"].is_string()) {
-                std::cerr
-                    << "Gemini error: "
-                    << errorResponse["error"]["message"]
-                           .get<std::string>()
-                    << '\n';
-            } else {
-                std::cerr
-                    << "Gemini returned an error response "
-                    << "without a readable message.\n";
-            }
-        } catch (const json::exception&) {
+        if (parsedResponse.error == ResponseParseError::ProviderError) {
+            std::cerr
+                << "Gemini error: "
+                << parsedResponse.errorMessage << '\n';
+        } else if (parsedResponse.error ==
+                   ResponseParseError::MalformedJson) {
             std::cerr
                 << "Gemini returned a non-JSON error response.\n";
+        } else {
+            std::cerr
+                << "Gemini returned an error response "
+                << "without a readable message.\n";
         }
 
         return false;
     }
 
-    try {
-        const json result = json::parse(responseBody);
-
-        if (!result.contains("candidates") ||
-            !result["candidates"].is_array() ||
-            result["candidates"].empty()) {
-            std::cerr
-                << "Error: Gemini response contains no candidates.\n";
-            return false;
-        }
-
-        const json& candidate = result["candidates"][0];
-
-        if (!candidate.contains("content") ||
-            !candidate["content"].is_object()) {
-            std::cerr
-                << "Error: Gemini response has no valid content.\n";
-            return false;
-        }
-
-        const json& content = candidate["content"];
-
-        if (!content.contains("parts") ||
-            !content["parts"].is_array()) {
-            std::cerr
-                << "Error: Gemini response contains no content parts.\n";
-            return false;
-        }
-
-        std::string generatedText;
-
-        for (const auto& part : content["parts"]) {
-            if (part.is_object() &&
-                part.contains("text") &&
-                part["text"].is_string()) {
-                generatedText +=
-                    part["text"].get<std::string>();
-            }
-        }
-
-        if (isWhitespaceOnly(generatedText)) {
-            std::cerr
-                << "Error: Gemini returned no generated text.\n";
-            return false;
-        }
-
-        response = std::move(generatedText);
-        return true;
-    } catch (const json::exception&) {
+    if (!parsedResponse.succeeded()) {
         std::cerr
-            << "Error: Failed to parse Gemini's JSON response.\n";
+            << "Error: "
+            << parsedResponse.errorMessage
+            << '\n';
         return false;
     }
+
+    response = parsedResponse.generatedText;
+    return true;
 }

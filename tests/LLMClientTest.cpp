@@ -254,6 +254,35 @@ TEST_F(LLMClientTest, RejectsResponseWithoutGeneratedText) {
     EXPECT_TRUE(response.empty());
 }
 
+TEST_F(LLMClientTest, RejectsPartialOutputAndLeavesResponseEmpty) {
+    LLMClient client(
+        [](
+            const std::string&,
+            const std::string&,
+            const std::string&,
+            std::string& responseBody,
+            long& httpStatus
+        ) {
+            responseBody = R"({
+                "candidates": [{
+                    "finishReason": "MAX_TOKENS",
+                    "content": {
+                        "parts": [{"text": "partial generated text"}]
+                    }
+                }]
+            })";
+
+            httpStatus = 200;
+            return true;
+        }
+    );
+
+    response = "old response";
+
+    EXPECT_FALSE(client.generateContent("Generate code", response));
+    EXPECT_TRUE(response.empty());
+}
+
 TEST_F(LLMClientTest, SupportsCustomModel) {
     LLMClient client(
         [](

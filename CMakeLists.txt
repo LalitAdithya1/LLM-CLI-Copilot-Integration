@@ -43,6 +43,7 @@ add_executable(codeagent
     src/CLIController.cpp
     src/FileManager.cpp
     src/PromptBuilder.cpp
+    src/ResponseParser.cpp
     src/LLMClient.cpp
     src/EnvLoader.cpp
 )
@@ -100,6 +101,7 @@ target_link_libraries(PromptBuilderTest
 add_executable(LLMClientTest
     tests/LLMClientTest.cpp
     src/LLMClient.cpp
+    src/ResponseParser.cpp
     src/EnvLoader.cpp
 )
 
@@ -116,6 +118,25 @@ target_link_libraries(LLMClientTest
 )
 
 # --------------------------------------------------
+# ResponseParser tests
+# --------------------------------------------------
+add_executable(ResponseParserTest
+    tests/ResponseParserTest.cpp
+    src/ResponseParser.cpp
+)
+
+target_include_directories(ResponseParserTest
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(ResponseParserTest
+    PRIVATE
+        GTest::gtest_main
+        nlohmann_json::nlohmann_json
+)
+
+# --------------------------------------------------
 # Test discovery
 # --------------------------------------------------
 include(GoogleTest)
@@ -123,6 +144,7 @@ include(GoogleTest)
 gtest_discover_tests(FileManagerTest)
 gtest_discover_tests(PromptBuilderTest)
 gtest_discover_tests(LLMClientTest)
+gtest_discover_tests(ResponseParserTest)
 
 # --------------------------------------------------
 # Compiler warnings
@@ -132,6 +154,7 @@ if(MSVC)
     target_compile_options(FileManagerTest PRIVATE /W4)
     target_compile_options(PromptBuilderTest PRIVATE /W4)
     target_compile_options(LLMClientTest PRIVATE /W4)
+    target_compile_options(ResponseParserTest PRIVATE /W4)
 else()
     target_compile_options(codeagent PRIVATE
         -Wall -Wextra -Wpedantic
@@ -146,6 +169,10 @@ else()
     )
 
     target_compile_options(LLMClientTest PRIVATE
+        -Wall -Wextra -Wpedantic
+    )
+
+    target_compile_options(ResponseParserTest PRIVATE
         -Wall -Wextra -Wpedantic
     )
 endif()
