@@ -40,6 +40,15 @@ TEST_F(FileManagerTestFixture, NonExistentFileValidation) {
     EXPECT_FALSE(manager.isValidSourceFile(missing));
 }
 
+TEST_F(FileManagerTestFixture, FailedReadClearsOutput) {
+    FileManager manager;
+    std::string content = "old contents";
+    std::filesystem::path missing = testDir / "missing_file.cpp";
+
+    EXPECT_FALSE(manager.readFile(missing, content));
+    EXPECT_TRUE(content.empty());
+}
+
 // 3. Write failure on empty path
 TEST_F(FileManagerTestFixture, EmptyPathWriteRejection) {
     FileManager manager;

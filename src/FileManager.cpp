@@ -23,6 +23,8 @@ bool FileManager::readFile(
     const std::filesystem::path& filePath,
     std::string& content
 ) const {
+    content.clear();
+
     if (!isValidSourceFile(filePath)) {
         std::cerr
             << "Error: Invalid or unsupported source file: "
