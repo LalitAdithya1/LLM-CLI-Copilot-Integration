@@ -1,5 +1,7 @@
 #include "FileManager.hpp"
 
+#include "detail/FileReplacement.hpp"
+
 #include <fstream>
 #include <iostream>
 #include <set>
@@ -180,47 +182,30 @@ bool FileManager::writeFile(
 
     outputFile.close();
 
-    if (fileAlreadyExists) {
-        std::error_code removeError;
-
-        std::filesystem::remove(
-            normalizedPath,
-            removeError
-        );
-
-        if (removeError) {
-            std::filesystem::remove(
-                temporaryPath,
-                removeError
-            );
-
-            std::cerr
-                << "Error: Unable to replace existing file: "
-                << normalizedPath << '\n';
-
-            return false;
-        }
-    }
-
-    std::error_code renameError;
-
-    std::filesystem::rename(
-        temporaryPath,
-        normalizedPath,
-        renameError
-    );
-
-    if (renameError) {
-        std::cerr
-            << "Error: Unable to finalize file write: "
-            << renameError.message() << '\n';
-
+    if (!outputFile.good()) {
         std::error_code cleanupError;
-
         std::filesystem::remove(
             temporaryPath,
             cleanupError
         );
+
+        std::cerr
+            << "Error: Failed while writing temporary file.\n";
+
+        return false;
+    }
+
+    std::error_code renameError;
+
+    if (!codeagent::detail::replaceFile(
+        temporaryPath,
+        normalizedPath,
+        renameError
+    )) {
+
+        std::cerr
+            << "Error: Unable to finalize file write: "
+            << renameError.message() << '\n';
 
         return false;
     }
