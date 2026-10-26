@@ -30,10 +30,40 @@ FetchContent_Declare(
     URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
 )
 
+FetchContent_Declare(
+    cpp_httplib
+    URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.58.0.tar.gz
+)
+
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
+# This loopback server does not use TLS or compression.
+set(HTTPLIB_USE_OPENSSL_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_ZLIB_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_BROTLI_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_ZSTD_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(cpp_httplib)
+
 enable_testing()
+
+# --------------------------------------------------
+# GUI HTTP server component
+# --------------------------------------------------
+add_library(GuiHttpServer
+    src/GuiHttpServer.cpp
+)
+
+target_include_directories(GuiHttpServer
+    PUBLIC
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(GuiHttpServer
+    PUBLIC
+        httplib::httplib
+)
 
 # --------------------------------------------------
 # Main application
@@ -125,6 +155,19 @@ add_executable(ResponseParserTest
     src/ResponseParser.cpp
 )
 
+# --------------------------------------------------
+# GUI HTTP server tests
+# --------------------------------------------------
+add_executable(GuiHttpServerTest
+    tests/GuiHttpServerTest.cpp
+)
+
+target_link_libraries(GuiHttpServerTest
+    PRIVATE
+        GTest::gtest_main
+        GuiHttpServer
+)
+
 target_include_directories(ResponseParserTest
     PRIVATE
         ${PROJECT_SOURCE_DIR}/include
@@ -145,6 +188,7 @@ gtest_discover_tests(FileManagerTest)
 gtest_discover_tests(PromptBuilderTest)
 gtest_discover_tests(LLMClientTest)
 gtest_discover_tests(ResponseParserTest)
+gtest_discover_tests(GuiHttpServerTest)
 
 # --------------------------------------------------
 # Compiler warnings
@@ -155,6 +199,8 @@ if(MSVC)
     target_compile_options(PromptBuilderTest PRIVATE /W4)
     target_compile_options(LLMClientTest PRIVATE /W4)
     target_compile_options(ResponseParserTest PRIVATE /W4)
+    target_compile_options(GuiHttpServer PRIVATE /W4)
+    target_compile_options(GuiHttpServerTest PRIVATE /W4)
 else()
     target_compile_options(codeagent PRIVATE
         -Wall -Wextra -Wpedantic
@@ -173,6 +219,14 @@ else()
     )
 
     target_compile_options(ResponseParserTest PRIVATE
+        -Wall -Wextra -Wpedantic
+    )
+
+    target_compile_options(GuiHttpServer PRIVATE
+        -Wall -Wextra -Wpedantic
+    )
+
+    target_compile_options(GuiHttpServerTest PRIVATE
         -Wall -Wextra -Wpedantic
     )
 endif()
