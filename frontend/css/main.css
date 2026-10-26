@@ -1,0 +1,66 @@
+:root {
+  color-scheme: dark;
+
+  --color-page: #0b0b0e;
+  --color-app: #111116;
+  --color-panel: #15151b;
+  --color-card: #1b1b23;
+  --color-accent: #8b5cf6;
+  --color-status: #22c55e;
+  --color-text: #f4f3f8;
+  --color-text-muted: #9694a3;
+  --color-border: #292832;
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+
+  --radius-panel: 0.75rem;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+  background: var(--color-page);
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background: var(--color-page);
+  color: var(--color-text);
+  font-family: Inter, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 0.9375rem;
+  line-height: 1.5;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+
+.app-shell {
+  width: min(100% - 2rem, 80rem);
+  min-height: calc(100vh - 4rem);
+  margin: var(--space-8) auto;
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-panel);
+  background: var(--color-app);
+}
