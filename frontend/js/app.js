@@ -8,6 +8,7 @@ import {
   openSourceFileDialog,
   refactorCode,
   rejectProposal,
+  saveGeneratedCode,
   saveProposal,
   selectOutputDirectory,
 } from './api.js';
@@ -20,6 +21,11 @@ int main() {
     return 0;
 }
 `;
+
+// Mirrors the supported extensions of the backend, which validates saves again.
+const SOURCE_FILE_EXTENSIONS = ['.c', '.cc', '.cpp', '.cxx', '.h', '.hh', '.hpp', '.hxx'];
+// Keeps a loaded file and its refactoring instruction under the 1 MiB API limit.
+const MAX_LOADED_FILE_BYTES = 512 * 1024;
 
 const REQUIRED_ELEMENTS = [
   '[data-app="codeagent"]',
@@ -62,6 +68,8 @@ const REQUIRED_ELEMENTS = [
   '#preview-heading',
   '#code-language',
   '#select-source-file-button',
+  '#load-source-file-button',
+  '#load-source-file-input',
 ];
 
 let appInitializationStarted = false;
@@ -106,6 +114,8 @@ function initializeApp() {
   const previewHeading = document.querySelector('#preview-heading');
   const codeLanguage = document.querySelector('#code-language');
   const selectSourceFileButton = document.querySelector('#select-source-file-button');
+  const loadSourceFileButton = document.querySelector('#load-source-file-button');
+  const loadSourceFileInput = document.querySelector('#load-source-file-input');
   const proposalReviewStatus = document.querySelector('#proposal-review-status');
   const proposalReviewAvailability = document.querySelector('#proposal-review-availability');
   const proposalOriginalCode = document.querySelector('#proposal-original-code');
@@ -126,8 +136,11 @@ function initializeApp() {
   let backendRefreshPromise = null;
   let editorRevisionSequence = 0;
   let selectedMode = 'generate';
-  const originalCode = SAMPLE_ORIGINAL_CODE;
+  let originalCode = SAMPLE_ORIGINAL_CODE;
   let draftCode = originalCode;
+  // Latest generated (non-proposal) output: { code, saved }.
+  let generatedOutput = null;
+  let generatedSaveInProgress = false;
 
   const proposalWorkflow = createProposalWorkflow({
     getProposalDiff,
@@ -139,11 +152,12 @@ function initializeApp() {
   function renderDecisionControls() {
     const state = proposalWorkflow.getState();
     const hasPendingProposal = state.proposal?.status === 'PENDING';
-    const operationInProgress = Boolean(state.operation);
+    const operationInProgress = Boolean(state.operation) || generatedSaveInProgress;
     const actionLocked = workflowInProgress || operationInProgress;
     promptInput.disabled = actionLocked;
     languageInput.disabled = actionLocked;
     codeEditor.disabled = actionLocked;
+    loadSourceFileButton.disabled = actionLocked;
     modeButtons.forEach((button) => {
       button.disabled = actionLocked || button.dataset.mode === 'files';
     });
@@ -159,20 +173,20 @@ function initializeApp() {
       : state.proposal?.reviewed ? 'Refresh diff' : 'Review changes';
     acceptProposalButton.disabled = !canDecide;
     rejectProposalButton.disabled = !canDecide;
-    saveFileButton.disabled = state.proposal?.status !== 'APPROVED'
-      || !state.proposal?.sourceMatches
-      || workflowInProgress || operationInProgress;
-    saveFileName.disabled = state.proposal?.status !== 'APPROVED'
-      || !state.proposal?.sourceMatches
-      || workflowInProgress || operationInProgress;
-    saveFileButton.textContent = state.operation === 'save' ? 'Saving…' : 'Save file';
+    const canSaveProposal = state.proposal?.status === 'APPROVED' && state.proposal.sourceMatches;
+    const canSaveGenerated = !state.proposal && generatedOutput !== null && !generatedOutput.saved;
+    saveFileButton.disabled = !(canSaveProposal || canSaveGenerated) || actionLocked;
+    saveFileName.disabled = !(canSaveProposal || canSaveGenerated) || actionLocked;
+    saveFileButton.textContent = state.operation === 'save' || generatedSaveInProgress
+      ? 'Saving…'
+      : 'Save file';
   }
 
   function renderProposalState(state = proposalWorkflow.getState()) {
     const proposal = state.proposal;
     if (!proposal) {
       proposalReviewStatus.textContent = 'No proposal available';
-      proposalReviewAvailability.textContent = 'Generated code is not a proposal and cannot be approved or saved.';
+      proposalReviewAvailability.textContent = 'Refactoring proposals and generated code appear here for review before anything is saved.';
       proposalDiffContent.textContent = 'No diff loaded.';
       renderDecisionControls();
       return;
@@ -321,12 +335,58 @@ function initializeApp() {
       previewHeading.textContent = result.selectedPath;
       previewHeading.title = result.selectedPath;
       codeLanguage.textContent = 'Path selected only · file contents not loaded';
-      renderStatus('Source path selected. The file contents were not read; the editor remains unchanged.');
+      renderStatus('Source path selected. The file contents were not read; use Open file in editor to load a file.');
     } catch (error) {
-      renderStatus(pathSelectionErrorMessage(error, 'Source-file selection'));
+      const hint = error instanceof ApiError && error.code === 'DIALOG_UNAVAILABLE'
+        ? ' Use Open file in editor instead.'
+        : '';
+      renderStatus(`${pathSelectionErrorMessage(error, 'Source-file selection')}${hint}`);
     } finally {
       setSelectionInProgress(false);
     }
+  }
+
+  // Reads a file chosen in the browser file picker. The contents stay in the
+  // page until the user sends them; the backend never reads arbitrary paths.
+  async function loadSourceFileIntoEditor(file) {
+    if (!file || workflowInProgress || generatedSaveInProgress
+      || proposalWorkflow.getState().operation) {
+      return;
+    }
+    const currentProposal = proposalWorkflow.getState().proposal;
+    if (currentProposal && ['PENDING', 'APPROVED'].includes(currentProposal.status)) {
+      renderStatus('Resolve the current proposal before loading another file.');
+      return;
+    }
+    const dot = file.name.lastIndexOf('.');
+    const extension = dot >= 0 ? file.name.slice(dot).toLowerCase() : '';
+    if (!SOURCE_FILE_EXTENSIONS.includes(extension)) {
+      renderStatus(`${file.name} is not a supported source file (${SOURCE_FILE_EXTENSIONS.join(', ')}).`);
+      return;
+    }
+    if (file.size > MAX_LOADED_FILE_BYTES) {
+      renderStatus(`${file.name} is larger than ${MAX_LOADED_FILE_BYTES / 1024} KiB and cannot be loaded.`);
+      return;
+    }
+    let text;
+    try {
+      text = await file.text();
+    } catch {
+      renderStatus(`${file.name} could not be read.`);
+      return;
+    }
+    proposalWorkflow.reset();
+    generatedOutput = null;
+    originalCode = text;
+    draftCode = text;
+    codeEditor.value = text;
+    proposalWorkflow.setCurrentSourceCode(text);
+    renderEditorState();
+    previewHeading.textContent = file.name;
+    previewHeading.title = file.name;
+    codeLanguage.textContent = 'Loaded from your computer · the original file is unchanged';
+    saveFileName.value = file.name;
+    renderStatus(`Loaded ${file.name} into the editor. Switch to Refactor to propose changes; saving writes to the active output directory.`);
   }
 
   async function handleOutputDirectorySelection() {
@@ -336,7 +396,20 @@ function initializeApp() {
     setSelectionInProgress(true);
     renderStatus('Opening the native output-directory dialog…');
     try {
-      const result = await selectOutputDirectory();
+      let result;
+      try {
+        result = await selectOutputDirectory();
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.code !== 'DIALOG_UNAVAILABLE') throw error;
+        // Without a native dialog (e.g. WSL without zenity), accept a typed
+        // path; the backend still checks that it is an existing directory.
+        const typedPath = window.prompt('The native directory dialog is unavailable. Enter the full path of an existing output directory:');
+        if (typeof typedPath !== 'string' || typedPath.trim().length === 0) {
+          renderStatus('Output-directory selection cancelled. The displayed directory is unchanged.');
+          return;
+        }
+        result = await selectOutputDirectory(typedPath.trim());
+      }
       if (result.status === 'CANCELLED') {
         renderStatus('Output-directory selection cancelled. The displayed directory is unchanged.');
         return;
@@ -450,7 +523,15 @@ function initializeApp() {
 
     const code = /^[A-Z0-9_]+$/.test(error.code) ? ` (${error.code})` : '';
     const message = error.message.trim() || 'The backend could not generate code.';
-    return `Generation failed${code}: ${message}`;
+    return `Generation failed${code}: ${message}${providerFailureHint(error)}`;
+  }
+
+  // The backend deliberately returns generic provider errors; the specific
+  // cause (missing key, HTTP status, network) is printed in its terminal.
+  function providerFailureHint(error) {
+    return error instanceof ApiError && ['GENERATION_FAILED', 'REFACTOR_FAILED'].includes(error.code)
+      ? ' Check the terminal running codeagent for details, such as a missing GEMINI_API_KEY.'
+      : '';
   }
 
   async function submitProposalDecision(action) {
@@ -476,6 +557,52 @@ function initializeApp() {
     renderStatus(confirmed
       ? 'The backend diff is ready. Review it before approving or rejecting.'
       : `Diff review failed. ${state.error}`);
+  }
+
+  async function saveGeneratedOutput() {
+    const output = generatedOutput;
+    if (workflowInProgress || generatedSaveInProgress || !output || output.saved) return;
+    const fileName = saveFileName.value.trim();
+    if (!fileName) {
+      saveFileName.setAttribute('aria-invalid', 'true');
+      renderStatus('Enter a filename for the generated code.');
+      saveFileName.focus();
+      return;
+    }
+    saveFileName.removeAttribute('aria-invalid');
+    generatedSaveInProgress = true;
+    renderDecisionControls();
+    renderStatus('Saving the generated code through the backend…');
+    try {
+      let result;
+      try {
+        result = await saveGeneratedCode({ fileName, content: output.code, overwriteConfirmed: false });
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.code !== 'OVERWRITE_CONFIRMATION_REQUIRED') throw error;
+        if (!window.confirm(`${fileName} already exists in the output directory. Replace it with the generated code?`)) {
+          renderStatus('Overwrite was not confirmed. The existing file was not changed.');
+          return;
+        }
+        result = await saveGeneratedCode({ fileName, content: output.code, overwriteConfirmed: true });
+      }
+      output.saved = true;
+      proposalReviewStatus.textContent = 'Generated code saved';
+      proposalReviewAvailability.textContent = `The backend confirmed the saved file: ${result.savedPath}`;
+      renderStatus(`The backend confirmed the save: ${result.savedPath}`);
+    } catch (error) {
+      renderStatus(`Save failed: ${apiErrorMessage(error, 'The generated code could not be saved.')}`);
+    } finally {
+      generatedSaveInProgress = false;
+      renderDecisionControls();
+    }
+  }
+
+  async function saveCurrentOutput() {
+    if (!proposalWorkflow.getState().proposal && generatedOutput) {
+      await saveGeneratedOutput();
+      return;
+    }
+    await saveApprovedProposal();
   }
 
   async function saveApprovedProposal() {
@@ -507,7 +634,7 @@ function initializeApp() {
   }
 
   async function submitWorkflow() {
-    if (workflowInProgress || proposalWorkflow.getState().operation) {
+    if (workflowInProgress || generatedSaveInProgress || proposalWorkflow.getState().operation) {
       return;
     }
 
@@ -545,6 +672,7 @@ function initializeApp() {
     }
 
     const requestMode = selectedMode;
+    generatedOutput = null;
     proposalWorkflow.reset();
     setWorkflowInProgress(true, requestMode === 'refactor' ? 'Creating…' : 'Generating…');
     proposalOriginalCode.textContent = originalSource;
@@ -575,14 +703,15 @@ function initializeApp() {
         const response = await generateCode({ instruction, language });
         proposalOriginalCode.textContent = originalSource;
         proposalProposedCode.textContent = response.generatedCode;
-        proposalReviewStatus.textContent = 'Generated output · not a proposal';
-        proposalReviewAvailability.textContent = 'Generated output has no proposal ID and cannot be approved or saved through the approved-proposal workflow.';
-        renderStatus('Generated code is displayed. It is not a proposal and has not been saved.');
+        generatedOutput = { code: response.generatedCode, saved: false };
+        proposalReviewStatus.textContent = 'Generated output · not saved';
+        proposalReviewAvailability.textContent = 'Generated code is not a refactoring proposal. Review it, enter a filename, and select Save file to write it to the output directory. Existing files are replaced only after you confirm.';
+        renderStatus('Generated code is displayed. It has not been saved.');
       }
     } catch (error) {
       const message = requestMode === 'refactor'
         ? error instanceof ApiError
-          ? `Proposal was not confirmed (${error.code}): ${error.message}`
+          ? `Proposal was not confirmed (${error.code}): ${error.message}${providerFailureHint(error)}`
           : 'Proposal was not confirmed. The backend may have processed the request, but no proposal ID was received.'
         : generationErrorMessage(error);
       proposalProposedCode.textContent = requestMode === 'refactor'
@@ -636,11 +765,19 @@ function initializeApp() {
     void reviewProposalChanges();
   });
   saveFileButton.addEventListener('click', () => {
-    void saveApprovedProposal();
+    void saveCurrentOutput();
   });
 
   selectSourceFileButton.addEventListener('click', () => {
     void handleSourceFileSelection();
+  });
+  loadSourceFileButton.addEventListener('click', () => {
+    loadSourceFileInput.click();
+  });
+  loadSourceFileInput.addEventListener('change', () => {
+    const file = loadSourceFileInput.files?.[0];
+    loadSourceFileInput.value = '';
+    void loadSourceFileIntoEditor(file);
   });
   selectOutputDirectoryButton.addEventListener('click', () => {
     void handleOutputDirectorySelection();

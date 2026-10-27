@@ -315,3 +315,104 @@ test('generated code and API errors are assigned as text content', async () => {
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.match(failing.elements.get('#notification-area').textContent, /<script>bad<\/script>/);
 });
+
+test('generated code saves once and replaces an existing file only after confirmation', async () => {
+  const saveBodies = [];
+  const app = await createApp((path, body, fallback) => {
+    if (path === '/api/generate') return jsonResponse({ generatedCode: 'int main() {}\n', language: body.language });
+    if (path === '/api/save') {
+      saveBodies.push(body);
+      return body.overwriteConfirmed
+        ? jsonResponse({ savedPath: '/tmp/gen.cpp', status: 'SAVED' })
+        : jsonResponse({ error: { code: 'OVERWRITE_CONFIRMATION_REQUIRED', message: 'exists' } }, 409);
+    }
+    return fallback(`http://127.0.0.1:8080${path}`, { method: body ? 'POST' : 'GET', body: body && JSON.stringify(body) });
+  });
+  const { elements } = app;
+  const saveButton = elements.get('#save-file-button');
+  assert.equal(saveButton.disabled, true);
+  elements.get('#prompt-input').value = 'Write main';
+  elements.get('#language-input').value = 'C++';
+  elements.get('#prompt-form').dispatch('submit');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(saveButton.disabled, false);
+
+  let confirmations = 0;
+  globalThis.window.confirm = () => { confirmations += 1; return true; };
+  elements.get('#save-file-name').value = 'gen.cpp';
+  saveButton.dispatch('click');
+  saveButton.dispatch('click');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(confirmations, 1);
+  assert.deepEqual(saveBodies, [
+    { fileName: 'gen.cpp', content: 'int main() {}\n', overwriteConfirmed: false },
+    { fileName: 'gen.cpp', content: 'int main() {}\n', overwriteConfirmed: true },
+  ]);
+  assert.match(elements.get('#notification-area').textContent, /confirmed the save: \/tmp\/gen\.cpp/);
+  assert.equal(saveButton.disabled, true);
+});
+
+test('declined overwrite of generated code does not send a confirmed save', async () => {
+  const saveBodies = [];
+  const app = await createApp((path, body, fallback) => {
+    if (path === '/api/generate') return jsonResponse({ generatedCode: 'int x;\n', language: body.language });
+    if (path === '/api/save') {
+      saveBodies.push(body);
+      return jsonResponse({ error: { code: 'OVERWRITE_CONFIRMATION_REQUIRED', message: 'exists' } }, 409);
+    }
+    return fallback(`http://127.0.0.1:8080${path}`, { method: body ? 'POST' : 'GET', body: body && JSON.stringify(body) });
+  });
+  globalThis.window.confirm = () => false;
+  app.elements.get('#prompt-input').value = 'Write x';
+  app.elements.get('#language-input').value = 'C++';
+  app.elements.get('#prompt-form').dispatch('submit');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  app.elements.get('#save-file-name').value = 'x.cpp';
+  app.elements.get('#save-file-button').dispatch('click');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(saveBodies.length, 1);
+  assert.equal(saveBodies[0].overwriteConfirmed, false);
+  assert.match(app.elements.get('#notification-area').textContent, /not confirmed/);
+  assert.equal(app.elements.get('#save-file-button').disabled, false);
+});
+
+test('opening a local file loads it into the editor and refactors that content', async () => {
+  const app = await createApp();
+  const { elements, modeButtons, requests } = app;
+  const input = elements.get('#load-source-file-input');
+  const source = 'int add(int a,int b){return a+b;}\n';
+  input.files = [{ name: 'math.hpp', size: source.length, text: async () => source }];
+  input.dispatch('change');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(elements.get('#code-editor').value, source);
+  assert.equal(elements.get('#preview-heading').textContent, 'math.hpp');
+  assert.equal(elements.get('#save-file-name').value, 'math.hpp');
+  assert.equal(elements.get('#code-status').textContent, 'Unmodified');
+
+  input.files = [{ name: 'notes.txt', size: 3, text: async () => 'abc' }];
+  input.dispatch('change');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(elements.get('#code-editor').value, source);
+  assert.match(elements.get('#notification-area').textContent, /not a supported source file/);
+
+  modeButtons.find((button) => button.dataset.mode === 'refactor').dispatch('click');
+  elements.get('#prompt-input').value = 'Add spaces';
+  elements.get('#language-input').value = 'C++';
+  elements.get('#prompt-form').dispatch('submit');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(requests.find((request) => request.path === '/api/refactor').body.sourceCode, source);
+});
+
+test('provider failures point the user to the terminal for the cause', async () => {
+  const app = await createApp((path, body, fallback) => {
+    if (path === '/api/generate') return jsonResponse({
+      error: { code: 'GENERATION_FAILED', message: 'Code generation failed.' },
+    }, 502);
+    return fallback(`http://127.0.0.1:8080${path}`, { method: body ? 'POST' : 'GET', body: body && JSON.stringify(body) });
+  });
+  app.elements.get('#prompt-input').value = 'Generate it';
+  app.elements.get('#language-input').value = 'C++';
+  app.elements.get('#prompt-form').dispatch('submit');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.match(app.elements.get('#notification-area').textContent, /terminal running codeagent.*GEMINI_API_KEY/);
+});

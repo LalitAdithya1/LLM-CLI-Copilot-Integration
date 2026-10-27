@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="CodeAgent — a local C++ coding assistant interface.">
     <title>CodeAgent — C++ Coding Copilot</title>
+    <link rel="icon" href="data:,">
     <link rel="stylesheet" href="css/main.css">
     <link rel="stylesheet" href="css/layout.css">
     <link rel="stylesheet" href="css/components.css">
@@ -61,7 +62,7 @@
         </nav>
 
         <p class="availability-note" id="backend-unavailable">
-          Source selection returns a path only. Paste source into the editor to refactor it; approved proposals can be saved through the backend.
+          Open a source file in the editor (or paste code), then refactor it into a proposal. Approved proposals and generated code are saved to the active output directory.
         </p>
 
         <section class="backend-config" aria-labelledby="backend-config-heading">
@@ -84,7 +85,9 @@
             </div>
           </dl>
           <div class="backend-config__actions">
-            <button class="action-button" id="select-source-file-button" type="button">Choose source file</button>
+            <button class="action-button" id="load-source-file-button" type="button">Open file in editor</button>
+            <input id="load-source-file-input" type="file" accept=".c,.cc,.cpp,.cxx,.h,.hh,.hpp,.hxx" hidden>
+            <button class="action-button" id="select-source-file-button" type="button">Choose source path</button>
             <button class="action-button" id="select-output-directory-button" type="button">Choose output directory</button>
           </div>
           <p class="backend-config__error" id="backend-config-error" role="alert" hidden></p>
@@ -157,7 +160,7 @@
                 aria-describedby="editor-description"
               ></textarea>
             </div>
-            <p class="visually-hidden" id="editor-description">Sample source only; selecting a file does not load its contents. Refactoring sends editor text to the backend. Saving requires an approved proposal.</p>
+            <p class="visually-hidden" id="editor-description">Sample source until you open a file. Refactoring sends editor text to the backend. Saving requires an approved proposal or generated code.</p>
 
             <footer class="preview-footer">
               <span id="code-language">Sample workspace · not loaded from a file</span>
@@ -210,7 +213,7 @@
       </main>
 
       <footer class="app-footer">
-        <p id="concept-note">The editor is a plain text workspace. Selected file contents are not loaded automatically.</p>
+        <p id="concept-note">The editor is a plain text workspace. AI output is never executed; files are written only when you save.</p>
         <div id="notification-area" role="status" aria-live="polite" aria-label="Status and notifications">
           Ready to connect to the local backend.
         </div>

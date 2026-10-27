@@ -1,9 +1,9 @@
-export function getBackendBaseUrl() {
-  if (typeof window !== 'undefined' && window.location && window.location.hostname) {
-    const host = window.location.hostname;
-    if (host === 'localhost' || host === '127.0.0.1') {
-      return `${window.location.protocol}//${host}:8080`;
-    }
+// `codeagent gui` serves this frontend itself, so the API is same-origin. A
+// page from the standalone development server on port 5500 uses port 8080.
+export function getBackendBaseUrl(location = globalThis.window?.location) {
+  const host = location?.hostname;
+  if ((host === 'localhost' || host === '127.0.0.1') && location.protocol === 'http:') {
+    return location.port === '5500' ? `http://${host}:8080` : location.origin;
   }
   return 'http://127.0.0.1:8080';
 }
@@ -335,6 +335,25 @@ export function createApiClient({
       return validateSave(await requestJson('/api/save', { method: 'POST', body }));
     },
 
+    async saveGeneratedCode(request = {}) {
+      if (!isObject(request)
+        || typeof request.fileName !== 'string'
+        || request.fileName.trim().length === 0
+        || typeof request.content !== 'string'
+        || request.content.trim().length === 0
+        || typeof request.overwriteConfirmed !== 'boolean') {
+        throw new ApiError('INVALID_REQUEST', 'A source filename and generated code are required to save.');
+      }
+      return validateSave(await requestJson('/api/save', {
+        method: 'POST',
+        body: {
+          fileName: request.fileName,
+          content: request.content,
+          overwriteConfirmed: request.overwriteConfirmed,
+        },
+      }));
+    },
+
     async openSourceFileDialog() {
       const payload = await requestJson('/api/files/open-dialog', {
         method: 'POST',
@@ -374,6 +393,7 @@ export const approveProposal = (proposalId) => defaultClient.approveProposal(pro
 export const rejectProposal = (proposalId) => defaultClient.rejectProposal(proposalId);
 export const getProposalDiff = (proposalId) => defaultClient.getProposalDiff(proposalId);
 export const saveProposal = (request) => defaultClient.saveProposal(request);
+export const saveGeneratedCode = (request) => defaultClient.saveGeneratedCode(request);
 export const openSourceFileDialog = () => defaultClient.openSourceFileDialog();
 export const selectOutputDirectory = (directoryPath) =>
   defaultClient.selectOutputDirectory(directoryPath);
