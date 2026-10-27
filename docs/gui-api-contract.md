@@ -320,7 +320,9 @@ Success response (`200`):
 }
 ```
 
-For a proposal save, the request uses `proposalId` and `fileName`; the proposal must already be approved. The backend returns the final resolved path after a successful write.
+For a proposal save, the request uses `proposalId` and `fileName`, with optional boolean `overwriteConfirmed`; proposal content comes only from server state. Saves use the session-selected directory, then launch directory. No per-request directory is accepted.
+
+Both forms require JSON and are limited to 1 MiB. Generated-code saves contain exactly `fileName`, `content`, and boolean `overwriteConfirmed`. Proposal saves contain `proposalId`, `fileName`, and optional `overwriteConfirmed`. Filenames must be single supported C/C++ source filenames; paths, separators, traversal, absolute names, symbolic links, and non-regular targets are rejected. The output directory must already exist. Success is HTTP `200` with `{"savedPath":"/absolute/path/name.cpp","status":"SAVED"}`. Errors use the common JSON shape: `400 INVALID_JSON`, `INVALID_REQUEST`, or `INVALID_FILENAME`; `404 PROPOSAL_NOT_FOUND`; `409 INVALID_PROPOSAL_STATE` or `OVERWRITE_CONFIRMATION_REQUIRED`; `413 PAYLOAD_TOO_LARGE`; `415 UNSUPPORTED_MEDIA_TYPE`; `422 INVALID_OUTPUT_DIRECTORY` or `INVALID_TARGET`; `500 SAVE_FAILED`.
 
 ## 4. Proposal and Save Safety
 
@@ -336,10 +338,11 @@ PENDING ──approve──> APPROVED ──successful save──> APPLIED
 - Only `APPROVED` proposals may be saved.
 - Rejected or already-applied proposals cannot be saved again.
 - Unknown proposal IDs return `404`; invalid state transitions return `409`.
-- Track the original editor version. If the editor changes before applying a proposal, reject stale application rather than silently replacing newer work.
+- Save requests do not carry the current editor revision/hash, so stale-editor validation cannot be performed. Proposal state preserves its original `editorRevision` and `baseEditorHash`; the backend does not claim freshness validation until the request contract defines current revision/hash fields.
 - If a proposal is based on an existing file, track its on-disk baseline separately from the editor-buffer version. Do not compare these as if they were the same hash.
 - Require explicit confirmation before overwriting an existing file.
 - Use a unique temporary file per write and safe platform-appropriate replacement. On failure, clean up the temporary file where possible, preserve the existing target where supported, and leave the proposal approved for retry.
+- A successful proposal save transitions `APPROVED` to `APPLIED`; a failed write leaves it approved and retryable.
 - Inspect `FileManager` before GUI integration. An HTTP request must not hang waiting for terminal input.
 
 ## 5. Security and Error Handling

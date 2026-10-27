@@ -16,6 +16,13 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -24,6 +31,8 @@ constexpr const char* kJsonContentType = "application/json; charset=utf-8";
 constexpr std::size_t kMaxRequestBodyBytes = 1024 * 1024;
 
 using Json = nlohmann::json;
+
+const std::vector<std::string>& supportedExtensions();
 
 bool isWhitespaceOnly(const std::string& value) {
     for (unsigned char character : value) {
@@ -65,6 +74,125 @@ void setJsonError(
         Json{{"error", {{"code", code}, {"message", message}}}}.dump(),
         kJsonContentType
     );
+}
+
+struct SaveRequest {
+    bool proposal = false;
+    std::string proposalId;
+    std::string fileName;
+    std::string content;
+    bool overwriteConfirmed = false;
+};
+
+bool parseSaveRequest(const std::string& requestBody, SaveRequest& request,
+                      httplib::Response& response) {
+    Json body;
+    try { body = Json::parse(requestBody); }
+    catch (const Json::exception&) {
+        setJsonError(response, 400, "INVALID_JSON", "Request body must contain valid JSON."); return false;
+    }
+    if (!body.is_object()) {
+        setJsonError(response, 400, "INVALID_REQUEST", "Request must be a generated-code or proposal save object."); return false;
+    }
+    if (body.contains("proposalId")) {
+        if ((body.size() != 2 && body.size() != 3) || !body["proposalId"].is_string() ||
+            !body.contains("fileName") || !body["fileName"].is_string() ||
+            (body.size() == 3 && (!body.contains("overwriteConfirmed") || !body["overwriteConfirmed"].is_boolean()))) {
+            setJsonError(response, 400, "INVALID_REQUEST", "Proposal save requires string proposalId and fileName fields, with optional boolean overwriteConfirmed."); return false;
+        }
+        request.proposal = true;
+        request.proposalId = body["proposalId"].get<std::string>();
+        request.fileName = body["fileName"].get<std::string>();
+        request.overwriteConfirmed = body.contains("overwriteConfirmed") && body["overwriteConfirmed"].get<bool>();
+        if (isWhitespaceOnly(request.proposalId)) {
+            setJsonError(response, 400, "INVALID_REQUEST", "proposalId cannot be empty."); return false;
+        }
+    } else {
+        if (body.size() != 3 || !body.contains("fileName") || !body["fileName"].is_string() ||
+            !body.contains("content") || !body["content"].is_string() ||
+            !body.contains("overwriteConfirmed") || !body["overwriteConfirmed"].is_boolean()) {
+            setJsonError(response, 400, "INVALID_REQUEST", "Generated-code save requires only string fileName, string content, and boolean overwriteConfirmed fields."); return false;
+        }
+        request.fileName = body["fileName"].get<std::string>();
+        request.content = body["content"].get<std::string>();
+        request.overwriteConfirmed = body["overwriteConfirmed"].get<bool>();
+    }
+    if (isWhitespaceOnly(request.fileName) || (!request.proposal && isWhitespaceOnly(request.content))) {
+        setJsonError(response, 400, "INVALID_REQUEST", "Required save values cannot be empty."); return false;
+    }
+    return true;
+}
+
+bool validSaveFileName(const std::string& name) {
+    if (name.empty() || name == "." || name == ".." ||
+        std::filesystem::path(name).filename().string() != name ||
+        name.find('/') != std::string::npos || name.find('\\') != std::string::npos || name.find(':') != std::string::npos) return false;
+    for (unsigned char c : name) if (c < 32 || c == 127) return false;
+    const auto& extensions = supportedExtensions();
+    return std::find(extensions.begin(), extensions.end(), std::filesystem::path(name).extension().string()) != extensions.end();
+}
+
+bool writeFileSafely(const std::filesystem::path& target, const std::string& content,
+                     bool overwrite, std::error_code& error) {
+    error.clear();
+    std::error_code statusError;
+    const auto status = std::filesystem::symlink_status(target, statusError);
+    const bool exists = !statusError && status.type() != std::filesystem::file_type::not_found;
+    if (statusError && statusError != std::errc::no_such_file_or_directory) { error = statusError; return false; }
+    if (exists && (std::filesystem::is_symlink(status) || !std::filesystem::is_regular_file(status))) {
+        error = std::make_error_code(std::errc::invalid_argument); return false;
+    }
+    if (exists && !overwrite) { error = std::make_error_code(std::errc::file_exists); return false; }
+    static std::atomic<std::uint64_t> sequence{0};
+    std::filesystem::path temp;
+#ifdef _WIN32
+    HANDLE file = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 32 && file == INVALID_HANDLE_VALUE; ++attempt) {
+        temp = target.parent_path() / (target.filename().string() + ".tmp-" + std::to_string(sequence.fetch_add(1)));
+        file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    }
+    if (file == INVALID_HANDLE_VALUE) { error = std::error_code(GetLastError(), std::system_category()); return false; }
+    std::size_t offset = 0;
+    while (offset < content.size()) {
+        DWORD written = 0;
+        const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(content.size() - offset, 1u << 20));
+        if (!WriteFile(file, content.data() + offset, chunk, &written, nullptr) || written == 0) {
+            const DWORD code = GetLastError(); error = std::error_code(code == ERROR_SUCCESS ? ERROR_WRITE_FAULT : code, std::system_category()); break;
+        }
+        offset += written;
+    }
+    if (!error && !FlushFileBuffers(file)) error = std::error_code(GetLastError(), std::system_category());
+    CloseHandle(file);
+#else
+    int fd = -1;
+    for (int attempt = 0; attempt < 32 && fd < 0; ++attempt) {
+        temp = target.parent_path() / (target.filename().string() + ".tmp-" + std::to_string(sequence.fetch_add(1)));
+        fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd < 0 && errno != EEXIST) break;
+    }
+    if (fd < 0) { error = std::error_code(errno, std::generic_category()); return false; }
+    std::size_t offset = 0;
+    while (offset < content.size()) {
+        const auto written = ::write(fd, content.data() + offset, content.size() - offset);
+        if (written < 0) { if (errno == EINTR) continue; error = std::error_code(errno, std::generic_category()); break; }
+        if (written == 0) { error = std::make_error_code(std::errc::io_error); break; }
+        offset += static_cast<std::size_t>(written);
+    }
+    if (!error && ::fsync(fd) != 0) error = std::error_code(errno, std::generic_category());
+    if (::close(fd) != 0 && !error) error = std::error_code(errno, std::generic_category());
+#endif
+    if (!error) {
+#ifdef _WIN32
+        const DWORD flags = MOVEFILE_WRITE_THROUGH | (exists ? MOVEFILE_REPLACE_EXISTING : 0);
+        if (!MoveFileExW(temp.c_str(), target.c_str(), flags)) error = std::error_code(GetLastError(), std::system_category());
+#else
+        if (exists) std::filesystem::rename(temp, target, error);
+        else if (::link(temp.c_str(), target.c_str()) != 0) error = std::error_code(errno, std::generic_category());
+        else { std::error_code ignored; std::filesystem::remove(temp, ignored); }
+#endif
+    }
+    if (error) { std::error_code ignored; std::filesystem::remove(temp, ignored); return false; }
+    return true;
 }
 
 bool parseGenerationRequest(
@@ -562,6 +690,52 @@ public:
             }
         });
 
+        server_.Post("/api/save", [this](const httplib::Request& request, httplib::Response& response) {
+            if (!isJsonContentType(request.get_header_value("Content-Type"))) {
+                setJsonError(response, 415, "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json."); return;
+            }
+            SaveRequest save;
+            if (!parseSaveRequest(request.body, save, response)) return;
+            if (!validSaveFileName(save.fileName)) {
+                setJsonError(response, 400, "INVALID_FILENAME", "fileName must be a supported source filename without a directory path."); return;
+            }
+            std::filesystem::path outputDirectory;
+            { std::lock_guard<std::mutex> lock(configMutex_); outputDirectory = activeOutputDirectory_; }
+            std::error_code error;
+            const auto canonicalDirectory = std::filesystem::canonical(outputDirectory, error);
+            if (error || !std::filesystem::is_directory(canonicalDirectory, error) || error) {
+                setJsonError(response, 422, "INVALID_OUTPUT_DIRECTORY", "Output directory is unavailable."); return;
+            }
+            const auto target = canonicalDirectory / save.fileName;
+            std::string code = std::move(save.content);
+            std::unique_lock<std::mutex> proposalLock(proposalMutex_, std::defer_lock);
+            if (save.proposal) {
+                proposalLock.lock();
+                const auto proposal = proposals_.find(save.proposalId);
+                if (proposal == proposals_.end()) { setJsonError(response, 404, "PROPOSAL_NOT_FOUND", "Proposal was not found."); return; }
+                if (proposal->second.status != ProposalStatus::Approved) { setJsonError(response, 409, "INVALID_PROPOSAL_STATE", "Only approved proposals can be saved."); return; }
+                code = proposal->second.proposedCode;
+            }
+            std::lock_guard<std::mutex> saveLock(saveMutex_);
+            const auto parent = std::filesystem::canonical(target.parent_path(), error);
+            if (error || parent != canonicalDirectory) { setJsonError(response, 422, "INVALID_OUTPUT_DIRECTORY", "Output directory is unavailable."); return; }
+            const auto state = std::filesystem::symlink_status(target, error);
+            if (error && error != std::errc::no_such_file_or_directory) { setJsonError(response, 500, "SAVE_FAILED", "File could not be saved."); return; }
+            const bool exists = !error && state.type() != std::filesystem::file_type::not_found;
+            if (exists && (std::filesystem::is_symlink(state) || !std::filesystem::is_regular_file(state))) {
+                setJsonError(response, 422, "INVALID_TARGET", "Target must be a regular file and cannot be a symbolic link."); return;
+            }
+            if (exists && !save.overwriteConfirmed) { setJsonError(response, 409, "OVERWRITE_CONFIRMATION_REQUIRED", "Set overwriteConfirmed to true to replace the existing file."); return; }
+            if (!writeFileSafely(target, code, save.overwriteConfirmed, error)) {
+                const bool confirmation = error == std::errc::file_exists;
+                setJsonError(response, confirmation ? 409 : 500,
+                    confirmation ? "OVERWRITE_CONFIRMATION_REQUIRED" : "SAVE_FAILED",
+                    confirmation ? "Set overwriteConfirmed to true to replace the existing file." : "File could not be saved."); return;
+            }
+            if (save.proposal) proposals_.at(save.proposalId).status = ProposalStatus::Applied;
+            response.set_content(Json{{"savedPath", target.string()}, {"status", "SAVED"}}.dump(), kJsonContentType);
+        });
+
         server_.Post("/api/refactor", [this](const httplib::Request& request, httplib::Response& response) {
             if (!isJsonContentType(request.get_header_value("Content-Type"))) {
                 setJsonError(
@@ -878,7 +1052,8 @@ private:
     enum class ProposalStatus {
         Pending,
         Approved,
-        Rejected
+        Rejected,
+        Applied
     };
 
     struct PendingProposal {
@@ -915,6 +1090,7 @@ private:
     const std::shared_ptr<NativeDialogProvider> dialogProvider_;
     std::mutex configMutex_;
     std::mutex proposalMutex_;
+    std::mutex saveMutex_;
     std::unordered_map<std::string, PendingProposal> proposals_;
     std::uint64_t nextProposalId_ = 1;
     std::atomic<int> boundPort_{0};

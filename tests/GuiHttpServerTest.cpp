@@ -5,6 +5,8 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <chrono>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <set>
@@ -674,6 +676,82 @@ protected:
         return nlohmann::json::parse(response->body).at("proposalId").get<std::string>();
     }
 };
+
+class GuiHttpServerSaveTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        directory_ = std::filesystem::temp_directory_path() / ("codeagent-save-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        ASSERT_TRUE(std::filesystem::create_directory(directory_));
+        server_ = std::make_unique<GuiHttpServer>(0, directory_, GuiHttpServer::GenerationHandler{},
+            [](const std::string&, const std::string&, const std::string& source, std::string& result) { result = "saved: " + source; return true; });
+        ASSERT_TRUE(server_->start());
+    }
+    void TearDown() override { if (server_) server_->stop(); std::error_code e; std::filesystem::remove_all(directory_, e); }
+    httplib::Client client() const { return httplib::Client("127.0.0.1", server_->port()); }
+    std::string approvedProposal() {
+        auto http = client();
+        auto created = http.Post("/api/refactor", R"({"sourceCode":"base","instruction":"edit","language":"C++","editorRevision":"r1"})", "application/json");
+        if (!created || created->status != 200) return {};
+        auto id = nlohmann::json::parse(created->body).at("proposalId").get<std::string>();
+        auto approved = http.Post("/api/changes/" + id + "/approve");
+        return approved && approved->status == 200 ? id : std::string{};
+    }
+    std::filesystem::path directory_;
+    std::unique_ptr<GuiHttpServer> server_;
+};
+
+TEST_F(GuiHttpServerSaveTest, SavesGeneratedCodeExplicitlyAndRequiresOverwriteConfirmation) {
+    auto http = client();
+    auto generated = http.Post("/api/generate", R"({"instruction":"x","language":"C++"})", "application/json");
+    ASSERT_TRUE(generated); EXPECT_EQ(generated->status, 503);
+    EXPECT_FALSE(std::filesystem::exists(directory_ / "main.cpp"));
+    auto first = http.Post("/api/save", R"({"fileName":"main.cpp","content":"one","overwriteConfirmed":false})", "application/json");
+    ASSERT_TRUE(first); EXPECT_EQ(first->status, 200);
+    auto denied = http.Post("/api/save", R"({"fileName":"main.cpp","content":"two","overwriteConfirmed":false})", "application/json");
+    ASSERT_TRUE(denied); EXPECT_EQ(denied->status, 409);
+    std::ifstream oldFile(directory_ / "main.cpp"); std::string old; oldFile >> old; EXPECT_EQ(old, "one");
+    auto replaced = http.Post("/api/save", R"({"fileName":"main.cpp","content":"two","overwriteConfirmed":true})", "application/json");
+    ASSERT_TRUE(replaced); EXPECT_EQ(replaced->status, 200);
+}
+
+TEST_F(GuiHttpServerSaveTest, SavesOnlyApprovedProposalAndPreventsDuplicateApplication) {
+    auto http = client();
+    auto pending = http.Post("/api/refactor", R"({"sourceCode":"base","instruction":"edit","language":"C++","editorRevision":"r"})", "application/json");
+    ASSERT_TRUE(pending);
+    auto pendingId = nlohmann::json::parse(pending->body).at("proposalId").get<std::string>();
+    auto denied = http.Post("/api/save", nlohmann::json{{"proposalId",pendingId},{"fileName","pending.cpp"}}.dump(), "application/json");
+    ASSERT_TRUE(denied); EXPECT_EQ(denied->status, 409);
+    auto unknown = http.Post("/api/save", R"({"proposalId":"missing","fileName":"none.cpp"})", "application/json");
+    ASSERT_TRUE(unknown); EXPECT_EQ(unknown->status, 404);
+    auto id = approvedProposal(); ASSERT_FALSE(id.empty());
+    auto saved = http.Post("/api/save", nlohmann::json{{"proposalId",id},{"fileName","proposal.cpp"}}.dump(), "application/json");
+    ASSERT_TRUE(saved); EXPECT_EQ(saved->status, 200);
+    auto repeated = http.Post("/api/save", nlohmann::json{{"proposalId",id},{"fileName","duplicate.cpp"}}.dump(), "application/json");
+    ASSERT_TRUE(repeated); EXPECT_EQ(repeated->status, 409);
+    EXPECT_FALSE(std::filesystem::exists(directory_ / "duplicate.cpp"));
+}
+
+TEST_F(GuiHttpServerSaveTest, RejectsMalformedRequestsUnsupportedMediaUnsafeNamesAndOversizedBodies) {
+    auto http = client();
+    for (const std::string body : {"{bad", "{}", R"({"fileName":"../x.cpp","content":"x","overwriteConfirmed":false})", R"({"fileName":"/tmp/x.cpp","content":"x","overwriteConfirmed":false})", R"({"fileName":"x.txt","content":"x","overwriteConfirmed":false})", R"({"fileName":"x.cpp","content":"x","overwriteConfirmed":false,"extra":true})"}) {
+        auto response = http.Post("/api/save", body, "application/json"); ASSERT_TRUE(response); EXPECT_EQ(response->status, 400);
+    }
+    auto media = http.Post("/api/save", "{}", "text/plain"); ASSERT_TRUE(media); EXPECT_EQ(media->status, 415);
+    auto large = http.Post("/api/save", std::string(1024 * 1024 + 32, 'x'), "application/json"); ASSERT_TRUE(large); EXPECT_EQ(large->status, 413);
+}
+
+TEST_F(GuiHttpServerSaveTest, FailedProposalSaveRemainsRetryableAndConcurrentSaveAppliesOnce) {
+    auto id = approvedProposal(); ASSERT_FALSE(id.empty());
+    std::filesystem::create_directory(directory_ / "retry.cpp");
+    auto http = client();
+    auto failed = http.Post("/api/save", nlohmann::json{{"proposalId",id},{"fileName","retry.cpp"}}.dump(), "application/json");
+    ASSERT_TRUE(failed); EXPECT_EQ(failed->status, 422);
+    std::filesystem::remove(directory_ / "retry.cpp");
+    std::atomic<int> ready{0}; std::atomic<bool> go{false}; int results[2] = {};
+    auto save = [&](int index) { httplib::Client c("127.0.0.1", server_->port()); ready++; while (!go) std::this_thread::yield(); auto r = c.Post("/api/save", nlohmann::json{{"proposalId",id},{"fileName","retry.cpp"}}.dump(), "application/json"); results[index] = r ? r->status : -1; };
+    std::thread a(save,0), b(save,1); while (ready != 2) std::this_thread::yield(); go = true; a.join(); b.join();
+    EXPECT_TRUE((results[0] == 200 && results[1] == 409) || (results[0] == 409 && results[1] == 200));
+}
 
 TEST_F(GuiHttpServerProposalReviewTest, DiffsBuffersAndProposalWithoutWritingOrTransitioning) {
     std::set<std::filesystem::path> filesBefore;
