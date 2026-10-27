@@ -3,7 +3,9 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <mutex>
 #include <system_error>
 #include <thread>
@@ -14,6 +16,107 @@ namespace {
 
 constexpr const char* kLoopbackAddress = "127.0.0.1";
 constexpr const char* kJsonContentType = "application/json; charset=utf-8";
+constexpr std::size_t kMaxRequestBodyBytes = 1024 * 1024;
+
+using Json = nlohmann::json;
+
+bool isWhitespaceOnly(const std::string& value) {
+    for (unsigned char character : value) {
+        if (!std::isspace(character)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool isJsonContentType(const std::string& contentType) {
+    const auto parameterStart = contentType.find(';');
+    std::string mediaType = contentType.substr(0, parameterStart);
+    const auto first = mediaType.find_first_not_of(" \t");
+    if (first == std::string::npos) {
+        return false;
+    }
+    const auto last = mediaType.find_last_not_of(" \t");
+    mediaType = mediaType.substr(first, last - first + 1);
+    std::transform(
+        mediaType.begin(),
+        mediaType.end(),
+        mediaType.begin(),
+        [](unsigned char character) {
+            return static_cast<char>(std::tolower(character));
+        }
+    );
+    return mediaType == "application/json";
+}
+
+void setJsonError(
+    httplib::Response& response,
+    int status,
+    const char* code,
+    const char* message
+) {
+    response.status = status;
+    response.set_content(
+        Json{{"error", {{"code", code}, {"message", message}}}}.dump(),
+        kJsonContentType
+    );
+}
+
+bool parseGenerationRequest(
+    const std::string& requestBody,
+    std::string& instruction,
+    std::string& language,
+    httplib::Response& response
+) {
+    Json body;
+    try {
+        body = Json::parse(requestBody);
+    } catch (const Json::exception&) {
+        setJsonError(
+            response,
+            400,
+            "INVALID_JSON",
+            "Request body must contain valid JSON."
+        );
+        return false;
+    }
+
+    if (!body.is_object() || body.size() != 2 ||
+        !body.contains("instruction") ||
+        !body.contains("language") ||
+        !body["instruction"].is_string() ||
+        !body["language"].is_string()) {
+        setJsonError(
+            response,
+            400,
+            "INVALID_REQUEST",
+            "Request must contain only string instruction and language fields."
+        );
+        return false;
+    }
+
+    instruction = body["instruction"].get<std::string>();
+    language = body["language"].get<std::string>();
+    if (isWhitespaceOnly(instruction)) {
+        setJsonError(
+            response,
+            400,
+            "INVALID_INSTRUCTION",
+            "Instruction cannot be empty."
+        );
+        return false;
+    }
+    if (isWhitespaceOnly(language)) {
+        setJsonError(
+            response,
+            400,
+            "INVALID_LANGUAGE",
+            "Language cannot be empty."
+        );
+        return false;
+    }
+    return true;
+}
 
 const std::vector<std::string>& supportedExtensions() {
     static const std::vector<std::string> extensions = {
@@ -28,13 +131,15 @@ class GuiHttpServer::Impl {
 public:
     explicit Impl(
         int requestedPort,
-        std::filesystem::path launchWorkingDirectory
+        std::filesystem::path launchWorkingDirectory,
+        GuiHttpServer::GenerationHandler generationHandler
     )
         : requestedPort_(requestedPort),
           launchWorkingDirectory_(resolveLaunchDirectory(
               std::move(launchWorkingDirectory)
           )),
-          activeOutputDirectory_(launchWorkingDirectory_) {
+          activeOutputDirectory_(launchWorkingDirectory_),
+          generationHandler_(std::move(generationHandler)) {
         server_.Get("/api/health", [](const httplib::Request&, httplib::Response& response) {
             response.set_content(
                 nlohmann::json{{"status", "ok"}}.dump(),
@@ -49,6 +154,88 @@ public:
                 {"activeOutputDirectory", activeOutputDirectory_.string()}
             };
             response.set_content(config.dump(), kJsonContentType);
+        });
+
+        server_.Post("/api/generate", [this](const httplib::Request& request, httplib::Response& response) {
+            if (!isJsonContentType(request.get_header_value("Content-Type"))) {
+                setJsonError(
+                    response,
+                    415,
+                    "UNSUPPORTED_MEDIA_TYPE",
+                    "Content-Type must be application/json."
+                );
+                return;
+            }
+
+            std::string instruction;
+            std::string language;
+            if (!parseGenerationRequest(
+                    request.body,
+                    instruction,
+                    language,
+                    response)) {
+                return;
+            }
+            if (!generationHandler_) {
+                setJsonError(
+                    response,
+                    503,
+                    "GENERATION_UNAVAILABLE",
+                    "Code generation is unavailable."
+                );
+                return;
+            }
+
+            std::string generatedCode;
+            try {
+                if (!generationHandler_(instruction, language, generatedCode) ||
+                    isWhitespaceOnly(generatedCode)) {
+                    setJsonError(
+                        response,
+                        502,
+                        "GENERATION_FAILED",
+                        "Code generation failed."
+                    );
+                    return;
+                }
+            } catch (...) {
+                setJsonError(
+                    response,
+                    502,
+                    "GENERATION_FAILED",
+                    "Code generation failed."
+                );
+                return;
+            }
+
+            try {
+                response.set_content(
+                    Json{
+                        {"generatedCode", generatedCode},
+                        {"language", language}
+                    }.dump(),
+                    kJsonContentType
+                );
+            } catch (...) {
+                setJsonError(
+                    response,
+                    502,
+                    "GENERATION_FAILED",
+                    "Code generation failed."
+                );
+            }
+        });
+
+        server_.set_payload_max_length(kMaxRequestBodyBytes);
+        server_.set_error_handler([](const httplib::Request&, httplib::Response& response) {
+            if (response.status == 413) {
+                setJsonError(
+                    response,
+                    413,
+                    "PAYLOAD_TOO_LARGE",
+                    "Request body exceeds the 1 MiB limit."
+                );
+            }
         });
 
         server_.set_socket_options([](socket_t socket) {
@@ -168,6 +355,7 @@ private:
     const int requestedPort_;
     const std::filesystem::path launchWorkingDirectory_;
     std::filesystem::path activeOutputDirectory_;
+    const GuiHttpServer::GenerationHandler generationHandler_;
     std::atomic<int> boundPort_{0};
     State state_ = State::Ready;
     std::mutex lifecycleMutex_;
@@ -175,15 +363,27 @@ private:
 };
 
 GuiHttpServer::GuiHttpServer(int port)
-    : GuiHttpServer(port, std::filesystem::current_path()) {}
+    : GuiHttpServer(port, std::filesystem::current_path(), {}) {}
 
 GuiHttpServer::GuiHttpServer(
     int port,
     std::filesystem::path launchWorkingDirectory
 )
+    : GuiHttpServer(
+          port,
+          std::move(launchWorkingDirectory),
+          {}
+      ) {}
+
+GuiHttpServer::GuiHttpServer(
+    int port,
+    std::filesystem::path launchWorkingDirectory,
+    GenerationHandler generationHandler
+)
     : impl_(std::make_unique<Impl>(
           port,
-          std::move(launchWorkingDirectory)
+          std::move(launchWorkingDirectory),
+          std::move(generationHandler)
       )) {}
 
 GuiHttpServer::~GuiHttpServer() = default;

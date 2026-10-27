@@ -179,6 +179,31 @@ TEST_F(LLMClientTest, RejectsHttpError) {
     EXPECT_TRUE(response.empty());
 }
 
+TEST_F(LLMClientTest, KeepsHttpStatusButDoesNotLogRawProviderErrorDetails) {
+    LLMClient client(
+        [](
+            const std::string&,
+            const std::string&,
+            const std::string&,
+            std::string& responseBody,
+            long& httpStatus
+        ) {
+            responseBody =
+                R"({"error":{"message":"provider detail leaked-secret-token"}})";
+            httpStatus = 401;
+            return true;
+        }
+    );
+
+    testing::internal::CaptureStderr();
+    EXPECT_FALSE(client.generateContent("Generate code", response));
+    const std::string diagnostic = testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(diagnostic.find("401"), std::string::npos);
+    EXPECT_NE(diagnostic.find("provider error"), std::string::npos);
+    EXPECT_EQ(diagnostic.find("leaked-secret-token"), std::string::npos);
+}
+
 TEST_F(LLMClientTest, RejectsMalformedJson) {
     LLMClient client(
         [](
@@ -279,8 +304,11 @@ TEST_F(LLMClientTest, RejectsPartialOutputAndLeavesResponseEmpty) {
 
     response = "old response";
 
+    testing::internal::CaptureStderr();
     EXPECT_FALSE(client.generateContent("Generate code", response));
+    const std::string diagnostic = testing::internal::GetCapturedStderr();
     EXPECT_TRUE(response.empty());
+    EXPECT_NE(diagnostic.find("token limit"), std::string::npos);
 }
 
 TEST_F(LLMClientTest, RefactoringRequiresExplicitCompleteFinishReason) {

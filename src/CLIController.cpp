@@ -11,6 +11,7 @@
 #include <cctype>
 #include <chrono>
 #include <csignal>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -25,7 +26,27 @@ void requestGuiStop(int) {
 }
 
 int runGuiCommand(std::ostream& output, std::ostream& error) {
-    GuiHttpServer server;
+    GuiHttpServer::GenerationHandler generationHandler =
+        [](const std::string& instruction,
+           const std::string& language,
+           std::string& generatedCode) {
+            PromptBuilder promptBuilder;
+            std::string prompt;
+            if (!promptBuilder.buildGenerationPrompt(
+                    instruction,
+                    language,
+                    prompt)) {
+                return false;
+            }
+
+            LLMClient client;
+            return client.generateContent(prompt, generatedCode);
+        };
+    GuiHttpServer server(
+        8080,
+        std::filesystem::current_path(),
+        std::move(generationHandler)
+    );
     if (!server.start()) {
         error << "Error: Could not start the GUI server on 127.0.0.1:"
               << (server.port() == 0 ? 8080 : server.port())

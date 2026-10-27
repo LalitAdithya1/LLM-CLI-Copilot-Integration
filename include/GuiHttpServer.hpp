@@ -2,15 +2,28 @@
 #define GUI_HTTP_SERVER_HPP
 
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <string>
 
 class GuiHttpServer {
 public:
+    using GenerationHandler = std::function<bool(
+        const std::string& instruction,
+        const std::string& language,
+        std::string& generatedCode
+    )>;
+
     // A port of 0 asks the operating system to select an available port.
     explicit GuiHttpServer(int port = 8080);
     GuiHttpServer(
         int port,
         std::filesystem::path launchWorkingDirectory
+    );
+    GuiHttpServer(
+        int port,
+        std::filesystem::path launchWorkingDirectory,
+        GenerationHandler generationHandler
     );
     ~GuiHttpServer();
 

@@ -3,6 +3,12 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
+#include <memory>
+#include <set>
+#include <stdexcept>
+#include <string>
+
 #include <gtest/gtest.h>
 
 TEST(GuiHttpServerTest, StartsOnAnAvailableLoopbackPortAndStops) {
@@ -134,4 +140,245 @@ TEST(GuiHttpServerTest, UnknownRouteStillReturnsNotFound) {
     EXPECT_EQ(response->status, 404);
 
     server.stop();
+}
+
+TEST(GuiHttpServerTest, GenerationWithoutHandlerReturnsServiceUnavailable) {
+    GuiHttpServer server(0);
+    ASSERT_TRUE(server.start());
+
+    httplib::Client http("127.0.0.1", server.port());
+    const auto response = http.Post(
+        "/api/generate",
+        R"({"instruction":"write a greeting","language":"C++"})",
+        "application/json"
+    );
+
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 503);
+    EXPECT_EQ(
+        nlohmann::json::parse(response->body).at("error").at("code"),
+        "GENERATION_UNAVAILABLE"
+    );
+
+    server.stop();
+}
+
+class GuiHttpServerGenerationTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        server_ = std::make_unique<GuiHttpServer>(
+            0,
+            std::filesystem::current_path(),
+            [this](const std::string& instruction,
+                   const std::string& language,
+                   std::string& generatedCode) {
+                generationCalls_.fetch_add(1);
+                if (instruction == "throw") {
+                    throw std::runtime_error("provider detail with secret");
+                }
+                if (!generationSucceeds_.load()) {
+                    return false;
+                }
+                generatedCode = "generated: " + instruction + " (" + language + ")";
+                return true;
+            }
+        );
+        ASSERT_TRUE(server_->start());
+    }
+
+    void TearDown() override {
+        if (server_) {
+            server_->stop();
+        }
+    }
+
+    httplib::Client client() const {
+        return httplib::Client("127.0.0.1", server_->port());
+    }
+
+    std::unique_ptr<GuiHttpServer> server_;
+    std::atomic<bool> generationSucceeds_{true};
+    std::atomic<int> generationCalls_{0};
+};
+
+TEST_F(GuiHttpServerGenerationTest, GeneratesCodeAndReturnsContractFields) {
+    std::set<std::filesystem::path> filesBefore;
+    for (const auto& entry : std::filesystem::directory_iterator(
+             std::filesystem::current_path())) {
+        filesBefore.insert(entry.path().filename());
+    }
+
+    auto http = client();
+    const auto response = http.Post(
+        "/api/generate",
+        R"({"instruction":"write a greeting","language":"C++"})",
+        "application/json"
+    );
+
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 200);
+    EXPECT_NE(response->get_header_value("Content-Type").find("application/json"),
+              std::string::npos);
+    const auto body = nlohmann::json::parse(response->body);
+    EXPECT_EQ(body.size(), 2u);
+    EXPECT_EQ(body.at("generatedCode"), "generated: write a greeting (C++)");
+    EXPECT_EQ(body.at("language"), "C++");
+    EXPECT_FALSE(body.contains("savedPath"));
+    EXPECT_EQ(generationCalls_.load(), 1);
+
+    std::set<std::filesystem::path> filesAfter;
+    for (const auto& entry : std::filesystem::directory_iterator(
+             std::filesystem::current_path())) {
+        filesAfter.insert(entry.path().filename());
+    }
+    EXPECT_EQ(filesAfter, filesBefore);
+}
+
+TEST_F(GuiHttpServerGenerationTest, RejectsMalformedJson) {
+    auto http = client();
+    const auto response = http.Post(
+        "/api/generate",
+        "{not json",
+        "application/json"
+    );
+
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 400);
+    const auto body = nlohmann::json::parse(response->body);
+    EXPECT_EQ(body.at("error").at("code"), "INVALID_JSON");
+    EXPECT_EQ(generationCalls_.load(), 0);
+}
+
+TEST_F(GuiHttpServerGenerationTest, RejectsNonJsonContentType) {
+    auto http = client();
+    const auto response = http.Post(
+        "/api/generate",
+        R"({"instruction":"write a greeting","language":"C++"})",
+        "text/plain"
+    );
+
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 415);
+    EXPECT_EQ(
+        nlohmann::json::parse(response->body).at("error").at("code"),
+        "UNSUPPORTED_MEDIA_TYPE"
+    );
+    EXPECT_EQ(generationCalls_.load(), 0);
+}
+
+TEST_F(GuiHttpServerGenerationTest, RejectsMissingInstruction) {
+    auto http = client();
+    const auto response = http.Post(
+        "/api/generate",
+        R"({"language":"C++"})",
+        "application/json"
+    );
+
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 400);
+    const auto body = nlohmann::json::parse(response->body);
+    EXPECT_EQ(body.at("error").at("code"), "INVALID_REQUEST");
+    EXPECT_EQ(generationCalls_.load(), 0);
+}
+
+TEST_F(GuiHttpServerGenerationTest, RejectsWhitespaceOnlyInstructionAndLanguage) {
+    auto http = client();
+    const auto emptyInstruction = http.Post(
+        "/api/generate",
+        R"({"instruction":" \t\n","language":"C++"})",
+        "application/json"
+    );
+    const auto emptyLanguage = http.Post(
+        "/api/generate",
+        R"({"instruction":"write a greeting","language":" \t\n"})",
+        "application/json"
+    );
+
+    ASSERT_TRUE(emptyInstruction);
+    ASSERT_TRUE(emptyLanguage);
+    EXPECT_EQ(emptyInstruction->status, 400);
+    EXPECT_EQ(emptyLanguage->status, 400);
+    EXPECT_EQ(
+        nlohmann::json::parse(emptyInstruction->body).at("error").at("code"),
+        "INVALID_INSTRUCTION"
+    );
+    EXPECT_EQ(
+        nlohmann::json::parse(emptyLanguage->body).at("error").at("code"),
+        "INVALID_LANGUAGE"
+    );
+    EXPECT_EQ(generationCalls_.load(), 0);
+}
+
+TEST_F(GuiHttpServerGenerationTest, RejectsExtraFieldsIncludingCredentialFields) {
+    auto http = client();
+    const auto response = http.Post(
+        "/api/generate",
+        R"({"instruction":"write a greeting","language":"C++","apiKey":"must-not-be-accepted"})",
+        "application/json"
+    );
+
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 400);
+    EXPECT_EQ(
+        nlohmann::json::parse(response->body).at("error").at("code"),
+        "INVALID_REQUEST"
+    );
+    EXPECT_EQ(response->body.find("must-not-be-accepted"), std::string::npos);
+    EXPECT_EQ(generationCalls_.load(), 0);
+}
+
+TEST_F(GuiHttpServerGenerationTest, ReportsGenerationFailureWithoutExceptionDetails) {
+    generationSucceeds_ = false;
+    auto http = client();
+    const auto providerFailure = http.Post(
+        "/api/generate",
+        R"({"instruction":"write a greeting","language":"C++"})",
+        "application/json"
+    );
+    const auto thrownFailure = http.Post(
+        "/api/generate",
+        R"({"instruction":"throw","language":"C++"})",
+        "application/json"
+    );
+
+    ASSERT_TRUE(providerFailure);
+    ASSERT_TRUE(thrownFailure);
+    EXPECT_EQ(providerFailure->status, 502);
+    EXPECT_EQ(thrownFailure->status, 502);
+    EXPECT_EQ(
+        nlohmann::json::parse(providerFailure->body).at("error").at("code"),
+        "GENERATION_FAILED"
+    );
+    EXPECT_EQ(
+        nlohmann::json::parse(thrownFailure->body).at("error").at("code"),
+        "GENERATION_FAILED"
+    );
+    EXPECT_EQ(thrownFailure->body.find("secret"), std::string::npos);
+}
+
+TEST_F(GuiHttpServerGenerationTest, RejectsRequestBodiesOverOneMiB) {
+    auto http = client();
+    const std::string oversizedBody =
+        "{\"instruction\":\"" + std::string(1024 * 1024, 'x') +
+        "\",\"language\":\"C++\"}";
+    const auto response = http.Post(
+        "/api/generate",
+        oversizedBody,
+        "application/json"
+    );
+
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 413);
+    EXPECT_NE(response->get_header_value("Content-Type").find("application/json"),
+              std::string::npos);
+    EXPECT_EQ(
+        nlohmann::json::parse(response->body),
+        nlohmann::json({
+            {"error", {
+                {"code", "PAYLOAD_TOO_LARGE"},
+                {"message", "Request body exceeds the 1 MiB limit."}
+            }}
+        })
+    );
+    EXPECT_EQ(generationCalls_.load(), 0);
 }

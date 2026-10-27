@@ -115,7 +115,9 @@ Example successful response:
 }
 ```
 
-### Example: generate code
+### B6: `POST /api/generate`
+
+The request must use `Content-Type: application/json` and contain exactly two string fields: `instruction` and `language`. The body is limited to 1 MiB. Both values must contain non-whitespace text. The current backend has no language allow-list; it accepts any non-empty language label. Additional fields, including credential fields, are rejected. Generation returns code only and does not write files.
 
 Request:
 
@@ -132,6 +134,30 @@ Success response (`200`):
 {
   "generatedCode": "#include <iostream>\\nint main() { return 0; }",
   "language": "C++"
+}
+```
+
+Errors use the common JSON error object from Section 2. B6 returns:
+
+| Status | Error code | Meaning |
+|---|---|---|
+| `400` | `INVALID_JSON` | The body is not valid JSON. |
+| `400` | `INVALID_REQUEST` | The request is not an object with exactly the required string fields. |
+| `400` | `INVALID_INSTRUCTION` | `instruction` is empty or whitespace-only. |
+| `400` | `INVALID_LANGUAGE` | `language` is empty or whitespace-only. |
+| `413` | `PAYLOAD_TOO_LARGE` | The request body exceeds 1 MiB. |
+| `415` | `UNSUPPORTED_MEDIA_TYPE` | The request content type is not `application/json`. |
+| `502` | `GENERATION_FAILED` | Prompt generation or the provider call failed. |
+| `503` | `GENERATION_UNAVAILABLE` | No generation handler is configured. |
+
+For example, an invalid instruction returns HTTP `400`:
+
+```json
+{
+  "error": {
+    "code": "INVALID_INSTRUCTION",
+    "message": "Instruction cannot be empty."
+  }
 }
 ```
 

@@ -148,6 +148,42 @@ std::string buildGeminiUrl(const std::string& model) {
            "v1beta/models/" + model + ":generateContent";
 }
 
+std::string safeResponseDiagnostic(const ParsedResponse& response) {
+    switch (response.error) {
+    case ResponseParseError::MalformedJson:
+        return "Gemini returned malformed JSON.";
+    case ResponseParseError::ProviderError:
+        return "Gemini returned a provider error.";
+    case ResponseParseError::MissingCandidates:
+        return "Gemini response contained no candidates.";
+    case ResponseParseError::UnexpectedStructure:
+        return "Gemini response had an unexpected structure.";
+    case ResponseParseError::MissingContent:
+        return "Gemini response had no valid content.";
+    case ResponseParseError::MissingParts:
+        return "Gemini response had no content parts.";
+    case ResponseParseError::EmptyGeneratedText:
+        return "Gemini response contained no generated text.";
+    case ResponseParseError::BlockedResponse:
+        return "Gemini flagged the response; generated text was not accepted.";
+    case ResponseParseError::IncompleteResponse:
+        if (response.finishReason && *response.finishReason == "MAX_TOKENS") {
+            return "Gemini stopped at the token limit; output may be incomplete.";
+        }
+        if (response.finishReason && *response.finishReason == "CONTINUATION") {
+            return "Gemini returned a continuation; output is incomplete.";
+        }
+        return "Gemini response may be incomplete.";
+    case ResponseParseError::RejectedFinishReason:
+        return "Gemini did not produce a usable completed response.";
+    case ResponseParseError::UnsupportedFinishReason:
+        return "Gemini returned an unsupported finish reason.";
+    case ResponseParseError::None:
+        return "Gemini returned an unsuccessful response.";
+    }
+    return "Gemini returned an unsuccessful response.";
+}
+
 } // namespace
 
 LLMClient::LLMClient()
@@ -255,32 +291,18 @@ bool LLMClient::generateContentImpl(
         std::cerr
             << "Gemini HTTP status: "
             << httpStatus << '\n';
-
-        if (parsedResponse.error == ResponseParseError::ProviderError) {
-            std::cerr
-                << "Gemini error: "
-                << parsedResponse.errorMessage << '\n';
-        } else if (parsedResponse.error ==
-                   ResponseParseError::MalformedJson) {
-            std::cerr
-                << "Gemini returned a non-JSON error response.\n";
-        } else {
-            std::cerr
-                << "Gemini returned an error response "
-                << "without a readable message.\n";
-        }
-
+        std::cerr << safeResponseDiagnostic(parsedResponse) << '\n';
         return false;
     }
 
     if (!parsedResponse.succeeded() ||
         (requireExplicitCompletion && !parsedResponse.isComplete())) {
-        std::cerr
-            << "Error: "
-            << (parsedResponse.errorMessage.empty()
-                    ? "Gemini did not confirm that the response is complete."
-                    : parsedResponse.errorMessage)
-            << '\n';
+        std::cerr << "Error: ";
+        if (parsedResponse.succeeded() && requireExplicitCompletion) {
+            std::cerr << "Gemini did not confirm that the response is complete.\n";
+        } else {
+            std::cerr << safeResponseDiagnostic(parsedResponse) << '\n';
+        }
         return false;
     }
 
