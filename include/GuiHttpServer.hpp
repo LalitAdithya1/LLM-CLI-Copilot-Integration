@@ -13,6 +13,13 @@ public:
         const std::string& language,
         std::string& generatedCode
     )>;
+    // Return true only when refactoredCode contains a valid, complete result.
+    using RefactoringHandler = std::function<bool(
+        const std::string& instruction,
+        const std::string& language,
+        const std::string& sourceCode,
+        std::string& refactoredCode
+    )>;
 
     // A port of 0 asks the operating system to select an available port.
     explicit GuiHttpServer(int port = 8080);
@@ -24,6 +31,12 @@ public:
         int port,
         std::filesystem::path launchWorkingDirectory,
         GenerationHandler generationHandler
+    );
+    GuiHttpServer(
+        int port,
+        std::filesystem::path launchWorkingDirectory,
+        GenerationHandler generationHandler,
+        RefactoringHandler refactoringHandler
     );
     ~GuiHttpServer();
 

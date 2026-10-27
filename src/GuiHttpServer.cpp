@@ -6,9 +6,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdint>
+#include <iomanip>
 #include <mutex>
+#include <sstream>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -118,6 +122,82 @@ bool parseGenerationRequest(
     return true;
 }
 
+struct RefactoringRequest {
+    std::string sourceCode;
+    std::string instruction;
+    std::string language;
+    std::string editorRevision;
+};
+
+bool parseRefactoringRequest(
+    const std::string& requestBody,
+    RefactoringRequest& request,
+    httplib::Response& response
+) {
+    Json body;
+    try {
+        body = Json::parse(requestBody);
+    } catch (const Json::exception&) {
+        setJsonError(
+            response,
+            400,
+            "INVALID_JSON",
+            "Request body must contain valid JSON."
+        );
+        return false;
+    }
+
+    if (!body.is_object() || body.size() != 4 ||
+        !body.contains("sourceCode") || !body["sourceCode"].is_string() ||
+        !body.contains("instruction") || !body["instruction"].is_string() ||
+        !body.contains("language") || !body["language"].is_string() ||
+        !body.contains("editorRevision") || !body["editorRevision"].is_string()) {
+        setJsonError(
+            response,
+            400,
+            "INVALID_REQUEST",
+            "Request must contain only string sourceCode, instruction, language, and editorRevision fields."
+        );
+        return false;
+    }
+
+    request.sourceCode = body["sourceCode"].get<std::string>();
+    request.instruction = body["instruction"].get<std::string>();
+    request.language = body["language"].get<std::string>();
+    request.editorRevision = body["editorRevision"].get<std::string>();
+
+    if (isWhitespaceOnly(request.sourceCode)) {
+        setJsonError(response, 400, "INVALID_SOURCE_CODE", "Source code cannot be empty.");
+        return false;
+    }
+    if (isWhitespaceOnly(request.instruction)) {
+        setJsonError(response, 400, "INVALID_INSTRUCTION", "Instruction cannot be empty.");
+        return false;
+    }
+    if (isWhitespaceOnly(request.language)) {
+        setJsonError(response, 400, "INVALID_LANGUAGE", "Language cannot be empty.");
+        return false;
+    }
+    if (isWhitespaceOnly(request.editorRevision)) {
+        setJsonError(response, 400, "INVALID_EDITOR_REVISION", "Editor revision cannot be empty.");
+        return false;
+    }
+    return true;
+}
+
+std::string hashEditorContent(const std::string& sourceCode) {
+    std::uint64_t hash = UINT64_C(14695981039346656037);
+    for (unsigned char byte : sourceCode) {
+        hash ^= byte;
+        hash *= UINT64_C(1099511628211);
+    }
+
+    std::ostringstream output;
+    output << "fnv1a64:" << std::hex << std::nouppercase
+           << std::setw(16) << std::setfill('0') << hash;
+    return output.str();
+}
+
 const std::vector<std::string>& supportedExtensions() {
     static const std::vector<std::string> extensions = {
         ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"
@@ -132,14 +212,16 @@ public:
     explicit Impl(
         int requestedPort,
         std::filesystem::path launchWorkingDirectory,
-        GuiHttpServer::GenerationHandler generationHandler
+        GuiHttpServer::GenerationHandler generationHandler,
+        GuiHttpServer::RefactoringHandler refactoringHandler
     )
         : requestedPort_(requestedPort),
           launchWorkingDirectory_(resolveLaunchDirectory(
               std::move(launchWorkingDirectory)
           )),
           activeOutputDirectory_(launchWorkingDirectory_),
-          generationHandler_(std::move(generationHandler)) {
+          generationHandler_(std::move(generationHandler)),
+          refactoringHandler_(std::move(refactoringHandler)) {
         server_.Get("/api/health", [](const httplib::Request&, httplib::Response& response) {
             response.set_content(
                 nlohmann::json{{"status", "ok"}}.dump(),
@@ -224,6 +306,96 @@ public:
                     "Code generation failed."
                 );
             }
+        });
+
+        server_.Post("/api/refactor", [this](const httplib::Request& request, httplib::Response& response) {
+            if (!isJsonContentType(request.get_header_value("Content-Type"))) {
+                setJsonError(
+                    response,
+                    415,
+                    "UNSUPPORTED_MEDIA_TYPE",
+                    "Content-Type must be application/json."
+                );
+                return;
+            }
+
+            RefactoringRequest refactoringRequest;
+            if (!parseRefactoringRequest(
+                    request.body,
+                    refactoringRequest,
+                    response)) {
+                return;
+            }
+            if (!refactoringHandler_) {
+                setJsonError(
+                    response,
+                    503,
+                    "REFACTOR_UNAVAILABLE",
+                    "Code refactoring is unavailable."
+                );
+                return;
+            }
+
+            std::string proposedCode;
+            try {
+                if (!refactoringHandler_(
+                        refactoringRequest.instruction,
+                        refactoringRequest.language,
+                        refactoringRequest.sourceCode,
+                        proposedCode) ||
+                    isWhitespaceOnly(proposedCode)) {
+                    setJsonError(
+                        response,
+                        502,
+                        "REFACTOR_FAILED",
+                        "Code refactoring failed or returned no complete code."
+                    );
+                    return;
+                }
+            } catch (...) {
+                setJsonError(
+                    response,
+                    502,
+                    "REFACTOR_FAILED",
+                    "Code refactoring failed."
+                );
+                return;
+            }
+
+            const std::string baseEditorHash =
+                hashEditorContent(refactoringRequest.sourceCode);
+            std::string proposalId;
+            std::string serializedResponse;
+            try {
+                std::lock_guard<std::mutex> lock(proposalMutex_);
+                proposalId = "prop-" + std::to_string(nextProposalId_++);
+                const Json result = {
+                    {"proposalId", proposalId},
+                    {"status", "PENDING"},
+                    {"originalCode", refactoringRequest.sourceCode},
+                    {"proposedCode", proposedCode},
+                    {"baseEditorHash", baseEditorHash}
+                };
+                serializedResponse = result.dump();
+                proposals_.emplace(
+                    proposalId,
+                    PendingProposal{
+                        refactoringRequest.sourceCode,
+                        proposedCode,
+                        refactoringRequest.editorRevision
+                    }
+                );
+            } catch (...) {
+                setJsonError(
+                    response,
+                    502,
+                    "REFACTOR_FAILED",
+                    "Code refactoring result could not be prepared."
+                );
+                return;
+            }
+
+            response.set_content(std::move(serializedResponse), kJsonContentType);
         });
 
         server_.set_payload_max_length(kMaxRequestBodyBytes);
@@ -334,6 +506,12 @@ public:
     }
 
 private:
+    struct PendingProposal {
+        std::string originalCode;
+        std::string proposedCode;
+        std::string editorRevision;
+    };
+
     static std::filesystem::path resolveLaunchDirectory(
         std::filesystem::path launchWorkingDirectory
     ) {
@@ -356,6 +534,10 @@ private:
     const std::filesystem::path launchWorkingDirectory_;
     std::filesystem::path activeOutputDirectory_;
     const GuiHttpServer::GenerationHandler generationHandler_;
+    const GuiHttpServer::RefactoringHandler refactoringHandler_;
+    std::mutex proposalMutex_;
+    std::unordered_map<std::string, PendingProposal> proposals_;
+    std::uint64_t nextProposalId_ = 1;
     std::atomic<int> boundPort_{0};
     State state_ = State::Ready;
     std::mutex lifecycleMutex_;
@@ -363,7 +545,7 @@ private:
 };
 
 GuiHttpServer::GuiHttpServer(int port)
-    : GuiHttpServer(port, std::filesystem::current_path(), {}) {}
+    : GuiHttpServer(port, std::filesystem::current_path(), {}, {}) {}
 
 GuiHttpServer::GuiHttpServer(
     int port,
@@ -372,6 +554,7 @@ GuiHttpServer::GuiHttpServer(
     : GuiHttpServer(
           port,
           std::move(launchWorkingDirectory),
+          {},
           {}
       ) {}
 
@@ -380,10 +563,24 @@ GuiHttpServer::GuiHttpServer(
     std::filesystem::path launchWorkingDirectory,
     GenerationHandler generationHandler
 )
+    : GuiHttpServer(
+          port,
+          std::move(launchWorkingDirectory),
+          std::move(generationHandler),
+          {}
+      ) {}
+
+GuiHttpServer::GuiHttpServer(
+    int port,
+    std::filesystem::path launchWorkingDirectory,
+    GenerationHandler generationHandler,
+    RefactoringHandler refactoringHandler
+)
     : impl_(std::make_unique<Impl>(
           port,
           std::move(launchWorkingDirectory),
-          std::move(generationHandler)
+          std::move(generationHandler),
+          std::move(refactoringHandler)
       )) {}
 
 GuiHttpServer::~GuiHttpServer() = default;

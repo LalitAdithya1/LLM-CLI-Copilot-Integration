@@ -188,6 +188,33 @@ Success response (`200`):
 
 Examples are illustrative, not actual model output.
 
+### B7: `POST /api/refactor`
+
+The request must use `Content-Type: application/json` and contain exactly four string fields: `sourceCode`, `instruction`, `language`, and `editorRevision`. Each field must contain non-whitespace text. Language labels are not restricted to an allow-list. Additional fields are rejected. The request body limit is 1 MiB.
+
+On success, return HTTP `200` with exactly the fields shown in the response example above. The returned proposal has status `PENDING`; creating it does not approve it and does not read or write files. A successful no-op refactor is still represented as a pending proposal; later review behavior is outside B7.
+
+`editorRevision` is an opaque, non-empty client revision token. The backend retains it with the pending proposal and does not reinterpret or return it in the B7 response. `baseEditorHash` is `fnv1a64:` followed by a 16-character, lowercase hexadecimal FNV-1a 64-bit hash of the exact UTF-8 bytes of `sourceCode`. This stable non-cryptographic hash is for accidental editor-content mismatch detection, not authentication or security. A later stale-editor check should compare both the revision token and source hash.
+
+Proposal IDs are sequential (`prop-1`, `prop-2`, and so on) within one server process. Pending proposal data is held in memory and is discarded when the server stops; it is not persisted. B7 stores proposal state for later review endpoints but does not implement retrieval, approval, rejection, deletion, or saving.
+
+Errors use the common JSON error object from Section 2:
+
+| Status | Error code | Meaning |
+|---|---|---|
+| `400` | `INVALID_JSON` | The body is not valid JSON. |
+| `400` | `INVALID_REQUEST` | The body is not an object with exactly the required string fields. |
+| `400` | `INVALID_SOURCE_CODE` | `sourceCode` is empty or whitespace-only. |
+| `400` | `INVALID_INSTRUCTION` | `instruction` is empty or whitespace-only. |
+| `400` | `INVALID_LANGUAGE` | `language` is empty or whitespace-only. |
+| `400` | `INVALID_EDITOR_REVISION` | `editorRevision` is empty or whitespace-only. |
+| `413` | `PAYLOAD_TOO_LARGE` | The request body exceeds 1 MiB. |
+| `415` | `UNSUPPORTED_MEDIA_TYPE` | The request content type is not `application/json`. |
+| `502` | `REFACTOR_FAILED` | The handler failed, threw, returned empty output, or the result could not be serialized. No proposal is created. |
+| `503` | `REFACTOR_UNAVAILABLE` | No refactoring handler is configured. |
+
+The production handler builds the prompt with `PromptBuilder` and calls `LLMClient::generateCompleteContent()`, which validates the provider response through `ResponseParser`. Blocked, incomplete, malformed, empty, or failed provider responses therefore produce `REFACTOR_FAILED`; exception details and provider response text are not returned to the HTTP client.
+
 ### Example: save generated code
 
 Request:

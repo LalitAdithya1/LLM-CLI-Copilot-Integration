@@ -382,3 +382,254 @@ TEST_F(GuiHttpServerGenerationTest, RejectsRequestBodiesOverOneMiB) {
     );
     EXPECT_EQ(generationCalls_.load(), 0);
 }
+
+class GuiHttpServerRefactoringTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        server_ = std::make_unique<GuiHttpServer>(
+            0,
+            std::filesystem::current_path(),
+            GuiHttpServer::GenerationHandler{},
+            [this](const std::string& instruction,
+                   const std::string&,
+                   const std::string& sourceCode,
+                   std::string& refactoredCode) {
+                handlerCalls_.fetch_add(1);
+                if (instruction == "blocked" || instruction == "incomplete") {
+                    return false;
+                }
+                if (instruction == "throw") {
+                    throw std::runtime_error("provider detail with secret");
+                }
+                if (instruction == "empty result") {
+                    refactoredCode = " \t\n";
+                    return true;
+                }
+                refactoredCode = "refactored: " + sourceCode;
+                return true;
+            }
+        );
+        ASSERT_TRUE(server_->start());
+    }
+
+    void TearDown() override {
+        if (server_) {
+            server_->stop();
+        }
+    }
+
+    httplib::Client client() const {
+        return httplib::Client("127.0.0.1", server_->port());
+    }
+
+    static std::string requestBody(
+        const std::string& sourceCode = "int value = 1;",
+        const std::string& instruction = "improve readability",
+        const std::string& language = "C++",
+        const std::string& editorRevision = "revision-1"
+    ) {
+        return nlohmann::json{
+            {"sourceCode", sourceCode},
+            {"instruction", instruction},
+            {"language", language},
+            {"editorRevision", editorRevision}
+        }.dump();
+    }
+
+    std::unique_ptr<GuiHttpServer> server_;
+    std::atomic<int> handlerCalls_{0};
+};
+
+TEST(GuiHttpServerTest, RefactoringWithoutHandlerReturnsServiceUnavailable) {
+    GuiHttpServer server(
+        0,
+        std::filesystem::current_path(),
+        GuiHttpServer::GenerationHandler{},
+        GuiHttpServer::RefactoringHandler{}
+    );
+    ASSERT_TRUE(server.start());
+
+    httplib::Client http("127.0.0.1", server.port());
+    const auto response = http.Post(
+        "/api/refactor",
+        R"({"sourceCode":"int x;","instruction":"change","language":"C++","editorRevision":"r1"})",
+        "application/json"
+    );
+
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 503);
+    EXPECT_EQ(nlohmann::json::parse(response->body).at("error").at("code"),
+              "REFACTOR_UNAVAILABLE");
+    server.stop();
+}
+
+TEST_F(GuiHttpServerRefactoringTest, CreatesPendingProposalWithoutWritingFiles) {
+    std::set<std::filesystem::path> filesBefore;
+    for (const auto& entry : std::filesystem::directory_iterator(
+             std::filesystem::current_path())) {
+        filesBefore.insert(entry.path().filename());
+    }
+
+    auto http = client();
+    const auto response = http.Post(
+        "/api/refactor",
+        requestBody("a"),
+        "application/json"
+    );
+
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 200);
+    EXPECT_NE(response->get_header_value("Content-Type").find("application/json"),
+              std::string::npos);
+    const auto body = nlohmann::json::parse(response->body);
+    ASSERT_EQ(body.size(), 5u);
+    EXPECT_EQ(body.at("proposalId"), "prop-1");
+    EXPECT_EQ(body.at("status"), "PENDING");
+    EXPECT_EQ(body.at("originalCode"), "a");
+    EXPECT_EQ(body.at("proposedCode"), "refactored: a");
+    EXPECT_EQ(body.at("baseEditorHash"), "fnv1a64:af63dc4c8601ec8c");
+    EXPECT_EQ(handlerCalls_.load(), 1);
+
+    std::set<std::filesystem::path> filesAfter;
+    for (const auto& entry : std::filesystem::directory_iterator(
+             std::filesystem::current_path())) {
+        filesAfter.insert(entry.path().filename());
+    }
+    EXPECT_EQ(filesAfter, filesBefore);
+}
+
+TEST_F(GuiHttpServerRefactoringTest, RejectsMalformedAndInvalidRequests) {
+    auto http = client();
+    const auto malformed = http.Post("/api/refactor", "{not json", "application/json");
+    const auto missing = http.Post(
+        "/api/refactor",
+        R"({"sourceCode":"int x;","instruction":"change","language":"C++"})",
+        "application/json"
+    );
+    auto extraRequest = nlohmann::json::parse(requestBody());
+    extraRequest["apiKey"] = "must-not-be-accepted";
+    const auto extra = http.Post(
+        "/api/refactor",
+        extraRequest.dump(),
+        "application/json"
+    );
+    const auto emptySource = http.Post(
+        "/api/refactor",
+        requestBody(" \t\n"),
+        "application/json"
+    );
+    const auto emptyInstruction = http.Post(
+        "/api/refactor",
+        requestBody("int x;", " \t\n"),
+        "application/json"
+    );
+    const auto emptyLanguage = http.Post(
+        "/api/refactor",
+        requestBody("int x;", "change", " \t\n"),
+        "application/json"
+    );
+    const auto emptyRevision = http.Post(
+        "/api/refactor",
+        requestBody("int x;", "change", "C++", " \t\n"),
+        "application/json"
+    );
+
+    ASSERT_TRUE(malformed);
+    ASSERT_TRUE(missing);
+    ASSERT_TRUE(extra);
+    ASSERT_TRUE(emptySource);
+    ASSERT_TRUE(emptyInstruction);
+    ASSERT_TRUE(emptyLanguage);
+    ASSERT_TRUE(emptyRevision);
+    EXPECT_EQ(malformed->status, 400);
+    EXPECT_EQ(nlohmann::json::parse(malformed->body).at("error").at("code"), "INVALID_JSON");
+    EXPECT_EQ(nlohmann::json::parse(missing->body).at("error").at("code"), "INVALID_REQUEST");
+    EXPECT_EQ(nlohmann::json::parse(extra->body).at("error").at("code"), "INVALID_REQUEST");
+    EXPECT_EQ(extra->body.find("must-not-be-accepted"), std::string::npos);
+    EXPECT_EQ(nlohmann::json::parse(emptySource->body).at("error").at("code"), "INVALID_SOURCE_CODE");
+    EXPECT_EQ(nlohmann::json::parse(emptyInstruction->body).at("error").at("code"), "INVALID_INSTRUCTION");
+    EXPECT_EQ(nlohmann::json::parse(emptyLanguage->body).at("error").at("code"), "INVALID_LANGUAGE");
+    EXPECT_EQ(nlohmann::json::parse(emptyRevision->body).at("error").at("code"), "INVALID_EDITOR_REVISION");
+    EXPECT_EQ(handlerCalls_.load(), 0);
+}
+
+TEST_F(GuiHttpServerRefactoringTest, RejectsNonJsonContentType) {
+    auto http = client();
+    const auto response = http.Post(
+        "/api/refactor",
+        requestBody(),
+        "text/plain"
+    );
+
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 415);
+    EXPECT_EQ(nlohmann::json::parse(response->body).at("error").at("code"),
+              "UNSUPPORTED_MEDIA_TYPE");
+    EXPECT_EQ(handlerCalls_.load(), 0);
+}
+
+TEST_F(GuiHttpServerRefactoringTest, RejectsOversizedRequestBody) {
+    auto http = client();
+    const std::string oversizedBody = requestBody(std::string(1024 * 1024, 'x'));
+    const auto response = http.Post(
+        "/api/refactor",
+        oversizedBody,
+        "application/json"
+    );
+
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 413);
+    EXPECT_EQ(nlohmann::json::parse(response->body).at("error").at("code"),
+              "PAYLOAD_TOO_LARGE");
+    EXPECT_EQ(handlerCalls_.load(), 0);
+}
+
+TEST_F(GuiHttpServerRefactoringTest, BlockedAndIncompleteResultsCreateNoProposal) {
+    auto http = client();
+    for (const char* instruction : {"blocked", "incomplete"}) {
+        const auto response = http.Post(
+            "/api/refactor",
+            requestBody("int x;", instruction),
+            "application/json"
+        );
+        ASSERT_TRUE(response);
+        EXPECT_EQ(response->status, 502);
+        EXPECT_EQ(nlohmann::json::parse(response->body).at("error").at("code"),
+                  "REFACTOR_FAILED");
+        EXPECT_EQ(response->body.find("PENDING"), std::string::npos);
+    }
+
+    const auto success = http.Post(
+        "/api/refactor",
+        requestBody(),
+        "application/json"
+    );
+    ASSERT_TRUE(success);
+    EXPECT_EQ(nlohmann::json::parse(success->body).at("proposalId"), "prop-1");
+    EXPECT_EQ(handlerCalls_.load(), 3);
+}
+
+TEST_F(GuiHttpServerRefactoringTest, ProviderFailuresAndEmptyResultsReturnSafeErrors) {
+    auto http = client();
+    const auto thrownFailure = http.Post(
+        "/api/refactor",
+        requestBody("int x;", "throw"),
+        "application/json"
+    );
+    const auto emptyResult = http.Post(
+        "/api/refactor",
+        requestBody("int x;", "empty result"),
+        "application/json"
+    );
+
+    ASSERT_TRUE(thrownFailure);
+    ASSERT_TRUE(emptyResult);
+    EXPECT_EQ(thrownFailure->status, 502);
+    EXPECT_EQ(emptyResult->status, 502);
+    EXPECT_EQ(nlohmann::json::parse(thrownFailure->body).at("error").at("code"),
+              "REFACTOR_FAILED");
+    EXPECT_EQ(thrownFailure->body.find("secret"), std::string::npos);
+    EXPECT_EQ(thrownFailure->body.find("provider detail"), std::string::npos);
+    EXPECT_EQ(nlohmann::json::parse(emptyResult->body).at("error").at("code"),
+              "REFACTOR_FAILED");
+}

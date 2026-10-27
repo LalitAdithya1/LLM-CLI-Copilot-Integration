@@ -42,10 +42,29 @@ int runGuiCommand(std::ostream& output, std::ostream& error) {
             LLMClient client;
             return client.generateContent(prompt, generatedCode);
         };
+    GuiHttpServer::RefactoringHandler refactoringHandler =
+        [](const std::string& instruction,
+           const std::string& language,
+           const std::string& sourceCode,
+           std::string& refactoredCode) {
+            PromptBuilder promptBuilder;
+            std::string prompt;
+            if (!promptBuilder.buildRefactoringPrompt(
+                    instruction,
+                    language,
+                    sourceCode,
+                    prompt)) {
+                return false;
+            }
+
+            LLMClient client;
+            return client.generateCompleteContent(prompt, refactoredCode);
+        };
     GuiHttpServer server(
         8080,
         std::filesystem::current_path(),
-        std::move(generationHandler)
+        std::move(generationHandler),
+        std::move(refactoringHandler)
     );
     if (!server.start()) {
         error << "Error: Could not start the GUI server on 127.0.0.1:"
