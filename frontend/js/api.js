@@ -106,6 +106,38 @@ function validateProposalDecision(payload, expectedProposalId, expectedStatus) {
   return payload;
 }
 
+function validatePathSelection(payload, responsePathField, endpointName) {
+  if (!isObject(payload) || typeof payload.status !== 'string') {
+    throw new ApiError(
+      'INVALID_RESPONSE',
+      `The backend returned an invalid ${endpointName} response.`,
+    );
+  }
+
+  if (payload.status === 'CANCELLED') {
+    expectFields(payload, ['status'], endpointName);
+    return payload;
+  }
+
+  expectFields(payload, ['status', responsePathField], endpointName);
+  const selectedPath = payload[responsePathField];
+  const isAbsolutePath = typeof selectedPath === 'string'
+    && (selectedPath.startsWith('/')
+      || selectedPath.startsWith('\\\\')
+      || /^[A-Za-z]:[\\/]/.test(selectedPath));
+  if (
+    payload.status !== 'SELECTED'
+    || !isAbsolutePath
+    || selectedPath.trim().length === 0
+  ) {
+    throw new ApiError(
+      'INVALID_RESPONSE',
+      `The backend returned an invalid ${endpointName} response.`,
+    );
+  }
+  return payload;
+}
+
 export function createApiClient({
   baseUrl = BACKEND_BASE_URL,
   fetchImpl = globalThis.fetch,
@@ -245,6 +277,33 @@ export function createApiClient({
     async rejectProposal(proposalId) {
       return sendProposalDecision(proposalId, 'reject', 'REJECTED');
     },
+
+    async openSourceFileDialog() {
+      const payload = await requestJson('/api/files/open-dialog', {
+        method: 'POST',
+        body: {},
+      });
+      return validatePathSelection(payload, 'selectedPath', 'source-file selection');
+    },
+
+    async selectOutputDirectory(directoryPath) {
+      let body = {};
+      if (directoryPath !== undefined) {
+        if (typeof directoryPath !== 'string' || directoryPath.trim().length === 0) {
+          throw new ApiError('INVALID_REQUEST', 'A non-empty directory path is required.');
+        }
+        body = { directoryPath };
+      }
+      const payload = await requestJson('/api/output/select-directory', {
+        method: 'POST',
+        body,
+      });
+      return validatePathSelection(
+        payload,
+        'activeOutputDirectory',
+        'output-directory selection',
+      );
+    },
   });
 }
 
@@ -256,3 +315,6 @@ export const generateCode = (request) => defaultClient.generateCode(request);
 export const refactorCode = (request) => defaultClient.refactorCode(request);
 export const approveProposal = (proposalId) => defaultClient.approveProposal(proposalId);
 export const rejectProposal = (proposalId) => defaultClient.rejectProposal(proposalId);
+export const openSourceFileDialog = () => defaultClient.openSourceFileDialog();
+export const selectOutputDirectory = (directoryPath) =>
+  defaultClient.selectOutputDirectory(directoryPath);

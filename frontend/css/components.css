@@ -425,6 +425,13 @@
   min-width: 0;
 }
 
+.backend-config__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+
 .backend-config__values dt {
   color: var(--color-text-muted);
   font-size: 0.6875rem;

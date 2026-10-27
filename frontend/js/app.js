@@ -4,8 +4,10 @@ import {
   generateCode,
   getConfig,
   getHealth,
+  openSourceFileDialog,
   refactorCode,
   rejectProposal,
+  selectOutputDirectory,
 } from './api.js';
 
 const SAMPLE_ORIGINAL_CODE = `#include <iostream>
@@ -40,6 +42,7 @@ const REQUIRED_ELEMENTS = [
   '#backend-config-extensions',
   '#backend-config-launch-directory',
   '#backend-config-output-directory',
+  '#select-output-directory-button',
   '#backend-config-error',
   '#generate-submit-button',
   '#generate-code-button',
@@ -50,6 +53,9 @@ const REQUIRED_ELEMENTS = [
   '#accept-proposal-button',
   '#reject-proposal-button',
   '#save-file-button',
+  '#preview-heading',
+  '#code-language',
+  '#select-source-file-button',
 ];
 
 let appInitializationStarted = false;
@@ -89,7 +95,11 @@ function initializeApp() {
   const backendConfigExtensions = document.querySelector('#backend-config-extensions');
   const backendConfigLaunchDirectory = document.querySelector('#backend-config-launch-directory');
   const backendConfigOutputDirectory = document.querySelector('#backend-config-output-directory');
+  const selectOutputDirectoryButton = document.querySelector('#select-output-directory-button');
   const backendConfigError = document.querySelector('#backend-config-error');
+  const previewHeading = document.querySelector('#preview-heading');
+  const codeLanguage = document.querySelector('#code-language');
+  const selectSourceFileButton = document.querySelector('#select-source-file-button');
   const proposalReviewStatus = document.querySelector('#proposal-review-status');
   const proposalReviewAvailability = document.querySelector('#proposal-review-availability');
   const proposalOriginalCode = document.querySelector('#proposal-original-code');
@@ -102,6 +112,8 @@ function initializeApp() {
     document.querySelector('#generate-code-button'),
   ];
   let workflowInProgress = false;
+  let selectionInProgress = false;
+  let outputDirectorySelectionVersion = 0;
   let backendRefreshPromise = null;
   let editorRevisionSequence = 0;
   let selectedMode = 'generate';
@@ -179,6 +191,75 @@ function initializeApp() {
       : fallback;
   }
 
+  function pathSelectionErrorMessage(error, selectionLabel) {
+    if (!(error instanceof ApiError)) {
+      return `${selectionLabel} failed. Check that the local backend is running.`;
+    }
+    if (error.code === 'DIALOG_UNAVAILABLE') {
+      return `${selectionLabel} dialog is unavailable: ${error.message}`;
+    }
+    const code = /^[A-Z0-9_]+$/.test(error.code) ? ` (${error.code})` : '';
+    return `${selectionLabel} failed${code}: ${error.message}`;
+  }
+
+  function setSelectionInProgress(isInProgress) {
+    selectionInProgress = isInProgress;
+    selectSourceFileButton.disabled = isInProgress;
+    selectOutputDirectoryButton.disabled = isInProgress;
+  }
+
+  async function handleSourceFileSelection() {
+    if (selectionInProgress) {
+      return;
+    }
+    setSelectionInProgress(true);
+    renderStatus('Opening the native source-file dialog…');
+    try {
+      const result = await openSourceFileDialog();
+      if (result.status === 'CANCELLED') {
+        renderStatus('Source-file selection cancelled. The displayed path is unchanged.');
+        return;
+      }
+      if (result.status !== 'SELECTED') {
+        throw new ApiError('INVALID_RESPONSE', 'The backend did not confirm a source-file selection.');
+      }
+      previewHeading.textContent = result.selectedPath;
+      previewHeading.title = result.selectedPath;
+      codeLanguage.textContent = 'Path selected only · file contents not loaded';
+      renderStatus('Source path selected. The file contents were not read; the editor remains unchanged.');
+    } catch (error) {
+      renderStatus(pathSelectionErrorMessage(error, 'Source-file selection'));
+    } finally {
+      setSelectionInProgress(false);
+    }
+  }
+
+  async function handleOutputDirectorySelection() {
+    if (selectionInProgress) {
+      return;
+    }
+    setSelectionInProgress(true);
+    renderStatus('Opening the native output-directory dialog…');
+    try {
+      const result = await selectOutputDirectory();
+      if (result.status === 'CANCELLED') {
+        renderStatus('Output-directory selection cancelled. The displayed directory is unchanged.');
+        return;
+      }
+      if (result.status !== 'SELECTED') {
+        throw new ApiError('INVALID_RESPONSE', 'The backend did not confirm an output-directory selection.');
+      }
+      outputDirectorySelectionVersion += 1;
+      backendConfigOutputDirectory.textContent = result.activeOutputDirectory;
+      backendConfigValues.hidden = false;
+      renderStatus('Output directory selection confirmed by the backend.');
+    } catch (error) {
+      renderStatus(pathSelectionErrorMessage(error, 'Output-directory selection'));
+    } finally {
+      setSelectionInProgress(false);
+    }
+  }
+
   async function refreshBackendHealth() {
     assistantStatus.dataset.state = 'checking';
     assistantStatusMessage.textContent = 'Checking backend…';
@@ -205,6 +286,7 @@ function initializeApp() {
   }
 
   async function refreshBackendConfig() {
+    const selectionVersionAtRequest = outputDirectorySelectionVersion;
     backendConfigStatus.textContent = 'Loading configuration…';
     backendConfigValues.hidden = true;
     backendConfigError.hidden = true;
@@ -218,9 +300,11 @@ function initializeApp() {
       backendConfigLaunchDirectory.textContent = config.launchDirectory.trim()
         ? config.launchDirectory
         : 'No launch directory reported';
-      backendConfigOutputDirectory.textContent = config.activeOutputDirectory.trim()
-        ? config.activeOutputDirectory
-        : 'No output directory reported';
+      if (selectionVersionAtRequest === outputDirectorySelectionVersion) {
+        backendConfigOutputDirectory.textContent = config.activeOutputDirectory.trim()
+          ? config.activeOutputDirectory
+          : 'No output directory reported';
+      }
       backendConfigStatus.textContent = 'Configuration loaded';
       backendConfigValues.hidden = false;
     } catch (error) {
@@ -460,6 +544,13 @@ function initializeApp() {
   });
   rejectProposalButton.addEventListener('click', () => {
     void submitProposalDecision('reject');
+  });
+
+  selectSourceFileButton.addEventListener('click', () => {
+    void handleSourceFileSelection();
+  });
+  selectOutputDirectoryButton.addEventListener('click', () => {
+    void handleOutputDirectorySelection();
   });
 
   renderDecisionControls();

@@ -61,7 +61,7 @@
         </nav>
 
         <p class="availability-note" id="backend-unavailable">
-          File and proposal review actions are not connected yet.
+          Source selection returns a path only; file contents are not loaded. Saving is unavailable.
         </p>
 
         <section class="backend-config" aria-labelledby="backend-config-heading">
@@ -83,6 +83,10 @@
               <dd id="backend-config-output-directory"></dd>
             </div>
           </dl>
+          <div class="backend-config__actions">
+            <button class="action-button" id="select-source-file-button" type="button">Choose source file</button>
+            <button class="action-button" id="select-output-directory-button" type="button">Choose output directory</button>
+          </div>
           <p class="backend-config__error" id="backend-config-error" role="alert" hidden></p>
         </section>
 
