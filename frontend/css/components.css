@@ -474,7 +474,8 @@
   margin-top: var(--space-3);
 }
 
-.prompt-form textarea {
+.prompt-form textarea,
+.prompt-form input[type="text"] {
   display: block;
   width: 100%;
   min-height: 5.5rem;
@@ -489,23 +490,31 @@
   transition: border-color 120ms ease, box-shadow 120ms ease, background-color 120ms ease;
 }
 
-.prompt-form textarea::placeholder {
+.prompt-form input[type="text"] {
+  min-height: 2.75rem;
+}
+
+.prompt-form textarea::placeholder,
+.prompt-form input[type="text"]::placeholder {
   color: #858391;
   opacity: 1;
 }
 
-.prompt-form textarea:not(:disabled):hover {
+.prompt-form textarea:not(:disabled):hover,
+.prompt-form input[type="text"]:not(:disabled):hover {
   border-color: #514c60;
 }
 
-.prompt-form textarea:not(:disabled):focus-visible {
+.prompt-form textarea:not(:disabled):focus-visible,
+.prompt-form input[type="text"]:not(:disabled):focus-visible {
   border-color: var(--color-accent);
   outline: 2px solid rgb(139 92 246 / 36%);
   outline-offset: 2px;
   box-shadow: 0 0 0 3px rgb(139 92 246 / 10%);
 }
 
-.prompt-form textarea:disabled {
+.prompt-form textarea:disabled,
+.prompt-form input[type="text"]:disabled {
   border-color: #302f38;
   background: #141419;
   color: var(--color-text-muted);

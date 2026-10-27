@@ -61,7 +61,7 @@
         </nav>
 
         <p class="availability-note" id="backend-unavailable">
-          Generation, file, and proposal actions are not connected yet.
+          File and proposal review actions are not connected yet.
         </p>
 
         <section class="backend-config" aria-labelledby="backend-config-heading">
@@ -102,7 +102,7 @@
               </article>
               <article class="message-card message-card--copilot" id="copilot-response" aria-live="polite">
                 <p class="message-label">COPILOT</p>
-                <p class="message-placeholder">Generation is not connected to this workspace yet.</p>
+                <p class="message-placeholder">Generated code will appear in proposal review.</p>
               </article>
             </div>
 
@@ -115,10 +115,12 @@
 
             <form class="prompt-form" id="prompt-form">
               <label class="visually-hidden" for="prompt-input">Instruction for CodeAgent</label>
-              <textarea id="prompt-input" name="prompt" rows="3" placeholder="Enter an instruction to validate locally." aria-describedby="prompt-help prompt-feedback"></textarea>
-              <p class="visually-hidden" id="prompt-help">Instructions are validated locally. Backend generation is not connected.</p>
+              <label class="visually-hidden" for="language-input">Programming language</label>
+              <input id="language-input" name="language" type="text" placeholder="Programming language (for example, C++)" aria-describedby="prompt-help prompt-feedback">
+              <textarea id="prompt-input" name="prompt" rows="3" placeholder="Describe the code to generate." aria-describedby="prompt-help prompt-feedback"></textarea>
+              <p class="visually-hidden" id="prompt-help">Enter a programming language and an instruction. Generated code is shown as a proposal and is not saved or applied.</p>
               <p class="prompt-feedback" id="prompt-feedback" role="alert" aria-live="assertive" hidden></p>
-              <button class="action-button" id="validate-instruction-button" type="submit">Validate instruction</button>
+              <button class="action-button action-button--primary" id="generate-submit-button" type="submit">Generate code</button>
             </form>
           </section>
 
@@ -174,11 +176,11 @@
           <div class="proposal-review__code-panes">
             <section class="proposal-code" aria-labelledby="proposal-original-heading">
               <h3 id="proposal-original-heading">Original code</h3>
-              <pre class="proposal-code__content" aria-label="Original code">No original code loaded.</pre>
+              <pre class="proposal-code__content" id="proposal-original-code" aria-label="Original code">No original code loaded.</pre>
             </section>
             <section class="proposal-code" aria-labelledby="proposal-proposed-heading">
               <h3 id="proposal-proposed-heading">Proposed code</h3>
-              <pre class="proposal-code__content" aria-label="Proposed code">No proposal available.</pre>
+              <pre class="proposal-code__content" id="proposal-proposed-code" aria-label="Proposed code">No proposal available.</pre>
             </section>
           </div>
 
@@ -189,7 +191,7 @@
         </section>
 
         <section class="bottom-actions" id="bottom-actions" aria-label="Code actions">
-          <button class="action-button action-button--primary" id="generate-code-button" type="button" disabled>Generate code</button>
+          <button class="action-button action-button--primary" id="generate-code-button" type="submit" form="prompt-form">Generate code</button>
           <button class="action-button" id="review-changes-button" type="button" disabled>Review changes</button>
           <button class="action-button" id="save-file-button" type="button" disabled>Save file</button>
         </section>
@@ -198,7 +200,7 @@
       <footer class="app-footer">
         <p id="concept-note">Conceptual layout preview, not the finished application. Monaco Editor will provide the actual editing experience.</p>
         <div id="notification-area" role="status" aria-live="polite" aria-label="Status and notifications">
-          Generation and proposal actions are not connected yet.
+          File and proposal review actions are not connected yet.
         </div>
       </footer>
     </div>
