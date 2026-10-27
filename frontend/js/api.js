@@ -68,6 +68,44 @@ function validateGeneration(payload) {
   return payload;
 }
 
+function validateRefactor(payload, expectedSourceCode) {
+  expectFields(
+    payload,
+    ['proposalId', 'status', 'originalCode', 'proposedCode', 'baseEditorHash'],
+    'refactoring proposal',
+  );
+  if (
+    typeof payload.proposalId !== 'string'
+    || payload.proposalId.trim().length === 0
+    || payload.status !== 'PENDING'
+    || payload.originalCode !== expectedSourceCode
+    || typeof payload.proposedCode !== 'string'
+    || payload.proposedCode.trim().length === 0
+    || typeof payload.baseEditorHash !== 'string'
+    || !/^fnv1a64:[0-9a-f]{16}$/.test(payload.baseEditorHash)
+  ) {
+    throw new ApiError(
+      'INVALID_RESPONSE',
+      'The backend returned an invalid refactoring proposal.',
+    );
+  }
+  return payload;
+}
+
+function validateProposalDecision(payload, expectedProposalId, expectedStatus) {
+  expectFields(payload, ['proposalId', 'status'], 'proposal decision');
+  if (
+    payload.proposalId !== expectedProposalId
+    || payload.status !== expectedStatus
+  ) {
+    throw new ApiError(
+      'INVALID_RESPONSE',
+      'The backend response did not confirm the requested proposal decision.',
+    );
+  }
+  return payload;
+}
+
 export function createApiClient({
   baseUrl = BACKEND_BASE_URL,
   fetchImpl = globalThis.fetch,
@@ -153,6 +191,17 @@ export function createApiClient({
     return payload;
   }
 
+  async function sendProposalDecision(proposalId, action, expectedStatus) {
+    if (typeof proposalId !== 'string' || proposalId.trim().length === 0) {
+      throw new ApiError('INVALID_REQUEST', 'A valid proposal ID is required.');
+    }
+    const payload = await requestJson(
+      `/api/changes/${encodeURIComponent(proposalId)}/${action}`,
+      { method: 'POST' },
+    );
+    return validateProposalDecision(payload, proposalId, expectedStatus);
+  }
+
   return Object.freeze({
     async getHealth() {
       return validateHealth(await requestJson('/api/health'));
@@ -173,6 +222,29 @@ export function createApiClient({
       });
       return validateGeneration(payload);
     },
+
+    async refactorCode(request = {}) {
+      const fields = isObject(request) ? request : {};
+      const refactorRequest = {
+        sourceCode: fields.sourceCode,
+        instruction: fields.instruction,
+        language: fields.language,
+        editorRevision: fields.editorRevision,
+      };
+      const payload = await requestJson('/api/refactor', {
+        method: 'POST',
+        body: refactorRequest,
+      });
+      return validateRefactor(payload, refactorRequest.sourceCode);
+    },
+
+    async approveProposal(proposalId) {
+      return sendProposalDecision(proposalId, 'approve', 'APPROVED');
+    },
+
+    async rejectProposal(proposalId) {
+      return sendProposalDecision(proposalId, 'reject', 'REJECTED');
+    },
   });
 }
 
@@ -181,3 +253,6 @@ const defaultClient = createApiClient();
 export const getHealth = () => defaultClient.getHealth();
 export const getConfig = () => defaultClient.getConfig();
 export const generateCode = (request) => defaultClient.generateCode(request);
+export const refactorCode = (request) => defaultClient.refactorCode(request);
+export const approveProposal = (proposalId) => defaultClient.approveProposal(proposalId);
+export const rejectProposal = (proposalId) => defaultClient.rejectProposal(proposalId);

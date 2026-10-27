@@ -1,4 +1,12 @@
-import { ApiError, generateCode, getConfig, getHealth } from './api.js';
+import {
+  ApiError,
+  approveProposal,
+  generateCode,
+  getConfig,
+  getHealth,
+  refactorCode,
+  rejectProposal,
+} from './api.js';
 
 const SAMPLE_ORIGINAL_CODE = `#include <iostream>
 
@@ -36,8 +44,12 @@ const REQUIRED_ELEMENTS = [
   '#generate-submit-button',
   '#generate-code-button',
   '#proposal-review-status',
+  '#proposal-review-availability',
   '#proposal-original-code',
   '#proposal-proposed-code',
+  '#accept-proposal-button',
+  '#reject-proposal-button',
+  '#save-file-button',
 ];
 
 let appInitializationStarted = false;
@@ -79,17 +91,46 @@ function initializeApp() {
   const backendConfigOutputDirectory = document.querySelector('#backend-config-output-directory');
   const backendConfigError = document.querySelector('#backend-config-error');
   const proposalReviewStatus = document.querySelector('#proposal-review-status');
+  const proposalReviewAvailability = document.querySelector('#proposal-review-availability');
   const proposalOriginalCode = document.querySelector('#proposal-original-code');
   const proposalProposedCode = document.querySelector('#proposal-proposed-code');
-  const generateButtons = [
+  const acceptProposalButton = document.querySelector('#accept-proposal-button');
+  const rejectProposalButton = document.querySelector('#reject-proposal-button');
+  const saveFileButton = document.querySelector('#save-file-button');
+  const submitButtons = [
     document.querySelector('#generate-submit-button'),
     document.querySelector('#generate-code-button'),
   ];
-  let submissionInProgress = false;
-  let generationRequestId = 0;
+  let workflowInProgress = false;
   let backendRefreshPromise = null;
+  let editorRevisionSequence = 0;
+  let selectedMode = 'generate';
+  let activeProposal = null;
   const originalCode = SAMPLE_ORIGINAL_CODE;
   let draftCode = originalCode;
+
+  function renderDecisionControls() {
+    const canDecide = activeProposal?.status === 'PENDING' && !workflowInProgress;
+    acceptProposalButton.disabled = !canDecide;
+    rejectProposalButton.disabled = !canDecide;
+    saveFileButton.disabled = true;
+  }
+
+  function setWorkflowInProgress(isInProgress, actionLabel = '') {
+    workflowInProgress = isInProgress;
+    promptInput.disabled = isInProgress;
+    languageInput.disabled = isInProgress;
+    modeButtons.forEach((button) => {
+      button.disabled = isInProgress || button.dataset.mode === 'files';
+    });
+    submitButtons.forEach((button) => {
+      button.disabled = isInProgress;
+      button.textContent = isInProgress
+        ? actionLabel
+        : selectedMode === 'refactor' ? 'Create proposal' : 'Generate code';
+    });
+    renderDecisionControls();
+  }
 
   function renderLineNumbers() {
     const fragment = document.createDocumentFragment();
@@ -220,6 +261,7 @@ function initializeApp() {
     promptFeedback.hidden = true;
     promptInput.removeAttribute('aria-invalid');
     languageInput.removeAttribute('aria-invalid');
+    codeEditor.removeAttribute('aria-invalid');
   }
 
   function generationErrorMessage(error) {
@@ -232,8 +274,70 @@ function initializeApp() {
     return `Generation failed${code}: ${message}`;
   }
 
-  async function submitGeneration() {
-    if (submissionInProgress) {
+  function clearProposalForNewRequest() {
+    activeProposal = null;
+    renderDecisionControls();
+  }
+
+  function decisionFailureMessage(error, action) {
+    const actionName = action === 'approve' ? 'Approval' : 'Rejection';
+    if (error instanceof ApiError && error.status === 409) {
+      return `${actionName} conflicted with the backend state (HTTP 409). The current decision is unknown.`;
+    }
+    if (error instanceof ApiError && error.status === 404) {
+      return 'The backend no longer has this proposal (HTTP 404). Its decision state is unknown.';
+    }
+    if (error instanceof ApiError && error.status !== null) {
+      return `${actionName} was not confirmed (HTTP ${error.status}). The proposal is no longer actionable here.`;
+    }
+    if (error instanceof ApiError) {
+      return `${actionName} was not confirmed. ${error.message} The backend may have processed it; the proposal is disabled because its current state cannot be queried.`;
+    }
+    return `${actionName} was not confirmed. The backend may have processed it; the proposal is disabled because its current state cannot be queried.`;
+  }
+
+  async function submitProposalDecision(action) {
+    if (workflowInProgress || activeProposal?.status !== 'PENDING') {
+      return;
+    }
+
+    const proposal = activeProposal;
+    setWorkflowInProgress(true, action === 'approve' ? 'Approving…' : 'Rejecting…');
+    renderStatus(action === 'approve' ? 'Waiting for approval confirmation…' : 'Waiting for rejection confirmation…');
+
+    try {
+      const confirmed = action === 'approve'
+        ? await approveProposal(proposal.id)
+        : await rejectProposal(proposal.id);
+
+      if (activeProposal?.id !== proposal.id) {
+        return;
+      }
+      activeProposal = { ...proposal, status: confirmed.status };
+      proposalReviewStatus.textContent = confirmed.status === 'APPROVED'
+        ? 'Approved'
+        : 'Rejected';
+      proposalReviewAvailability.textContent = confirmed.status === 'APPROVED'
+        ? 'The backend confirmed approval. This proposal has not been saved or applied.'
+        : 'The backend confirmed rejection. This proposal cannot be approved or saved.';
+      renderStatus(confirmed.status === 'APPROVED'
+        ? 'Proposal approved. No file was saved or changed.'
+        : 'Proposal rejected. No file was saved or changed.');
+    } catch (error) {
+      if (activeProposal?.id === proposal.id) {
+        activeProposal = { ...proposal, status: 'UNKNOWN' };
+      }
+      const message = decisionFailureMessage(error, action);
+      proposalReviewStatus.textContent = 'Decision unconfirmed';
+      proposalReviewAvailability.textContent = `${message} No proposal-status lookup is available, so further decisions are disabled.`;
+      renderStatus(message);
+    } finally {
+      setWorkflowInProgress(false);
+    }
+  }
+
+  async function submitWorkflow() {
+    if (workflowInProgress) {
       return;
     }
 
@@ -242,7 +346,9 @@ function initializeApp() {
     const language = languageInput.value;
 
     if (instruction.trim().length === 0) {
-      renderValidationError('Enter an instruction before generating code.');
+      renderValidationError(selectedMode === 'refactor'
+        ? 'Enter an instruction before creating a proposal.'
+        : 'Enter an instruction before generating code.');
       return;
     }
     if (language.trim().length === 0) {
@@ -254,67 +360,109 @@ function initializeApp() {
     }
 
     languageInput.removeAttribute('aria-invalid');
-    submissionInProgress = true;
-    const requestId = ++generationRequestId;
     const originalSource = codeEditor.value;
+    if (selectedMode === 'refactor' && originalSource.trim().length === 0) {
+      renderValidationError('Enter source code before creating a proposal.', codeEditor);
+      return;
+    }
 
-    promptInput.disabled = true;
-    languageInput.disabled = true;
-    generateButtons.forEach((button) => {
-      button.disabled = true;
-      button.textContent = 'Generating…';
-    });
+    const requestMode = selectedMode;
+    clearProposalForNewRequest();
+    setWorkflowInProgress(true, requestMode === 'refactor' ? 'Creating…' : 'Generating…');
     proposalOriginalCode.textContent = originalSource;
-    proposalProposedCode.textContent = 'Generating…';
-    proposalReviewStatus.textContent = 'Generating code…';
-    renderStatus('Generating code with the backend…');
+    proposalProposedCode.textContent = requestMode === 'refactor'
+      ? 'Creating proposal…'
+      : 'Generating code…';
+    proposalReviewStatus.textContent = requestMode === 'refactor'
+      ? 'Creating proposal…'
+      : 'Generating code…';
+    proposalReviewAvailability.textContent = requestMode === 'refactor'
+      ? 'Waiting for a confirmed backend proposal.'
+      : 'Generated output cannot be approved or rejected.';
+    renderStatus(requestMode === 'refactor'
+      ? 'Creating a refactoring proposal with the backend…'
+      : 'Generating code with the backend…');
 
     try {
-      const response = await generateCode({ instruction, language });
-      if (requestId !== generationRequestId) {
-        return;
+      if (requestMode === 'refactor') {
+        const proposal = await refactorCode({
+          sourceCode: originalSource,
+          instruction,
+          language,
+          editorRevision: `frontend-revision-${++editorRevisionSequence}`,
+        });
+        activeProposal = {
+          id: proposal.proposalId,
+          status: 'PENDING',
+        };
+        proposalOriginalCode.textContent = proposal.originalCode;
+        proposalProposedCode.textContent = proposal.proposedCode;
+        proposalReviewStatus.textContent = 'Proposed · PENDING';
+        proposalReviewAvailability.textContent = 'This proposal is pending backend review. Approval does not save or apply it.';
+        renderStatus('Refactoring proposal is ready for review. It has not been approved or saved.');
+      } else {
+        const response = await generateCode({ instruction, language });
+        proposalOriginalCode.textContent = originalSource;
+        proposalProposedCode.textContent = response.generatedCode;
+        proposalReviewStatus.textContent = 'Generated output · not a proposal';
+        proposalReviewAvailability.textContent = 'Generated output has no proposal ID and cannot be approved or rejected.';
+        renderStatus('Generated code is displayed. It is not a proposal and has not been saved.');
       }
-
-      proposalOriginalCode.textContent = originalSource;
-      proposalProposedCode.textContent = response.generatedCode;
-      proposalReviewStatus.textContent = 'Proposal ready for review';
-      renderStatus('Generated code is ready for review. It has not been applied or saved.');
     } catch (error) {
-      if (requestId !== generationRequestId) {
-        return;
-      }
-
-      proposalProposedCode.textContent = 'No proposal was generated.';
-      proposalReviewStatus.textContent = 'Generation failed';
-      const message = generationErrorMessage(error);
+      activeProposal = null;
+      const message = requestMode === 'refactor'
+        ? error instanceof ApiError
+          ? `Proposal was not confirmed (${error.code}): ${error.message}`
+          : 'Proposal was not confirmed. The backend may have processed the request, but no proposal ID was received.'
+        : generationErrorMessage(error);
+      proposalProposedCode.textContent = requestMode === 'refactor'
+        ? 'No confirmed proposal is available.'
+        : 'No generated code is available.';
+      proposalReviewStatus.textContent = requestMode === 'refactor'
+        ? 'Proposal unconfirmed'
+        : 'Generation failed';
+      proposalReviewAvailability.textContent = requestMode === 'refactor'
+        ? 'No confirmed proposal ID is available, so review decisions are disabled.'
+        : 'Generation did not produce reviewable proposal state.';
       promptFeedback.textContent = message;
       promptFeedback.hidden = false;
       renderStatus(message);
     } finally {
-      if (requestId === generationRequestId) {
-        submissionInProgress = false;
-        promptInput.disabled = false;
-        languageInput.disabled = false;
-        generateButtons.forEach((button) => {
-          button.disabled = false;
-          button.textContent = 'Generate code';
-        });
-      }
+      setWorkflowInProgress(false);
     }
   }
 
   function selectMode(selectedButton) {
+    if (workflowInProgress) {
+      return;
+    }
+    selectedMode = selectedButton.dataset.mode;
     modeButtons.forEach((button) => {
       button.setAttribute(
         'aria-pressed',
         String(button === selectedButton),
       );
     });
+    submitButtons.forEach((button) => {
+      button.textContent = selectedMode === 'refactor' ? 'Create proposal' : 'Generate code';
+    });
+    promptInput.placeholder = selectedMode === 'refactor'
+      ? 'Describe how to refactor the current code.'
+      : 'Describe the code to generate.';
   }
 
   modeButtons.forEach((button) => {
     button.addEventListener('click', () => selectMode(button));
   });
+
+  acceptProposalButton.addEventListener('click', () => {
+    void submitProposalDecision('approve');
+  });
+  rejectProposalButton.addEventListener('click', () => {
+    void submitProposalDecision('reject');
+  });
+
+  renderDecisionControls();
 
   backendRetryButton.addEventListener('click', () => {
     void refreshBackendInformation();
@@ -322,7 +470,7 @@ function initializeApp() {
 
   promptForm.addEventListener('submit', (event) => {
     event.preventDefault();
-    void submitGeneration();
+    void submitWorkflow();
   });
 
   void refreshBackendInformation();
