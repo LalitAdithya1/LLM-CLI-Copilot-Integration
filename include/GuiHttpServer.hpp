@@ -57,6 +57,11 @@ public:
     // Returns false for an invalid/occupied port or a startup failure.
     bool start();
 
+    // Serves the browser frontend from directory at "/" alongside the API.
+    // Call before start(). Returns false when the directory does not exist or
+    // the server has already been started.
+    bool serveFrontend(const std::filesystem::path& directory);
+
     // Stops the listener and joins its worker thread. Safe to call repeatedly.
     void stop();
 

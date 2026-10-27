@@ -201,6 +201,86 @@ TEST(GuiHttpServerTest, RejectsForeignOriginAndUnexpectedHost) {
     server.stop();
 }
 
+TEST(GuiHttpServerTest, AllowsItsOwnLoopbackOriginForTheBundledFrontend) {
+    GuiHttpServer server(0);
+    ASSERT_TRUE(server.start());
+    httplib::Client client("127.0.0.1", server.port());
+    const std::string port = std::to_string(server.port());
+    for (const auto& origin : {"http://127.0.0.1:" + port, "http://localhost:" + port}) {
+        httplib::Headers headers{{"Origin", origin}};
+        const auto response = client.Post("/api/diff", headers,
+            R"({"originalCode":"a\n","proposedCode":"b\n"})", "application/json");
+        ASSERT_TRUE(response);
+        EXPECT_EQ(response->status, 200);
+        EXPECT_EQ(response->get_header_value("Access-Control-Allow-Origin"), origin);
+    }
+    const std::string otherPort = std::to_string(server.port() == 65535 ? 1 : server.port() + 1);
+    for (const auto& origin : {"http://127.0.0.1:" + otherPort, "https://127.0.0.1:" + port,
+                               "http://0.0.0.0:" + port}) {
+        httplib::Headers headers{{"Origin", origin}};
+        const auto response = client.Get("/api/health", headers);
+        ASSERT_TRUE(response);
+        EXPECT_EQ(response->status, 403);
+    }
+    server.stop();
+}
+
+TEST(GuiHttpServerTest, ServesFrontendFilesWithSecurityHeadersAlongsideTheApi) {
+    const auto directory = std::filesystem::temp_directory_path() /
+        ("codeagent-frontend-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(directory / "js");
+    std::ofstream(directory / "index.html") << "<!doctype html><title>CodeAgent</title>";
+    std::ofstream(directory / "js/app.js") << "console.log('ok');";
+    std::ofstream(directory.parent_path() / (directory.filename().string() + "-secret.txt"))
+        << "secret";
+
+    GuiHttpServer missing(0);
+    EXPECT_FALSE(missing.serveFrontend(directory / "does-not-exist"));
+
+    GuiHttpServer server(0);
+    ASSERT_TRUE(server.serveFrontend(directory));
+    ASSERT_TRUE(server.start());
+    EXPECT_FALSE(server.serveFrontend(directory));
+    httplib::Client client("127.0.0.1", server.port());
+
+    const auto index = client.Get("/");
+    ASSERT_TRUE(index);
+    EXPECT_EQ(index->status, 200);
+    EXPECT_NE(index->body.find("CodeAgent"), std::string::npos);
+    EXPECT_NE(index->get_header_value("Content-Type").find("text/html"), std::string::npos);
+    EXPECT_EQ(index->get_header_value("X-Content-Type-Options"), "nosniff");
+    EXPECT_NE(index->get_header_value("Content-Security-Policy").find("default-src 'self'"),
+              std::string::npos);
+
+    const auto script = client.Get("/js/app.js");
+    ASSERT_TRUE(script);
+    EXPECT_EQ(script->status, 200);
+    EXPECT_EQ(script->get_header_value("Content-Type"), "text/javascript");
+
+    const auto traversal = client.Get(
+        "/../" + directory.filename().string() + "-secret.txt");
+    ASSERT_TRUE(traversal);
+    EXPECT_NE(traversal->status, 200);
+    EXPECT_EQ(traversal->body.find("secret"), std::string::npos);
+
+    const auto health = client.Get("/api/health");
+    ASSERT_TRUE(health);
+    EXPECT_EQ(health->status, 200);
+    EXPECT_EQ(nlohmann::json::parse(health->body).at("status"), "ok");
+
+    const auto missingApi = client.Get("/api/missing");
+    ASSERT_TRUE(missingApi);
+    EXPECT_EQ(missingApi->status, 404);
+    EXPECT_EQ(nlohmann::json::parse(missingApi->body).at("error").at("code"), "NOT_FOUND");
+
+    server.stop();
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+    std::filesystem::remove(
+        directory.parent_path() / (directory.filename().string() + "-secret.txt"), ignored);
+}
+
 TEST(GuiHttpServerTest, RejectsNullAndMalformedOrigins) {
     GuiHttpServer server(0);
     ASSERT_TRUE(server.start());

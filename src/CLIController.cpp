@@ -1,6 +1,7 @@
 
 #include "CLIController.hpp"
 
+#include "EnvLoader.hpp"
 #include "FileManager.hpp"
 #include "GuiHttpServer.hpp"
 #include "PromptBuilder.hpp"
@@ -11,21 +12,110 @@
 #include <cctype>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace {
 
 volatile std::sig_atomic_t guiStopRequested = 0;
+constexpr int kDefaultGuiPort = 8080;
 
 void requestGuiStop(int) {
     guiStopRequested = 1;
 }
 
+bool isSetEnvironmentValue(const char* value) {
+    if (value == nullptr) {
+        return false;
+    }
+    for (const char* character = value; *character != '\0'; ++character) {
+        if (!std::isspace(static_cast<unsigned char>(*character))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// CODEAGENT_GUI_PORT overrides the default port, e.g. when 8080 is taken.
+bool resolveGuiPort(int& port, std::ostream& error) {
+    const char* value = std::getenv("CODEAGENT_GUI_PORT");
+    if (!isSetEnvironmentValue(value)) {
+        port = kDefaultGuiPort;
+        return true;
+    }
+    const std::string text(value);
+    const bool digitsOnly = text.size() <= 5 && std::all_of(
+        text.begin(), text.end(),
+        [](unsigned char character) { return std::isdigit(character) != 0; }
+    );
+    port = digitsOnly ? std::stoi(text) : 0;
+    if (port < 1 || port > 65535) {
+        error << "Error: CODEAGENT_GUI_PORT must be a port number from 1 to 65535.\n";
+        return false;
+    }
+    return true;
+}
+
+bool containsFrontend(const std::filesystem::path& directory) {
+    std::error_code ignored;
+    return std::filesystem::is_regular_file(directory / "index.html", ignored);
+}
+
+// Finds the frontend independently of the working directory: an explicit
+// CODEAGENT_FRONTEND_DIR, then locations relative to the executable (build
+// tree or installed share/codeagent), then the source tree it was built from.
+std::filesystem::path findFrontendDirectory(std::ostream& error) {
+    const char* configured = std::getenv("CODEAGENT_FRONTEND_DIR");
+    if (isSetEnvironmentValue(configured)) {
+        if (containsFrontend(configured)) {
+            return configured;
+        }
+        error << "Warning: CODEAGENT_FRONTEND_DIR does not contain index.html; "
+              << "searching the default locations.\n";
+    }
+
+    std::vector<std::filesystem::path> candidates;
+    std::error_code executableError;
+    const auto executable =
+        std::filesystem::read_symlink("/proc/self/exe", executableError);
+    if (!executableError) {
+        const auto directory = executable.parent_path();
+        candidates.push_back(directory / "frontend");
+        candidates.push_back(directory.parent_path() / "frontend");
+        candidates.push_back(directory.parent_path() / "share/codeagent/frontend");
+    }
+#ifdef CODEAGENT_FRONTEND_SOURCE_DIR
+    candidates.emplace_back(CODEAGENT_FRONTEND_SOURCE_DIR);
+#endif
+    for (const auto& candidate : candidates) {
+        if (containsFrontend(candidate)) {
+            return candidate.lexically_normal();
+        }
+    }
+    return {};
+}
+
 int runGuiCommand(std::ostream& output, std::ostream& error) {
+    int port = kDefaultGuiPort;
+    if (!resolveGuiPort(port, error)) {
+        return 1;
+    }
+
+    // Report a missing key at startup instead of only on the first request.
+    // The key itself is never printed or sent to the browser.
+    loadEnvFile(".env");
+    if (!isSetEnvironmentValue(std::getenv("GEMINI_API_KEY"))) {
+        error << "Warning: GEMINI_API_KEY is not set. Add it to a .env file in "
+              << "the launch directory or export it; generation and "
+              << "refactoring will fail until it is configured.\n";
+    }
+
     GuiHttpServer::GenerationHandler generationHandler =
         [](const std::string& instruction,
            const std::string& language,
@@ -61,15 +151,24 @@ int runGuiCommand(std::ostream& output, std::ostream& error) {
             return client.generateCompleteContent(prompt, refactoredCode);
         };
     GuiHttpServer server(
-        8080,
+        port,
         std::filesystem::current_path(),
         std::move(generationHandler),
         std::move(refactoringHandler)
     );
+    const auto frontendDirectory = findFrontendDirectory(error);
+    const bool servingFrontend =
+        !frontendDirectory.empty() && server.serveFrontend(frontendDirectory);
+    if (!servingFrontend) {
+        error << "Warning: Frontend files were not found; only the API is "
+              << "available. Set CODEAGENT_FRONTEND_DIR to the frontend "
+              << "directory that contains index.html.\n";
+    }
     if (!server.start()) {
         error << "Error: Could not start the GUI server on 127.0.0.1:"
-              << (server.port() == 0 ? 8080 : server.port())
-              << ". The port may be unavailable or already in use.\n";
+              << port << ". The port may be in use by another program "
+              << "(is another 'codeagent gui' running?). Stop it or choose "
+              << "another port, e.g. CODEAGENT_GUI_PORT=8081 codeagent gui\n";
         return 1;
     }
 
@@ -93,11 +192,22 @@ int runGuiCommand(std::ostream& output, std::ostream& error) {
     }
 #endif
 
-    output << "GUI backend listening at http://127.0.0.1:"
-           << server.port() << "\n"
-           << "Health endpoint: http://127.0.0.1:"
-           << server.port() << "/api/health\n"
-           << "Press Ctrl+C to stop.\n";
+    const std::string url =
+        "http://127.0.0.1:" + std::to_string(server.port()) + "/";
+    output << "CodeAgent GUI running at " << url << "\n"
+           << "Health endpoint: " << url << "api/health\n";
+    if (servingFrontend) {
+        output << "Serving frontend from " << frontendDirectory.string() << "\n";
+        if (isSetEnvironmentValue(std::getenv("CODEAGENT_NO_BROWSER"))) {
+            output << "Open " << url << " in your browser.\n";
+        } else if (launchDefaultBrowser(url)) {
+            output << "Opening your default browser...\n";
+        } else {
+            output << "Could not open a browser automatically. Open "
+                   << url << " in your browser.\n";
+        }
+    }
+    output << "Press Ctrl+C to stop.\n";
     output.flush();
 
     while (guiStopRequested == 0 && server.isRunning()) {
@@ -123,12 +233,17 @@ void displayHelp(std::ostream& output) {
         << "  codeagent generate \"<instruction>\"\n"
         << "  codeagent refactor <file-path> \"<instruction>\"\n\n"
         << "Commands:\n"
-        << "  gui        Start the local GUI backend (Ctrl+C to stop)\n"
+        << "  gui        Start the browser GUI on 127.0.0.1 and open it (Ctrl+C to stop)\n"
         << "  generate   Generate code from an instruction\n"
         << "  refactor   Refactor a source file using AI\n"
         << "  help       Display this help message\n\n"
         << "Options:\n"
-        << "  -h, --help Display this help message\n";
+        << "  -h, --help Display this help message\n\n"
+        << "Environment:\n"
+        << "  GEMINI_API_KEY          Gemini API key (or set it in ./.env)\n"
+        << "  CODEAGENT_GUI_PORT      GUI port (default 8080)\n"
+        << "  CODEAGENT_NO_BROWSER    Set to 1 to skip opening a browser\n"
+        << "  CODEAGENT_FRONTEND_DIR  Directory containing the frontend index.html\n";
 }
 
 void displayUsageError(std::ostream& error, const std::string& message) {

@@ -3,6 +3,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <string>
 
 enum class NativeDialogKind {
     SourceFile,
@@ -31,5 +32,10 @@ public:
 // Creates the platform provider. Ubuntu/Linux uses zenity when a graphical
 // display is available; unsupported or headless systems report unavailable.
 std::shared_ptr<NativeDialogProvider> createNativeDialogProvider();
+
+// Asks the desktop to open url in the default browser without waiting for it.
+// WSL uses wslview or explorer.exe, Linux uses xdg-open, macOS uses open.
+// Returns false when no launcher could be started; the caller keeps running.
+bool launchDefaultBrowser(const std::string& url);
 
 #endif

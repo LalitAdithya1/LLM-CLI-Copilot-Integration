@@ -102,6 +102,19 @@ target_link_libraries(codeagent
         nlohmann_json::nlohmann_json
 )
 
+# Last-resort frontend location for `codeagent gui` when the executable is not
+# next to (or installed with) the frontend directory.
+target_compile_definitions(codeagent
+    PRIVATE
+        CODEAGENT_FRONTEND_SOURCE_DIR="${PROJECT_SOURCE_DIR}/frontend"
+)
+
+install(TARGETS codeagent RUNTIME DESTINATION bin)
+install(DIRECTORY frontend/
+    DESTINATION share/codeagent/frontend
+    PATTERN "tests" EXCLUDE
+)
+
 # --------------------------------------------------
 # FileManager tests
 # --------------------------------------------------

@@ -37,8 +37,12 @@ constexpr std::size_t kMaximumRetainedProposals = 128;
 
 using Json = nlohmann::json;
 
-bool isAllowedGuiOrigin(const std::string& origin) {
-    return origin == kAllowedGuiOrigin || origin == kAllowedGuiLocalhostOrigin;
+// The bundled frontend is served by this server, so its own loopback origin is
+// allowed as well as the standalone development server on port 5500.
+bool isAllowedGuiOrigin(const std::string& origin, int boundPort) {
+    const std::string port = ":" + std::to_string(boundPort);
+    return origin == kAllowedGuiOrigin || origin == kAllowedGuiLocalhostOrigin ||
+           origin == "http://127.0.0.1" + port || origin == "http://localhost" + port;
 }
 
 const std::vector<std::string>& supportedExtensions();
@@ -1077,7 +1081,8 @@ public:
             const auto originRange = request.headers.equal_range("Origin");
             const bool hasOrigin = originRange.first != originRange.second;
             if (hasOrigin) {
-                if (!hasSingleHeader(request, "Origin", origin) || !isAllowedGuiOrigin(origin)) {
+                if (!hasSingleHeader(request, "Origin", origin) ||
+                    !isAllowedGuiOrigin(origin, boundPort_)) {
                     setJsonError(response, 403, "ORIGIN_NOT_ALLOWED", "Request origin is not allowed.");
                     return httplib::Server::HandlerResponse::Handled;
                 }
@@ -1205,6 +1210,24 @@ public:
 
         state_ = State::Running;
         return true;
+    }
+
+    bool serveFrontend(const std::filesystem::path& directory) {
+        std::lock_guard<std::mutex> lock(lifecycleMutex_);
+        if (state_ != State::Ready) {
+            return false;
+        }
+        // cpp-httplib rejects ".." segments and symlinks escaping the
+        // directory. The policy keeps the page and its requests same-origin.
+        return server_.set_mount_point("/", directory.string(), {
+            {"X-Content-Type-Options", "nosniff"},
+            {"Cache-Control", "no-store"},
+            {"Referrer-Policy", "no-referrer"},
+            {"Content-Security-Policy",
+             "default-src 'self'; img-src 'self' data:; connect-src 'self'; "
+             "object-src 'none'; base-uri 'none'; form-action 'none'; "
+             "frame-ancestors 'none'"}
+        });
     }
 
     void stop() {
@@ -1362,6 +1385,10 @@ GuiHttpServer::~GuiHttpServer() = default;
 
 bool GuiHttpServer::start() {
     return impl_->start();
+}
+
+bool GuiHttpServer::serveFrontend(const std::filesystem::path& directory) {
+    return impl_->serveFrontend(directory);
 }
 
 void GuiHttpServer::stop() {

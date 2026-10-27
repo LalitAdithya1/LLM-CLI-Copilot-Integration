@@ -16,9 +16,14 @@ public:
 
 #else
 
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <fstream>
+#include <thread>
+#include <vector>
 #include <fcntl.h>
 #include <poll.h>
 #include <spawn.h>
@@ -204,3 +209,107 @@ public:
 std::shared_ptr<NativeDialogProvider> createNativeDialogProvider() {
     return std::make_shared<SystemNativeDialogProvider>();
 }
+
+#ifdef _WIN32
+
+bool launchDefaultBrowser(const std::string&) {
+    return false;
+}
+
+#else
+
+namespace {
+
+bool runningUnderWsl() {
+    const char* distribution = std::getenv("WSL_DISTRO_NAME");
+    if (distribution != nullptr && *distribution != '\0') {
+        return true;
+    }
+    std::ifstream release("/proc/sys/kernel/osrelease");
+    std::string text;
+    std::getline(release, text);
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return text.find("microsoft") != std::string::npos;
+}
+
+// Starts program with url as its only argument, detached from the terminal's
+// process group so Ctrl+C on the server does not reach the browser. Arguments
+// are passed directly to exec; no shell is involved.
+bool spawnBrowserLauncher(const char* program, const std::string& url) {
+    posix_spawn_file_actions_t actions;
+    if (::posix_spawn_file_actions_init(&actions) != 0) {
+        return false;
+    }
+    posix_spawnattr_t attributes;
+    if (::posix_spawnattr_init(&attributes) != 0) {
+        ::posix_spawn_file_actions_destroy(&actions);
+        return false;
+    }
+    int result = ::posix_spawn_file_actions_addopen(
+        &actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0
+    );
+    if (result == 0) {
+        result = ::posix_spawn_file_actions_addopen(
+            &actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0
+        );
+    }
+    if (result == 0) {
+        result = ::posix_spawn_file_actions_addopen(
+            &actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0
+        );
+    }
+    if (result == 0) {
+        result = ::posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP);
+    }
+    if (result == 0) {
+        result = ::posix_spawnattr_setpgroup(&attributes, 0);
+    }
+
+    std::string programArgument(program);
+    std::string urlArgument(url);
+    char* arguments[] = {programArgument.data(), urlArgument.data(), nullptr};
+    pid_t child = -1;
+    if (result == 0) {
+        result = ::posix_spawnp(&child, program, &actions, &attributes, arguments, environ);
+    }
+    ::posix_spawnattr_destroy(&attributes);
+    ::posix_spawn_file_actions_destroy(&actions);
+    if (result != 0) {
+        return false;
+    }
+
+    // Reap the launcher without blocking the server; launchers such as
+    // explorer.exe report unreliable exit codes, so the status is ignored.
+    std::thread([child] {
+        int status = 0;
+        while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    }).detach();
+    return true;
+}
+
+} // namespace
+
+bool launchDefaultBrowser(const std::string& url) {
+#ifdef __APPLE__
+    const std::vector<const char*> launchers = {"open"};
+#else
+    // Under WSL the Windows browser is the default; wslview is optional.
+    const bool wsl = runningUnderWsl();
+    if (!wsl && !graphicalDisplayAvailable()) {
+        return false;
+    }
+    const std::vector<const char*> launchers = wsl
+        ? std::vector<const char*>{"wslview", "explorer.exe"}
+        : std::vector<const char*>{"xdg-open"};
+#endif
+    for (const char* launcher : launchers) {
+        if (spawnBrowserLauncher(launcher, url)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+#endif
