@@ -68,6 +68,53 @@ Typical status codes: `400` invalid request, `404` missing resource, `409` state
 | `POST /api/save` | Save generated code or an approved proposal to the requested output location. |
 | `POST /api/session/exit` | Request graceful backend shutdown. |
 
+### B4 response schemas (agreed API contract)
+
+The following response fields and shapes are the agreed API contract for the B4 endpoints.
+
+#### `GET /api/health`
+
+On success, return HTTP `200` with a JSON response:
+
+```json
+{
+  "status": "ok"
+}
+```
+
+#### `GET /api/config`
+
+On success, return HTTP `200` with a JSON object containing exactly these fields:
+
+- `supportedExtensions`: an array of supported source-file extension strings.
+- `launchDirectory`: the absolute path captured when the GUI session is initialized.
+- `activeOutputDirectory`: the absolute path currently selected for output. Initially, it is equal to `launchDirectory`.
+
+The current supported extension list is:
+
+```json
+[
+  ".c",
+  ".cc",
+  ".cpp",
+  ".cxx",
+  ".h",
+  ".hh",
+  ".hpp",
+  ".hxx"
+]
+```
+
+Example successful response:
+
+```json
+{
+  "supportedExtensions": [".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"],
+  "launchDirectory": "/absolute/path/to/launch/directory",
+  "activeOutputDirectory": "/absolute/path/to/launch/directory"
+}
+```
+
 ### Example: generate code
 
 Request:

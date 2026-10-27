@@ -63,6 +63,7 @@ target_include_directories(GuiHttpServer
 target_link_libraries(GuiHttpServer
     PUBLIC
         httplib::httplib
+        nlohmann_json::nlohmann_json
 )
 
 # --------------------------------------------------

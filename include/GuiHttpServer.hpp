@@ -1,12 +1,17 @@
 #ifndef GUI_HTTP_SERVER_HPP
 #define GUI_HTTP_SERVER_HPP
 
+#include <filesystem>
 #include <memory>
 
 class GuiHttpServer {
 public:
     // A port of 0 asks the operating system to select an available port.
     explicit GuiHttpServer(int port = 8080);
+    GuiHttpServer(
+        int port,
+        std::filesystem::path launchWorkingDirectory
+    );
     ~GuiHttpServer();
 
     GuiHttpServer(const GuiHttpServer&) = delete;

@@ -1,22 +1,56 @@
 #include "GuiHttpServer.hpp"
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <mutex>
 #include <system_error>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace {
 
 constexpr const char* kLoopbackAddress = "127.0.0.1";
+constexpr const char* kJsonContentType = "application/json; charset=utf-8";
+
+const std::vector<std::string>& supportedExtensions() {
+    static const std::vector<std::string> extensions = {
+        ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"
+    };
+    return extensions;
+}
 
 } // namespace
 
 class GuiHttpServer::Impl {
 public:
-    explicit Impl(int requestedPort)
-        : requestedPort_(requestedPort) {
+    explicit Impl(
+        int requestedPort,
+        std::filesystem::path launchWorkingDirectory
+    )
+        : requestedPort_(requestedPort),
+          launchWorkingDirectory_(resolveLaunchDirectory(
+              std::move(launchWorkingDirectory)
+          )),
+          activeOutputDirectory_(launchWorkingDirectory_) {
+        server_.Get("/api/health", [](const httplib::Request&, httplib::Response& response) {
+            response.set_content(
+                nlohmann::json{{"status", "ok"}}.dump(),
+                kJsonContentType
+            );
+        });
+
+        server_.Get("/api/config", [this](const httplib::Request&, httplib::Response& response) {
+            const nlohmann::json config = {
+                {"supportedExtensions", supportedExtensions()},
+                {"launchDirectory", launchWorkingDirectory_.string()},
+                {"activeOutputDirectory", activeOutputDirectory_.string()}
+            };
+            response.set_content(config.dump(), kJsonContentType);
+        });
+
         server_.set_socket_options([](socket_t socket) {
 #ifdef _WIN32
             httplib::set_socket_opt(
@@ -113,6 +147,16 @@ public:
     }
 
 private:
+    static std::filesystem::path resolveLaunchDirectory(
+        std::filesystem::path launchWorkingDirectory
+    ) {
+        if (launchWorkingDirectory.empty()) {
+            launchWorkingDirectory = std::filesystem::current_path();
+        }
+        return std::filesystem::absolute(launchWorkingDirectory)
+            .lexically_normal();
+    }
+
     enum class State {
         Ready,
         Running,
@@ -122,6 +166,8 @@ private:
 
     httplib::Server server_;
     const int requestedPort_;
+    const std::filesystem::path launchWorkingDirectory_;
+    std::filesystem::path activeOutputDirectory_;
     std::atomic<int> boundPort_{0};
     State state_ = State::Ready;
     std::mutex lifecycleMutex_;
@@ -129,7 +175,16 @@ private:
 };
 
 GuiHttpServer::GuiHttpServer(int port)
-    : impl_(std::make_unique<Impl>(port)) {}
+    : GuiHttpServer(port, std::filesystem::current_path()) {}
+
+GuiHttpServer::GuiHttpServer(
+    int port,
+    std::filesystem::path launchWorkingDirectory
+)
+    : impl_(std::make_unique<Impl>(
+          port,
+          std::move(launchWorkingDirectory)
+      )) {}
 
 GuiHttpServer::~GuiHttpServer() = default;
 
