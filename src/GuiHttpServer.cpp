@@ -31,10 +31,15 @@ namespace {
 constexpr const char* kLoopbackAddress = "127.0.0.1";
 constexpr const char* kJsonContentType = "application/json; charset=utf-8";
 constexpr const char* kAllowedGuiOrigin = "http://127.0.0.1:5500";
+constexpr const char* kAllowedGuiLocalhostOrigin = "http://localhost:5500";
 constexpr std::size_t kMaxRequestBodyBytes = 1024 * 1024;
 constexpr std::size_t kMaximumRetainedProposals = 128;
 
 using Json = nlohmann::json;
+
+bool isAllowedGuiOrigin(const std::string& origin) {
+    return origin == kAllowedGuiOrigin || origin == kAllowedGuiLocalhostOrigin;
+}
 
 const std::vector<std::string>& supportedExtensions();
 
@@ -1072,7 +1077,7 @@ public:
             const auto originRange = request.headers.equal_range("Origin");
             const bool hasOrigin = originRange.first != originRange.second;
             if (hasOrigin) {
-                if (!hasSingleHeader(request, "Origin", origin) || origin != kAllowedGuiOrigin) {
+                if (!hasSingleHeader(request, "Origin", origin) || !isAllowedGuiOrigin(origin)) {
                     setJsonError(response, 403, "ORIGIN_NOT_ALLOWED", "Request origin is not allowed.");
                     return httplib::Server::HandlerResponse::Handled;
                 }
@@ -1090,14 +1095,14 @@ public:
                     setJsonError(response, 403, "INVALID_PREFLIGHT", "Preflight request is not allowed.");
                     return httplib::Server::HandlerResponse::Handled;
                 }
-                response.set_header("Access-Control-Allow-Origin", kAllowedGuiOrigin);
+                response.set_header("Access-Control-Allow-Origin", origin);
                 response.status = 204;
                 response.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
                 response.set_header("Access-Control-Allow-Headers", "Content-Type");
                 response.set_header("Access-Control-Max-Age", "600");
                 return httplib::Server::HandlerResponse::Handled;
             }
-            if (hasOrigin) response.set_header("Access-Control-Allow-Origin", kAllowedGuiOrigin);
+            if (hasOrigin) response.set_header("Access-Control-Allow-Origin", origin);
             return httplib::Server::HandlerResponse::Unhandled;
         });
 

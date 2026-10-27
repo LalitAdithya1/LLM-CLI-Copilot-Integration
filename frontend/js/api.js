@@ -1,4 +1,14 @@
-export const BACKEND_BASE_URL = 'http://127.0.0.1:8080';
+export function getBackendBaseUrl() {
+  if (typeof window !== 'undefined' && window.location && window.location.hostname) {
+    const host = window.location.hostname;
+    if (host === 'localhost' || host === '127.0.0.1') {
+      return `${window.location.protocol}//${host}:8080`;
+    }
+  }
+  return 'http://127.0.0.1:8080';
+}
+
+export const BACKEND_BASE_URL = getBackendBaseUrl();
 
 export class ApiError extends Error {
   constructor(code, message, status = null) {

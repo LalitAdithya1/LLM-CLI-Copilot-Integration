@@ -34,9 +34,9 @@ This is a logical design; class names and boundaries must be confirmed against t
 ## 2. Common Rules
 
 - The backend binds to IPv4 loopback `127.0.0.1` and validates each `/api/` request's single `Host` header against `127.0.0.1:<actual backend port>` or `localhost:<actual backend port>`. Other hosts, ports, missing Host headers, and duplicate Host headers receive `400 INVALID_HOST`.
-- The supported browser GUI origin is exactly `http://127.0.0.1:5500`. Responses to that origin include `Access-Control-Allow-Origin` with that exact value; origins are never reflected and wildcard CORS is not used.
-- The server handles preflight `OPTIONS` for API paths only when the Origin is the configured GUI origin, the requested method is `GET` or `POST`, and requested headers are absent or limited to `Content-Type`. Accepted preflights advertise `GET, POST, OPTIONS` and `Content-Type`.
-- Any present Origin on an API request must be exactly `http://127.0.0.1:5500`. Foreign, `null`, malformed, or duplicate Origin headers receive `403 ORIGIN_NOT_ALLOWED` before route handlers run, including state-changing routes with empty bodies.
+- The supported browser GUI origins are exactly `http://127.0.0.1:5500` and `http://localhost:5500` (for direct loopback and WSL/container forwarding compatibility). Responses to an allowed origin include `Access-Control-Allow-Origin` matching that origin; wildcard CORS is not used.
+- The server handles preflight `OPTIONS` for API paths only when the Origin is a configured GUI origin, the requested method is `GET` or `POST`, and requested headers are absent or limited to `Content-Type`. Accepted preflights advertise `GET, POST, OPTIONS` and `Content-Type`.
+- Any present Origin on an API request must be exactly `http://127.0.0.1:5500` or `http://localhost:5500`. Foreign, `null`, malformed, or duplicate Origin headers receive `403 ORIGIN_NOT_ALLOWED` before route handlers run, including state-changing routes with empty bodies.
 - Requests with no Origin are accepted as non-browser local clients for CLI and automated-test compatibility. Host validation still applies. This is not client authentication: other local processes can make requests, and browser protection relies on browsers sending Origin for cross-origin requests. Do not expose the backend beyond loopback.
 - Use JSON request bodies (`Content-Type: application/json`) and JSON responses.
 - Capture the terminal's current working directory when `codeagent gui` starts. This is the immutable default output directory.

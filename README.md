@@ -201,7 +201,7 @@ For local frontend development, serve the existing frontend from the exact allow
 python3 -m http.server 5500 --bind 127.0.0.1 --directory frontend
 ```
 
-Then open `http://127.0.0.1:5500`. The backend runs at `http://127.0.0.1:8080` until Ctrl+C. The API only permits browser requests from this exact frontend origin; other origins and `Origin: null` are rejected. Requests without an Origin are accepted for non-browser local clients, with Host validation still enforced.
+Then open `http://127.0.0.1:5500` (or `http://localhost:5500`). The backend runs at `http://127.0.0.1:8080` until Ctrl+C. The API permits browser requests from these exact local frontend origins (`http://127.0.0.1:5500` and `http://localhost:5500`); other origins and `Origin: null` are rejected. Requests without an Origin are accepted for non-browser local clients, with Host validation still enforced.
 
 The frontend supports health/config display, code generation, refactoring from text in the editor, server-backed diff review, proposal approval/rejection, output-directory selection, and saving approved proposals. Save filenames must be supported C/C++ source filenames. Existing-file replacement requires a confirmation prompt. Generated output is not saved by the current UI. The source picker returns a path only; it does not load file contents. The editor is a plain text area. Files mode, settings, and copy controls are disabled placeholders.
 

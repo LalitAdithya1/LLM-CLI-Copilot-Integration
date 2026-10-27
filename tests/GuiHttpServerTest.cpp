@@ -134,13 +134,14 @@ TEST(GuiHttpServerTest, AllowsConfiguredOriginAndReturnsCorsHeader) {
     GuiHttpServer server(0);
     ASSERT_TRUE(server.start());
     httplib::Client client("127.0.0.1", server.port());
-    httplib::Headers headers{{"Origin", "http://127.0.0.1:5500"}};
-    const auto response = client.Get("/api/health", headers);
-    ASSERT_TRUE(response);
-    EXPECT_EQ(response->status, 200);
-    EXPECT_EQ(response->get_header_value("Access-Control-Allow-Origin"),
-              "http://127.0.0.1:5500");
-    EXPECT_EQ(response->get_header_value("Vary"), "Origin");
+    for (const auto& origin : {"http://127.0.0.1:5500", "http://localhost:5500"}) {
+        httplib::Headers headers{{"Origin", origin}};
+        const auto response = client.Get("/api/health", headers);
+        ASSERT_TRUE(response);
+        EXPECT_EQ(response->status, 200);
+        EXPECT_EQ(response->get_header_value("Access-Control-Allow-Origin"), origin);
+        EXPECT_EQ(response->get_header_value("Vary"), "Origin");
+    }
     server.stop();
 }
 
