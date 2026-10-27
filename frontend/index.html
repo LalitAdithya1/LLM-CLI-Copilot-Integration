@@ -114,23 +114,24 @@
               </button>
             </header>
 
-            <div class="code-preview" id="code-preview" role="region" aria-label="Code preview">
-              <ol class="line-numbers" aria-hidden="true">
-                <li></li>
-                <li></li>
-                <li></li>
-                <li></li>
-                <li></li>
-                <li></li>
-                <li></li>
-                <li></li>
-              </ol>
-              <pre class="code-placeholder"><code id="code-content">Code preview will be available when backend support is implemented.</code></pre>
+            <div class="code-preview" id="code-preview" role="region" aria-label="Editable sample code workspace">
+              <ol class="line-numbers" id="editor-line-numbers" aria-hidden="true"></ol>
+              <textarea
+                class="code-editor"
+                id="code-editor"
+                rows="12"
+                wrap="off"
+                spellcheck="false"
+                autocomplete="off"
+                aria-label="Editable C++ sample source for main.cpp"
+                aria-describedby="editor-description"
+              ></textarea>
             </div>
+            <p class="visually-hidden" id="editor-description">Sample source only; it was not loaded from a file. Edits stay in this page and are not saved or sent to a backend.</p>
 
             <footer class="preview-footer">
-              <span id="code-language">C++ · UTF-8</span>
-              <span id="code-status" role="status">Preview unavailable</span>
+              <span id="code-language">Sample workspace · not loaded from a file</span>
+              <span id="code-status" role="status">Unmodified</span>
             </footer>
           </section>
         </div>
