@@ -61,8 +61,30 @@
         </nav>
 
         <p class="availability-note" id="backend-unavailable">
-          Backend features are not available yet. This page is a conceptual layout preview.
+          Generation, file, and proposal actions are not connected yet.
         </p>
+
+        <section class="backend-config" aria-labelledby="backend-config-heading">
+          <div class="backend-config__header">
+            <h2 id="backend-config-heading">Backend configuration</h2>
+            <p id="backend-config-status" role="status">Loading configuration…</p>
+          </div>
+          <dl class="backend-config__values" id="backend-config-values" hidden>
+            <div>
+              <dt>Supported extensions</dt>
+              <dd id="backend-config-extensions"></dd>
+            </div>
+            <div>
+              <dt>Launch directory</dt>
+              <dd id="backend-config-launch-directory"></dd>
+            </div>
+            <div>
+              <dt>Active output directory</dt>
+              <dd id="backend-config-output-directory"></dd>
+            </div>
+          </dl>
+          <p class="backend-config__error" id="backend-config-error" role="alert" hidden></p>
+        </section>
 
         <div class="workspace-panels">
           <section class="assistant-panel" id="assistant-panel" aria-labelledby="assistant-heading">
@@ -80,19 +102,21 @@
               </article>
               <article class="message-card message-card--copilot" id="copilot-response" aria-live="polite">
                 <p class="message-label">COPILOT</p>
-                <p class="message-placeholder">Assistant responses are unavailable until a C++ HTTP API is implemented.</p>
+                <p class="message-placeholder">Generation is not connected to this workspace yet.</p>
               </article>
             </div>
 
-            <div class="assistant-status" id="assistant-status" role="status">
+            <div class="assistant-status" id="assistant-status" data-state="checking" role="status" aria-live="polite">
               <span class="status-indicator" aria-hidden="true"></span>
-              <span>Backend unavailable</span>
+              <span id="assistant-status-message">Checking backend…</span>
+              <span class="assistant-status__detail" id="assistant-status-detail"></span>
+              <button class="assistant-status__retry" id="backend-retry-button" type="button" disabled>Retry</button>
             </div>
 
             <form class="prompt-form" id="prompt-form">
               <label class="visually-hidden" for="prompt-input">Instruction for CodeAgent</label>
               <textarea id="prompt-input" name="prompt" rows="3" placeholder="Enter an instruction to validate locally." aria-describedby="prompt-help prompt-feedback"></textarea>
-              <p class="visually-hidden" id="prompt-help">Instructions are validated locally. Backend execution is not connected.</p>
+              <p class="visually-hidden" id="prompt-help">Instructions are validated locally. Backend generation is not connected.</p>
               <p class="prompt-feedback" id="prompt-feedback" role="alert" aria-live="assertive" hidden></p>
               <button class="action-button" id="validate-instruction-button" type="submit">Validate instruction</button>
             </form>
@@ -174,7 +198,7 @@
       <footer class="app-footer">
         <p id="concept-note">Conceptual layout preview, not the finished application. Monaco Editor will provide the actual editing experience.</p>
         <div id="notification-area" role="status" aria-live="polite" aria-label="Status and notifications">
-          Backend-dependent features are not available yet.
+          Generation and proposal actions are not connected yet.
         </div>
       </footer>
     </div>
