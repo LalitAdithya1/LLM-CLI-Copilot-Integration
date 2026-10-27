@@ -1,4 +1,5 @@
 #include "GuiHttpServer.hpp"
+#include "UnifiedDiff.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -8,6 +9,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #include <gtest/gtest.h>
 
@@ -632,4 +634,217 @@ TEST_F(GuiHttpServerRefactoringTest, ProviderFailuresAndEmptyResultsReturnSafeEr
     EXPECT_EQ(thrownFailure->body.find("provider detail"), std::string::npos);
     EXPECT_EQ(nlohmann::json::parse(emptyResult->body).at("error").at("code"),
               "REFACTOR_FAILED");
+}
+
+class GuiHttpServerProposalReviewTest : public GuiHttpServerRefactoringTest {
+protected:
+    std::string createProposal() {
+        auto http = client();
+        const auto response = http.Post(
+            "/api/refactor",
+            requestBody(),
+            "application/json"
+        );
+        if (!response || response->status != 200) {
+            return {};
+        }
+        return nlohmann::json::parse(response->body).at("proposalId").get<std::string>();
+    }
+};
+
+TEST_F(GuiHttpServerProposalReviewTest, DiffsBuffersAndProposalWithoutWritingOrTransitioning) {
+    std::set<std::filesystem::path> filesBefore;
+    for (const auto& entry : std::filesystem::directory_iterator(
+             std::filesystem::current_path())) {
+        filesBefore.insert(entry.path().filename());
+    }
+
+    auto http = client();
+    const std::string original = "int value = 1;\n";
+    const std::string proposed = "int value = 2;\n";
+    const auto bufferDiff = http.Post(
+        "/api/diff",
+        nlohmann::json{
+            {"originalCode", original},
+            {"proposedCode", proposed}
+        }.dump(),
+        "application/json"
+    );
+    ASSERT_TRUE(bufferDiff);
+    ASSERT_EQ(bufferDiff->status, 200);
+    EXPECT_EQ(
+        nlohmann::json::parse(bufferDiff->body).at("diff"),
+        makeUnifiedDiff(original, proposed)
+    );
+
+    const std::string proposalId = createProposal();
+    ASSERT_FALSE(proposalId.empty());
+    const auto proposalDiff = http.Post(
+        "/api/diff",
+        nlohmann::json{{"proposalId", proposalId}}.dump(),
+        "application/json"
+    );
+    ASSERT_TRUE(proposalDiff);
+    ASSERT_EQ(proposalDiff->status, 200);
+    EXPECT_EQ(
+        nlohmann::json::parse(proposalDiff->body).at("diff"),
+        makeUnifiedDiff("int value = 1;", "refactored: int value = 1;")
+    );
+
+    const auto approval = http.Post(
+        "/api/changes/" + proposalId + "/approve"
+    );
+    ASSERT_TRUE(approval);
+    EXPECT_EQ(approval->status, 200);
+    EXPECT_EQ(nlohmann::json::parse(approval->body).at("status"), "APPROVED");
+
+    std::set<std::filesystem::path> filesAfter;
+    for (const auto& entry : std::filesystem::directory_iterator(
+             std::filesystem::current_path())) {
+        filesAfter.insert(entry.path().filename());
+    }
+    EXPECT_EQ(filesAfter, filesBefore);
+}
+
+TEST_F(GuiHttpServerProposalReviewTest, UnknownProposalIdsReturnSafeNotFoundErrors) {
+    auto http = client();
+    const auto diff = http.Post(
+        "/api/diff",
+        R"({"proposalId":"prop-999999"})",
+        "application/json"
+    );
+    const auto approval = http.Post("/api/changes/prop-999999/approve");
+
+    ASSERT_TRUE(diff);
+    ASSERT_TRUE(approval);
+    EXPECT_EQ(diff->status, 404);
+    EXPECT_EQ(approval->status, 404);
+    EXPECT_EQ(nlohmann::json::parse(diff->body).at("error").at("code"),
+              "PROPOSAL_NOT_FOUND");
+    EXPECT_EQ(nlohmann::json::parse(approval->body).at("error").at("code"),
+              "PROPOSAL_NOT_FOUND");
+    EXPECT_EQ(diff->body.find("prop-999999"), std::string::npos);
+    EXPECT_EQ(approval->body.find("prop-999999"), std::string::npos);
+}
+
+TEST_F(GuiHttpServerProposalReviewTest, RejectsInvalidDiffRequests) {
+    auto http = client();
+    const auto malformed = http.Post("/api/diff", "{not json", "application/json");
+    const auto extraFields = http.Post(
+        "/api/diff",
+        R"({"proposalId":"prop-1","originalCode":"a","proposedCode":"b"})",
+        "application/json"
+    );
+    const auto wrongTypes = http.Post(
+        "/api/diff",
+        R"({"originalCode":"a","proposedCode":2})",
+        "application/json"
+    );
+    const auto wrongMediaType = http.Post("/api/diff", "{}", "text/plain");
+    const auto actionBody = http.Post(
+        "/api/changes/prop-1/approve",
+        "{}",
+        "application/json"
+    );
+
+    ASSERT_TRUE(malformed);
+    ASSERT_TRUE(extraFields);
+    ASSERT_TRUE(wrongTypes);
+    ASSERT_TRUE(wrongMediaType);
+    ASSERT_TRUE(actionBody);
+    EXPECT_EQ(malformed->status, 400);
+    EXPECT_EQ(extraFields->status, 400);
+    EXPECT_EQ(wrongTypes->status, 400);
+    EXPECT_EQ(wrongMediaType->status, 415);
+    EXPECT_EQ(actionBody->status, 400);
+    EXPECT_EQ(nlohmann::json::parse(malformed->body).at("error").at("code"),
+              "INVALID_JSON");
+    EXPECT_EQ(nlohmann::json::parse(extraFields->body).at("error").at("code"),
+              "INVALID_REQUEST");
+    EXPECT_EQ(nlohmann::json::parse(wrongTypes->body).at("error").at("code"),
+              "INVALID_REQUEST");
+}
+
+TEST_F(GuiHttpServerProposalReviewTest, OnlyPendingProposalsCanTransitionOnce) {
+    auto http = client();
+    const std::string approvedId = createProposal();
+    ASSERT_FALSE(approvedId.empty());
+    const auto approved = http.Post("/api/changes/" + approvedId + "/approve");
+    const auto repeatedApproval = http.Post("/api/changes/" + approvedId + "/approve");
+    const auto rejectionAfterApproval = http.Post("/api/changes/" + approvedId + "/reject");
+
+    ASSERT_TRUE(approved);
+    ASSERT_TRUE(repeatedApproval);
+    ASSERT_TRUE(rejectionAfterApproval);
+    EXPECT_EQ(approved->status, 200);
+    EXPECT_EQ(nlohmann::json::parse(approved->body).at("status"), "APPROVED");
+    EXPECT_EQ(repeatedApproval->status, 409);
+    EXPECT_EQ(rejectionAfterApproval->status, 409);
+    EXPECT_EQ(nlohmann::json::parse(repeatedApproval->body).at("error").at("code"),
+              "INVALID_PROPOSAL_STATE");
+
+    const std::string rejectedId = createProposal();
+    ASSERT_FALSE(rejectedId.empty());
+    const auto rejected = http.Post("/api/changes/" + rejectedId + "/reject");
+    const auto approvalAfterRejection = http.Post("/api/changes/" + rejectedId + "/approve");
+    ASSERT_TRUE(rejected);
+    ASSERT_TRUE(approvalAfterRejection);
+    EXPECT_EQ(rejected->status, 200);
+    EXPECT_EQ(nlohmann::json::parse(rejected->body).at("status"), "REJECTED");
+    EXPECT_EQ(approvalAfterRejection->status, 409);
+}
+
+TEST_F(GuiHttpServerProposalReviewTest, ConcurrentApprovalAndRejectionHaveOneWinner) {
+    const std::string proposalId = createProposal();
+    ASSERT_FALSE(proposalId.empty());
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    int approvalStatus = 0;
+    int rejectionStatus = 0;
+    std::string approvalResult;
+    std::string rejectionResult;
+
+    std::thread approvalThread([&] {
+        httplib::Client http("127.0.0.1", server_->port());
+        ready.fetch_add(1);
+        while (!start.load()) {
+            std::this_thread::yield();
+        }
+        const auto response = http.Post("/api/changes/" + proposalId + "/approve");
+        approvalStatus = response ? response->status : -1;
+        if (response) {
+            approvalResult = response->body;
+        }
+    });
+    std::thread rejectionThread([&] {
+        httplib::Client http("127.0.0.1", server_->port());
+        ready.fetch_add(1);
+        while (!start.load()) {
+            std::this_thread::yield();
+        }
+        const auto response = http.Post("/api/changes/" + proposalId + "/reject");
+        rejectionStatus = response ? response->status : -1;
+        if (response) {
+            rejectionResult = response->body;
+        }
+    });
+
+    while (ready.load() != 2) {
+        std::this_thread::yield();
+    }
+    start = true;
+    approvalThread.join();
+    rejectionThread.join();
+
+    EXPECT_TRUE(
+        (approvalStatus == 200 && rejectionStatus == 409) ||
+        (approvalStatus == 409 && rejectionStatus == 200)
+    );
+    const std::string& winningBody = approvalStatus == 200
+        ? approvalResult
+        : rejectionResult;
+    const std::string winningStatus =
+        nlohmann::json::parse(winningBody).at("status").get<std::string>();
+    EXPECT_TRUE(winningStatus == "APPROVED" || winningStatus == "REJECTED");
 }

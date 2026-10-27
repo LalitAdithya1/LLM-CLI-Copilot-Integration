@@ -215,6 +215,43 @@ Errors use the common JSON error object from Section 2:
 
 The production handler builds the prompt with `PromptBuilder` and calls `LLMClient::generateCompleteContent()`, which validates the provider response through `ResponseParser`. Blocked, incomplete, malformed, empty, or failed provider responses therefore produce `REFACTOR_FAILED`; exception details and provider response text are not returned to the HTTP client.
 
+### B8: Diff and proposal review
+
+#### `POST /api/diff`
+
+The request must use `Content-Type: application/json`. It accepts exactly one of these shapes:
+
+```json
+{"proposalId":"prop-1"}
+```
+
+or
+
+```json
+{"originalCode":"void greet() {}","proposedCode":"void greet() noexcept {}"}
+```
+
+Direct code buffers may be empty. Proposal-based diff uses the stored original and proposed buffers. The response is HTTP `200` with `{"diff":"..."}`. Reading a proposal's diff never changes its status. Requests remain subject to the 1 MiB body limit.
+
+#### `POST /api/changes/{id}/approve` and `POST /api/changes/{id}/reject`
+
+The proposal ID is supplied in the path and the request body must be empty. Success returns HTTP `200` with `{"proposalId":"prop-1","status":"APPROVED"}` or `{"proposalId":"prop-1","status":"REJECTED"}`. Only a `PENDING` proposal may transition. Repeating a transition or attempting the opposite transition returns HTTP `409`; an unknown ID returns HTTP `404`. These operations only change proposal state; neither operation saves or applies code.
+
+The backend retains `editorRevision` and `baseEditorHash` unchanged in proposal state. B8 does not perform a stale-editor check: the contract requires rejecting stale application, while B8 approval does not apply code and has no current-revision field to compare. The stale check belongs on a future apply/save operation.
+
+B8 errors use the common JSON error object from Section 2:
+
+| Status | Error code | Meaning |
+|---|---|---|
+| `400` | `INVALID_JSON` | The diff request body is not valid JSON. |
+| `400` | `INVALID_REQUEST` | The diff request does not match one of the documented shapes, or an approval/rejection request has a body. |
+| `404` | `PROPOSAL_NOT_FOUND` | The requested proposal ID does not exist in this server session. |
+| `409` | `INVALID_PROPOSAL_STATE` | The proposal is no longer pending. |
+| `413` | `PAYLOAD_TOO_LARGE` | A B8 request body exceeds 1 MiB. |
+| `415` | `UNSUPPORTED_MEDIA_TYPE` | The diff request content type is not `application/json`. |
+| `500` | `DIFF_FAILED` | The diff could not be generated. |
+| `500` | `STATE_UPDATE_FAILED` | A transition response could not be prepared. |
+
 ### Example: save generated code
 
 Request:

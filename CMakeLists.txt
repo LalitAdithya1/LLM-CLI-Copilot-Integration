@@ -51,6 +51,15 @@ enable_testing()
 # --------------------------------------------------
 # GUI HTTP server component
 # --------------------------------------------------
+add_library(UnifiedDiff
+    src/UnifiedDiff.cpp
+)
+
+target_include_directories(UnifiedDiff
+    PUBLIC
+        ${PROJECT_SOURCE_DIR}/include
+)
+
 add_library(GuiHttpServer
     src/GuiHttpServer.cpp
 )
@@ -64,6 +73,7 @@ target_link_libraries(GuiHttpServer
     PUBLIC
         httplib::httplib
         nlohmann_json::nlohmann_json
+        UnifiedDiff
 )
 
 # --------------------------------------------------
@@ -77,7 +87,6 @@ add_executable(codeagent
     src/ResponseParser.cpp
     src/LLMClient.cpp
     src/EnvLoader.cpp
-    src/UnifiedDiff.cpp
 )
 
 target_include_directories(codeagent
@@ -187,7 +196,6 @@ target_link_libraries(ResponseParserTest
 # --------------------------------------------------
 add_executable(UnifiedDiffTest
     tests/UnifiedDiffTest.cpp
-    src/UnifiedDiff.cpp
 )
 
 target_include_directories(UnifiedDiffTest
@@ -198,6 +206,7 @@ target_include_directories(UnifiedDiffTest
 target_link_libraries(UnifiedDiffTest
     PRIVATE
         GTest::gtest_main
+        UnifiedDiff
 )
 
 # --------------------------------------------------
@@ -211,7 +220,6 @@ add_executable(CLIControllerTest
     src/LLMClient.cpp
     src/ResponseParser.cpp
     src/EnvLoader.cpp
-    src/UnifiedDiff.cpp
 )
 
 target_include_directories(CLIControllerTest
@@ -252,6 +260,7 @@ if(MSVC)
     target_compile_options(UnifiedDiffTest PRIVATE /W4)
     target_compile_options(CLIControllerTest PRIVATE /W4)
     target_compile_options(GuiHttpServer PRIVATE /W4)
+    target_compile_options(UnifiedDiff PRIVATE /W4)
     target_compile_options(GuiHttpServerTest PRIVATE /W4)
 else()
     target_compile_options(codeagent PRIVATE
@@ -283,6 +292,10 @@ else()
     )
 
     target_compile_options(GuiHttpServer PRIVATE
+        -Wall -Wextra -Wpedantic
+    )
+
+    target_compile_options(UnifiedDiff PRIVATE
         -Wall -Wextra -Wpedantic
     )
 

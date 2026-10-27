@@ -1,4 +1,5 @@
 #include "GuiHttpServer.hpp"
+#include "UnifiedDiff.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -198,6 +199,74 @@ std::string hashEditorContent(const std::string& sourceCode) {
     return output.str();
 }
 
+struct DiffRequest {
+    std::string proposalId;
+    std::string originalCode;
+    std::string proposedCode;
+    bool usesProposal = false;
+};
+
+bool parseDiffRequest(
+    const std::string& requestBody,
+    DiffRequest& request,
+    httplib::Response& response
+) {
+    Json body;
+    try {
+        body = Json::parse(requestBody);
+    } catch (const Json::exception&) {
+        setJsonError(
+            response,
+            400,
+            "INVALID_JSON",
+            "Request body must contain valid JSON."
+        );
+        return false;
+    }
+
+    if (!body.is_object()) {
+        setJsonError(
+            response,
+            400,
+            "INVALID_REQUEST",
+            "Request must contain a proposalId or originalCode and proposedCode."
+        );
+        return false;
+    }
+
+    if (body.size() == 1 && body.contains("proposalId") &&
+        body["proposalId"].is_string()) {
+        request.proposalId = body["proposalId"].get<std::string>();
+        if (isWhitespaceOnly(request.proposalId)) {
+            setJsonError(
+                response,
+                400,
+                "INVALID_REQUEST",
+                "proposalId cannot be empty."
+            );
+            return false;
+        }
+        request.usesProposal = true;
+        return true;
+    }
+
+    if (body.size() == 2 && body.contains("originalCode") &&
+        body["originalCode"].is_string() &&
+        body.contains("proposedCode") && body["proposedCode"].is_string()) {
+        request.originalCode = body["originalCode"].get<std::string>();
+        request.proposedCode = body["proposedCode"].get<std::string>();
+        return true;
+    }
+
+    setJsonError(
+        response,
+        400,
+        "INVALID_REQUEST",
+        "Request must contain exactly proposalId or originalCode and proposedCode string fields."
+    );
+    return false;
+}
+
 const std::vector<std::string>& supportedExtensions() {
     static const std::vector<std::string> extensions = {
         ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"
@@ -382,7 +451,9 @@ public:
                     PendingProposal{
                         refactoringRequest.sourceCode,
                         proposedCode,
-                        refactoringRequest.editorRevision
+                        refactoringRequest.editorRevision,
+                        baseEditorHash,
+                        ProposalStatus::Pending
                     }
                 );
             } catch (...) {
@@ -397,6 +468,119 @@ public:
 
             response.set_content(std::move(serializedResponse), kJsonContentType);
         });
+
+        server_.Post("/api/diff", [this](const httplib::Request& request, httplib::Response& response) {
+            if (!isJsonContentType(request.get_header_value("Content-Type"))) {
+                setJsonError(
+                    response,
+                    415,
+                    "UNSUPPORTED_MEDIA_TYPE",
+                    "Content-Type must be application/json."
+                );
+                return;
+            }
+
+            DiffRequest diffRequest;
+            if (!parseDiffRequest(request.body, diffRequest, response)) {
+                return;
+            }
+
+            std::string originalCode = std::move(diffRequest.originalCode);
+            std::string proposedCode = std::move(diffRequest.proposedCode);
+            if (diffRequest.usesProposal) {
+                std::lock_guard<std::mutex> lock(proposalMutex_);
+                const auto proposal = proposals_.find(diffRequest.proposalId);
+                if (proposal == proposals_.end()) {
+                    setJsonError(
+                        response,
+                        404,
+                        "PROPOSAL_NOT_FOUND",
+                        "Proposal was not found."
+                    );
+                    return;
+                }
+                originalCode = proposal->second.originalCode;
+                proposedCode = proposal->second.proposedCode;
+            }
+
+            try {
+                response.set_content(
+                    Json{{"diff", makeUnifiedDiff(originalCode, proposedCode)}}.dump(),
+                    kJsonContentType
+                );
+            } catch (...) {
+                setJsonError(
+                    response,
+                    500,
+                    "DIFF_FAILED",
+                    "Diff could not be generated."
+                );
+            }
+        });
+
+        server_.Post(R"(/api/changes/([^/]+)/(approve|reject))",
+            [this](const httplib::Request& request, httplib::Response& response) {
+                if (!request.body.empty()) {
+                    setJsonError(
+                        response,
+                        400,
+                        "INVALID_REQUEST",
+                        "Approval and rejection requests must have an empty body."
+                    );
+                    return;
+                }
+
+                const std::string proposalId = request.matches[1].str();
+                const std::string action = request.matches[2].str();
+                const ProposalStatus nextStatus = action == "approve"
+                    ? ProposalStatus::Approved
+                    : ProposalStatus::Rejected;
+                const char* statusText = action == "approve"
+                    ? "APPROVED"
+                    : "REJECTED";
+
+                std::string serializedResponse;
+                {
+                    std::lock_guard<std::mutex> lock(proposalMutex_);
+                    const auto proposal = proposals_.find(proposalId);
+                    if (proposal == proposals_.end()) {
+                        setJsonError(
+                            response,
+                            404,
+                            "PROPOSAL_NOT_FOUND",
+                            "Proposal was not found."
+                        );
+                        return;
+                    }
+                    if (proposal->second.status != ProposalStatus::Pending) {
+                        setJsonError(
+                            response,
+                            409,
+                            "INVALID_PROPOSAL_STATE",
+                            "Only pending proposals can be approved or rejected."
+                        );
+                        return;
+                    }
+                    try {
+                        serializedResponse = Json{
+                            {"proposalId", proposalId},
+                            {"status", statusText}
+                        }.dump();
+                    } catch (...) {
+                        setJsonError(
+                            response,
+                            500,
+                            "STATE_UPDATE_FAILED",
+                            "Proposal state could not be updated."
+                        );
+                        return;
+                    }
+                    proposal->second.status = nextStatus;
+                }
+
+                response.set_content(std::move(serializedResponse), kJsonContentType);
+            }
+        );
 
         server_.set_payload_max_length(kMaxRequestBodyBytes);
         server_.set_error_handler([](const httplib::Request&, httplib::Response& response) {
@@ -506,10 +690,18 @@ public:
     }
 
 private:
+    enum class ProposalStatus {
+        Pending,
+        Approved,
+        Rejected
+    };
+
     struct PendingProposal {
         std::string originalCode;
         std::string proposedCode;
         std::string editorRevision;
+        std::string baseEditorHash;
+        ProposalStatus status = ProposalStatus::Pending;
     };
 
     static std::filesystem::path resolveLaunchDirectory(
