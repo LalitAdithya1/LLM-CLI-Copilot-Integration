@@ -2,26 +2,88 @@
 #include "CLIController.hpp"
 
 #include "FileManager.hpp"
+#include "GuiHttpServer.hpp"
 #include "PromptBuilder.hpp"
 #include "LLMClient.hpp"
 #include "UnifiedDiff.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <csignal>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace {
+
+volatile std::sig_atomic_t guiStopRequested = 0;
+
+void requestGuiStop(int) {
+    guiStopRequested = 1;
+}
+
+int runGuiCommand(std::ostream& output, std::ostream& error) {
+    GuiHttpServer server;
+    if (!server.start()) {
+        error << "Error: Could not start the GUI server on 127.0.0.1:"
+              << (server.port() == 0 ? 8080 : server.port())
+              << ". The port may be unavailable or already in use.\n";
+        return 1;
+    }
+
+    guiStopRequested = 0;
+    const auto previousInterruptHandler =
+        std::signal(SIGINT, requestGuiStop);
+    if (previousInterruptHandler == SIG_ERR) {
+        server.stop();
+        error << "Error: Could not install the interrupt handler for the GUI server.\n";
+        return 1;
+    }
+
+#ifdef SIGTERM
+    const auto previousTerminateHandler =
+        std::signal(SIGTERM, requestGuiStop);
+    if (previousTerminateHandler == SIG_ERR) {
+        std::signal(SIGINT, previousInterruptHandler);
+        server.stop();
+        error << "Error: Could not install the termination handler for the GUI server.\n";
+        return 1;
+    }
+#endif
+
+    output << "GUI backend listening at http://127.0.0.1:"
+           << server.port() << "\n"
+           << "Health endpoint: http://127.0.0.1:"
+           << server.port() << "/api/health\n"
+           << "Press Ctrl+C to stop.\n";
+    output.flush();
+
+    while (guiStopRequested == 0 && server.isRunning()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    server.stop();
+    std::signal(SIGINT, previousInterruptHandler);
+#ifdef SIGTERM
+    std::signal(SIGTERM, previousTerminateHandler);
+#endif
+    guiStopRequested = 0;
+    output << "GUI backend stopped.\n";
+    return 0;
+}
 
 void displayHelp(std::ostream& output) {
     output
         << "CodingCLI - AI Coding Assistant\n\n"
         << "Usage:\n"
         << "  codeagent help\n"
+        << "  codeagent gui\n"
         << "  codeagent generate \"<instruction>\"\n"
         << "  codeagent refactor <file-path> \"<instruction>\"\n\n"
         << "Commands:\n"
+        << "  gui        Start the local GUI backend (Ctrl+C to stop)\n"
         << "  generate   Generate code from an instruction\n"
         << "  refactor   Refactor a source file using AI\n"
         << "  help       Display this help message\n\n"
@@ -103,12 +165,17 @@ CLIController::CLIController(
     LLMCall llmCall,
     std::istream& input,
     std::ostream& output,
-    std::ostream& error
+    std::ostream& error,
+    GuiCommand guiCommand
 )
     : llmCall_(std::move(llmCall)),
       input_(input),
       output_(output),
-      error_(error) {
+      error_(error),
+      guiCommand_(std::move(guiCommand)) {
+    if (!guiCommand_) {
+        guiCommand_ = runGuiCommand;
+    }
 }
 
 int CLIController::run(int argc, char* argv[]) {
@@ -128,6 +195,18 @@ int CLIController::run(int argc, char* argv[]) {
         command == "-h") {
         displayHelp(output_);
         return 0;
+    }
+
+    // ------------------------------------------------------------
+    // GUI
+    // ------------------------------------------------------------
+
+    if (command == "gui") {
+        if (argc != 2) {
+            displayUsageError(error_, "The gui command does not accept arguments.");
+            return 1;
+        }
+        return guiCommand_(output_, error_);
     }
 
     // ------------------------------------------------------------

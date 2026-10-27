@@ -1,4 +1,5 @@
 #include "CLIController.hpp"
+#include "GuiHttpServer.hpp"
 #include "LLMClient.hpp"
 
 #include <gtest/gtest.h>
@@ -329,6 +330,7 @@ TEST_F(CLIControllerTest, HelpAndGenerateRemainAvailable) {
     }
     ASSERT_EQ(controller.run(static_cast<int>(helpArgv.size()), helpArgv.data()), 0);
     EXPECT_NE(output.str().find("Usage:"), std::string::npos);
+    EXPECT_NE(output.str().find("codeagent gui"), std::string::npos);
 
     output.str("");
     output.clear();
@@ -344,6 +346,68 @@ TEST_F(CLIControllerTest, HelpAndGenerateRemainAvailable) {
     EXPECT_FALSE(completionRequiredForGenerate);
     EXPECT_NE(output.str().find("generated code"), std::string::npos);
     EXPECT_TRUE(error.str().empty());
+}
+
+TEST_F(CLIControllerTest, GuiCommandDispatchesToInjectedCommand) {
+    std::istringstream input;
+    std::ostringstream output;
+    std::ostringstream error;
+    bool called = false;
+    CLIController controller(
+        [](const std::string&, std::string&, bool) { return false; },
+        input,
+        output,
+        error,
+        [&called](std::ostream& commandOutput, std::ostream& commandError) {
+            called = true;
+            GuiHttpServer server(0);
+            if (!server.start()) {
+                commandError << "Could not start GUI server.\n";
+                return 1;
+            }
+            commandOutput << "GUI backend listening at http://127.0.0.1:"
+                          << server.port() << '\n';
+            server.stop();
+            return 0;
+        }
+    );
+    std::vector<std::string> arguments = {"codeagent", "gui"};
+    std::vector<char*> argv;
+    for (std::string& argument : arguments) {
+        argv.push_back(argument.data());
+    }
+
+    EXPECT_EQ(controller.run(static_cast<int>(argv.size()), argv.data()), 0);
+    EXPECT_TRUE(called);
+    EXPECT_NE(output.str().find("GUI backend listening at http://127.0.0.1:"),
+              std::string::npos);
+    EXPECT_TRUE(error.str().empty());
+}
+
+TEST_F(CLIControllerTest, GuiCommandRejectsExtraArguments) {
+    std::istringstream input;
+    std::ostringstream output;
+    std::ostringstream error;
+    bool commandCalled = false;
+    CLIController controller(
+        [](const std::string&, std::string&, bool) { return false; },
+        input,
+        output,
+        error,
+        [&commandCalled](std::ostream&, std::ostream&) {
+            commandCalled = true;
+            return 0;
+        }
+    );
+    std::vector<std::string> arguments = {"codeagent", "gui", "unexpected"};
+    std::vector<char*> argv;
+    for (std::string& argument : arguments) {
+        argv.push_back(argument.data());
+    }
+
+    EXPECT_EQ(controller.run(static_cast<int>(argv.size()), argv.data()), 1);
+    EXPECT_FALSE(commandCalled);
+    EXPECT_NE(error.str().find("does not accept arguments"), std::string::npos);
 }
 
 } // namespace

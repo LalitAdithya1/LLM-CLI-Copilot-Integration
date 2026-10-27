@@ -13,13 +13,15 @@ public:
         std::string& response,
         bool requireExplicitCompletion
     )>;
+    using GuiCommand = std::function<int(std::ostream&, std::ostream&)>;
 
     CLIController();
     CLIController(
         LLMCall llmCall,
         std::istream& input,
         std::ostream& output,
-        std::ostream& error
+        std::ostream& error,
+        GuiCommand guiCommand = {}
     );
 
     int run(int argc, char* argv[]);
@@ -29,6 +31,7 @@ private:
     std::istream& input_;
     std::ostream& output_;
     std::ostream& error_;
+    GuiCommand guiCommand_;
 };
 
 #endif

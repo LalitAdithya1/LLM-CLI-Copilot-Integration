@@ -62,7 +62,7 @@ The application communicates with an external LLM API. It does not train or host
 
 * Provide a command-based interface.
 * Display generated code, refactoring suggestions, and error messages.
-* Support commands such as `generate`, `refactor`, `help`, and `exit`.
+* Support commands such as `gui`, `generate`, `refactor`, `help`, and `exit`.
 * Validate user input and provide clear usage instructions.
 
 ## 4. Technology Stack
@@ -187,7 +187,15 @@ ai-assistant generate "Implement a stack using arrays" \
 ai-assistant help
 ```
 
-These examples describe the planned interface, not necessarily commands available in the current implementation.
+### Start the GUI backend
+
+```bash
+./codeagent gui
+```
+
+It starts the loopback-only GUI backend, prints its local address, and runs until Ctrl+C.
+
+The older CLI examples above illustrate intended usage; some commands and options may not yet be available.
 
 ## 8. Requirements
 

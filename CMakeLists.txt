@@ -87,6 +87,7 @@ target_include_directories(codeagent
 
 target_link_libraries(codeagent
     PRIVATE
+        GuiHttpServer
         CURL::libcurl
         nlohmann_json::nlohmann_json
 )
@@ -221,6 +222,7 @@ target_include_directories(CLIControllerTest
 target_link_libraries(CLIControllerTest
     PRIVATE
         GTest::gtest_main
+        GuiHttpServer
         CURL::libcurl
         nlohmann_json::nlohmann_json
 )
