@@ -5,13 +5,36 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
+
+class ScriptedNativeDialogProvider final : public NativeDialogProvider {
+public:
+    explicit ScriptedNativeDialogProvider(
+        std::function<NativeDialogResult(NativeDialogKind)> callback
+    ) : callback_(std::move(callback)) {}
+
+    NativeDialogResult choose(NativeDialogKind kind) override {
+        return callback_(kind);
+    }
+
+private:
+    std::function<NativeDialogResult(NativeDialogKind)> callback_;
+};
+
+namespace {
+std::filesystem::path repositoryRoot() {
+    return std::filesystem::path(__FILE__).parent_path().parent_path();
+}
+} // namespace
 
 TEST(GuiHttpServerTest, StartsOnAnAvailableLoopbackPortAndStops) {
     GuiHttpServer server(0);
@@ -847,4 +870,173 @@ TEST_F(GuiHttpServerProposalReviewTest, ConcurrentApprovalAndRejectionHaveOneWin
     const std::string winningStatus =
         nlohmann::json::parse(winningBody).at("status").get<std::string>();
     EXPECT_TRUE(winningStatus == "APPROVED" || winningStatus == "REJECTED");
+}
+
+TEST(GuiHttpServerDialogTest, FileSelectionReturnsPathOnlyAndDoesNotModifySource) {
+    const auto sourcePath = repositoryRoot() / "src/main.cpp";
+    ASSERT_TRUE(std::filesystem::is_regular_file(sourcePath));
+    const auto initialSize = std::filesystem::file_size(sourcePath);
+    const auto initialWriteTime = std::filesystem::last_write_time(sourcePath);
+    auto provider = std::make_shared<ScriptedNativeDialogProvider>(
+        [sourcePath](NativeDialogKind kind) {
+            EXPECT_EQ(kind, NativeDialogKind::SourceFile);
+            return NativeDialogResult{NativeDialogStatus::Selected, sourcePath};
+        }
+    );
+    GuiHttpServer server(0, std::filesystem::current_path(), {}, {}, provider);
+    ASSERT_TRUE(server.start());
+
+    httplib::Client http("127.0.0.1", server.port());
+    const auto response = http.Post("/api/files/open-dialog", "{}", "application/json");
+
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 200);
+    const auto body = nlohmann::json::parse(response->body);
+    EXPECT_EQ(body, nlohmann::json({{"status", "SELECTED"},
+                                   {"selectedPath", sourcePath.string()}}));
+    EXPECT_FALSE(body.contains("contents"));
+    EXPECT_EQ(std::filesystem::file_size(sourcePath), initialSize);
+    EXPECT_EQ(std::filesystem::last_write_time(sourcePath), initialWriteTime);
+    server.stop();
+}
+
+TEST(GuiHttpServerDialogTest, CancellationAndDialogFailuresAreSafeAndDoNotChangeConfig) {
+    const std::vector<std::pair<NativeDialogResult, int>> outcomes = {
+        {{NativeDialogStatus::Cancelled, {}}, 200},
+        {{NativeDialogStatus::Unavailable, {}}, 503},
+        {{NativeDialogStatus::TimedOut, {}}, 504},
+        {{NativeDialogStatus::Failed, {}}, 500}
+    };
+    for (const auto& outcome : outcomes) {
+        auto provider = std::make_shared<ScriptedNativeDialogProvider>(
+            [result = outcome.first](NativeDialogKind) { return result; }
+        );
+        GuiHttpServer server(0, std::filesystem::current_path(), {}, {}, provider);
+        ASSERT_TRUE(server.start());
+        httplib::Client http("127.0.0.1", server.port());
+        const auto response = http.Post(
+            "/api/output/select-directory", "{}", "application/json"
+        );
+        ASSERT_TRUE(response);
+        EXPECT_EQ(response->status, outcome.second);
+        const auto body = nlohmann::json::parse(response->body);
+        if (outcome.first.status == NativeDialogStatus::Cancelled) {
+            EXPECT_EQ(body.at("status"), "CANCELLED");
+        } else {
+            EXPECT_EQ(body.at("error").at("code"),
+                      outcome.first.status == NativeDialogStatus::Unavailable
+                          ? "DIALOG_UNAVAILABLE"
+                          : outcome.first.status == NativeDialogStatus::TimedOut
+                                ? "DIALOG_TIMEOUT"
+                                : "DIALOG_FAILED");
+            EXPECT_NE(body.at("error").at("message").get<std::string>().find("Native directory dialog"),
+                      std::string::npos);
+            EXPECT_EQ(response->body.find("secret"), std::string::npos);
+        }
+        const auto config = http.Get("/api/config");
+        ASSERT_TRUE(config);
+        EXPECT_EQ(nlohmann::json::parse(config->body).at("activeOutputDirectory"),
+                  std::filesystem::current_path().string());
+        server.stop();
+    }
+}
+
+TEST(GuiHttpServerDialogTest, RejectsInvalidSelectionsAndRequestsWithoutLeakingPaths) {
+    const auto invalidPath = repositoryRoot() / "docs/gui-api-contract.md";
+    auto provider = std::make_shared<ScriptedNativeDialogProvider>(
+        [invalidPath](NativeDialogKind) {
+            return NativeDialogResult{
+                NativeDialogStatus::Selected,
+                invalidPath
+            };
+        }
+    );
+    GuiHttpServer server(0, std::filesystem::current_path(), {}, {}, provider);
+    ASSERT_TRUE(server.start());
+    httplib::Client http("127.0.0.1", server.port());
+
+    const auto invalidSource = http.Post("/api/files/open-dialog", "{}", "application/json");
+    const auto invalidOutput = http.Post("/api/output/select-directory", "{}", "application/json");
+    const auto invalidBody = http.Post("/api/files/open-dialog", "[]", "application/json");
+    const auto wrongType = http.Post("/api/files/open-dialog", "{}", "text/plain");
+    ASSERT_TRUE(invalidSource);
+    ASSERT_TRUE(invalidOutput);
+    ASSERT_TRUE(invalidBody);
+    ASSERT_TRUE(wrongType);
+    EXPECT_EQ(invalidSource->status, 422);
+    EXPECT_EQ(nlohmann::json::parse(invalidSource->body).at("error").at("code"),
+              "INVALID_SOURCE_FILE");
+    EXPECT_EQ(invalidOutput->status, 422);
+    EXPECT_EQ(nlohmann::json::parse(invalidOutput->body).at("error").at("code"),
+              "INVALID_OUTPUT_DIRECTORY");
+    EXPECT_EQ(invalidBody->status, 400);
+    EXPECT_EQ(wrongType->status, 415);
+    EXPECT_EQ(invalidSource->body.find(invalidPath.string()), std::string::npos);
+
+    const auto missingOutput = http.Post(
+        "/api/output/select-directory",
+        R"({"directoryPath":"/path/that/does/not/exist"})",
+        "application/json"
+    );
+    ASSERT_TRUE(missingOutput);
+    EXPECT_EQ(missingOutput->status, 422);
+    const auto config = http.Get("/api/config");
+    ASSERT_TRUE(config);
+    EXPECT_EQ(nlohmann::json::parse(config->body).at("activeOutputDirectory"),
+              std::filesystem::current_path().string());
+    server.stop();
+}
+
+TEST(GuiHttpServerDialogTest, UpdatesOutputDirectoryForManualAndConcurrentSelections) {
+    const auto firstDirectory = repositoryRoot();
+    const auto secondDirectory = repositoryRoot() / "include";
+    ASSERT_TRUE(std::filesystem::is_directory(secondDirectory));
+    std::atomic<unsigned int> next{0};
+    auto provider = std::make_shared<ScriptedNativeDialogProvider>(
+        [firstDirectory, secondDirectory, &next](NativeDialogKind kind) {
+            EXPECT_EQ(kind, NativeDialogKind::OutputDirectory);
+            return NativeDialogResult{
+                NativeDialogStatus::Selected,
+                next.fetch_add(1) % 2 == 0 ? firstDirectory : secondDirectory
+            };
+        }
+    );
+    GuiHttpServer server(0, firstDirectory, {}, {}, provider);
+    ASSERT_TRUE(server.start());
+    httplib::Client http("127.0.0.1", server.port());
+
+    const auto manual = http.Post(
+        "/api/output/select-directory",
+        nlohmann::json{{"directoryPath", secondDirectory.string()}}.dump(),
+        "application/json"
+    );
+    ASSERT_TRUE(manual);
+    EXPECT_EQ(manual->status, 200);
+    EXPECT_EQ(nlohmann::json::parse(manual->body).at("activeOutputDirectory"),
+              secondDirectory.string());
+
+    std::atomic<int> successes{0};
+    std::vector<std::thread> requests;
+    for (int index = 0; index < 8; ++index) {
+        requests.emplace_back([&] {
+            httplib::Client client("127.0.0.1", server.port());
+            const auto response = client.Post(
+                "/api/output/select-directory", "{}", "application/json"
+            );
+            if (response && response->status == 200) {
+                ++successes;
+            }
+        });
+    }
+    for (auto& request : requests) {
+        request.join();
+    }
+    EXPECT_EQ(successes.load(), 8);
+    const auto config = http.Get("/api/config");
+    ASSERT_TRUE(config);
+    const auto activeDirectory =
+        nlohmann::json::parse(config->body).at("activeOutputDirectory");
+    EXPECT_TRUE(activeDirectory == firstDirectory.string() ||
+                activeDirectory == secondDirectory.string());
+    server.stop();
 }

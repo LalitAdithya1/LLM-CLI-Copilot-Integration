@@ -6,6 +6,8 @@
 #include <memory>
 #include <string>
 
+#include "NativeDialog.hpp"
+
 class GuiHttpServer {
 public:
     using GenerationHandler = std::function<bool(
@@ -37,6 +39,13 @@ public:
         std::filesystem::path launchWorkingDirectory,
         GenerationHandler generationHandler,
         RefactoringHandler refactoringHandler
+    );
+    GuiHttpServer(
+        int port,
+        std::filesystem::path launchWorkingDirectory,
+        GenerationHandler generationHandler,
+        RefactoringHandler refactoringHandler,
+        std::shared_ptr<NativeDialogProvider> dialogProvider
     );
     ~GuiHttpServer();
 

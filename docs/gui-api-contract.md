@@ -63,7 +63,7 @@ Typical status codes: `400` invalid request, `404` missing resource, `409` state
 | `POST /api/diff` | Return a diff for two code buffers or an existing proposal ID. |
 | `POST /api/changes/{id}/approve` | Mark a pending proposal as approved. Does not save. |
 | `POST /api/changes/{id}/reject` | Reject a pending proposal. It cannot subsequently be saved. |
-| `POST /api/files/open-dialog` | Open a native file picker, validate the selected C/C++ file, and return its path and contents. |
+| `POST /api/files/open-dialog` | Open a native file picker, validate the selected C/C++ file, and return its path without reading its contents. |
 | `POST /api/output/select-directory` | Open a directory picker or set a validated session output directory. |
 | `POST /api/save` | Save generated code or an approved proposal to the requested output location. |
 | `POST /api/session/exit` | Request graceful backend shutdown. |
@@ -251,6 +251,53 @@ B8 errors use the common JSON error object from Section 2:
 | `415` | `UNSUPPORTED_MEDIA_TYPE` | The diff request content type is not `application/json`. |
 | `500` | `DIFF_FAILED` | The diff could not be generated. |
 | `500` | `STATE_UPDATE_FAILED` | A transition response could not be prepared. |
+
+### B9: Native file and output-directory selection
+
+Both endpoints require `Content-Type: application/json` and are limited by the common 1 MiB request-body limit. They only inspect path metadata; selecting a source file never reads its contents, and neither endpoint writes files.
+
+#### `POST /api/files/open-dialog`
+
+The request body must be the empty JSON object `{}`. It opens the native source-file picker. A selected path must exist, be a regular file, and have one of the extensions returned by `GET /api/config` (`.c`, `.cc`, `.cpp`, `.cxx`, `.h`, `.hh`, `.hpp`, `.hxx`). Success returns HTTP `200`:
+
+```json
+{"status":"SELECTED","selectedPath":"/absolute/path/to/source.cpp"}
+```
+
+Cancellation returns HTTP `200` with `{"status":"CANCELLED"}`. No file content is included in any response.
+
+#### `POST /api/output/select-directory`
+
+The request may be `{}` to open the native directory picker, or exactly one string `directoryPath` for manual path selection:
+
+```json
+{"directoryPath":"/absolute/path/to/output"}
+```
+
+The selected path must be an existing directory. On success the session's `activeOutputDirectory` is updated and HTTP `200` returns:
+
+```json
+{"status":"SELECTED","activeOutputDirectory":"/absolute/path/to/output"}
+```
+
+Cancellation returns HTTP `200` with `{"status":"CANCELLED"}` and leaves the active directory unchanged. Invalid paths also leave it unchanged.
+
+B9 errors use the common JSON error object from Section 2:
+
+| Status | Error code | Meaning |
+|---|---|---|
+| `400` | `INVALID_JSON` | The request body is not valid JSON. |
+| `400` | `INVALID_REQUEST` | The body does not match the endpoint's documented shape. |
+| `400` | `INVALID_DIRECTORY_PATH` | `directoryPath` is empty or whitespace-only. |
+| `413` | `PAYLOAD_TOO_LARGE` | The request body exceeds 1 MiB. |
+| `415` | `UNSUPPORTED_MEDIA_TYPE` | The content type is not `application/json`. |
+| `422` | `INVALID_SOURCE_FILE` | The selected path is not an existing regular source file with a supported extension. |
+| `422` | `INVALID_OUTPUT_DIRECTORY` | The selected path is not an existing directory. |
+| `500` | `DIALOG_FAILED` | The native dialog could not complete. |
+| `503` | `DIALOG_UNAVAILABLE` | The dialog utility or graphical display is unavailable. |
+| `504` | `DIALOG_TIMEOUT` | The native dialog exceeded its 30-second timeout. |
+
+On Ubuntu/Linux, the production provider invokes `zenity` directly with fixed argument vectors (no shell); it uses the graphical `DISPLAY` or `WAYLAND_DISPLAY` environment and a 30-second timeout. Windows currently reports the native dialog as unavailable. The provider is injectable so HTTP behavior can be tested offline.
 
 ### Example: save generated code
 

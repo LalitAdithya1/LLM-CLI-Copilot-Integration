@@ -274,6 +274,74 @@ const std::vector<std::string>& supportedExtensions() {
     return extensions;
 }
 
+bool parseEmptyObject(
+    const std::string& requestBody,
+    httplib::Response& response
+) {
+    try {
+        const Json body = Json::parse(requestBody);
+        if (body.is_object() && body.empty()) {
+            return true;
+        }
+    } catch (const Json::exception&) {
+        setJsonError(response, 400, "INVALID_JSON", "Request body must contain valid JSON.");
+        return false;
+    }
+    setJsonError(response, 400, "INVALID_REQUEST", "Request body must be an empty JSON object.");
+    return false;
+}
+
+bool resolveSelectedSourcePath(
+    const std::filesystem::path& selectedPath,
+    std::filesystem::path& normalizedPath
+) {
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(selectedPath, error) || error) {
+        return false;
+    }
+    const std::string extension = selectedPath.extension().string();
+    const auto& extensions = supportedExtensions();
+    if (std::find(extensions.begin(), extensions.end(), extension) == extensions.end()) {
+        return false;
+    }
+    normalizedPath = std::filesystem::absolute(selectedPath, error).lexically_normal();
+    return !error;
+}
+
+bool resolveSelectedDirectoryPath(
+    const std::filesystem::path& selectedPath,
+    std::filesystem::path& normalizedPath
+) {
+    std::error_code error;
+    if (!std::filesystem::is_directory(selectedPath, error) || error) {
+        return false;
+    }
+    normalizedPath = std::filesystem::absolute(selectedPath, error).lexically_normal();
+    return !error;
+}
+
+void setDialogError(
+    httplib::Response& response,
+    const NativeDialogStatus status,
+    const char* dialogKind
+) {
+    switch (status) {
+        case NativeDialogStatus::Unavailable:
+            setJsonError(response, 503, "DIALOG_UNAVAILABLE", dialogKind);
+            return;
+        case NativeDialogStatus::TimedOut:
+            setJsonError(response, 504, "DIALOG_TIMEOUT", dialogKind);
+            return;
+        case NativeDialogStatus::Failed:
+            setJsonError(response, 500, "DIALOG_FAILED", dialogKind);
+            return;
+        case NativeDialogStatus::Selected:
+        case NativeDialogStatus::Cancelled:
+            break;
+    }
+    setJsonError(response, 500, "DIALOG_FAILED", dialogKind);
+}
+
 } // namespace
 
 class GuiHttpServer::Impl {
@@ -282,7 +350,8 @@ public:
         int requestedPort,
         std::filesystem::path launchWorkingDirectory,
         GuiHttpServer::GenerationHandler generationHandler,
-        GuiHttpServer::RefactoringHandler refactoringHandler
+        GuiHttpServer::RefactoringHandler refactoringHandler,
+        std::shared_ptr<NativeDialogProvider> dialogProvider
     )
         : requestedPort_(requestedPort),
           launchWorkingDirectory_(resolveLaunchDirectory(
@@ -290,7 +359,9 @@ public:
           )),
           activeOutputDirectory_(launchWorkingDirectory_),
           generationHandler_(std::move(generationHandler)),
-          refactoringHandler_(std::move(refactoringHandler)) {
+          refactoringHandler_(std::move(refactoringHandler)),
+          dialogProvider_(dialogProvider ? std::move(dialogProvider)
+                                         : createNativeDialogProvider()) {
         server_.Get("/api/health", [](const httplib::Request&, httplib::Response& response) {
             response.set_content(
                 nlohmann::json{{"status", "ok"}}.dump(),
@@ -299,12 +370,126 @@ public:
         });
 
         server_.Get("/api/config", [this](const httplib::Request&, httplib::Response& response) {
+            std::lock_guard<std::mutex> lock(configMutex_);
             const nlohmann::json config = {
                 {"supportedExtensions", supportedExtensions()},
                 {"launchDirectory", launchWorkingDirectory_.string()},
                 {"activeOutputDirectory", activeOutputDirectory_.string()}
             };
             response.set_content(config.dump(), kJsonContentType);
+        });
+
+        server_.Post("/api/files/open-dialog", [this](const httplib::Request& request, httplib::Response& response) {
+            if (!isJsonContentType(request.get_header_value("Content-Type"))) {
+                setJsonError(response, 415, "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json.");
+                return;
+            }
+            if (!parseEmptyObject(request.body, response)) {
+                return;
+            }
+
+            NativeDialogResult result;
+            try {
+                result = dialogProvider_->choose(NativeDialogKind::SourceFile);
+            } catch (...) {
+                setDialogError(response, NativeDialogStatus::Failed, "Native file dialog failed.");
+                return;
+            }
+            if (result.status == NativeDialogStatus::Cancelled) {
+                response.set_content(Json{{"status", "CANCELLED"}}.dump(), kJsonContentType);
+                return;
+            }
+            if (result.status != NativeDialogStatus::Selected) {
+                const char* message = result.status == NativeDialogStatus::Unavailable
+                    ? "Native file dialog is unavailable."
+                    : result.status == NativeDialogStatus::TimedOut
+                        ? "Native file dialog timed out."
+                        : "Native file dialog failed.";
+                setDialogError(response, result.status, message);
+                return;
+            }
+
+            std::filesystem::path selectedPath;
+            if (!resolveSelectedSourcePath(result.selectedPath, selectedPath)) {
+                setJsonError(response, 422, "INVALID_SOURCE_FILE", "Selected path is not a supported source file.");
+                return;
+            }
+            response.set_content(
+                Json{{"status", "SELECTED"}, {"selectedPath", selectedPath.string()}}.dump(),
+                kJsonContentType
+            );
+        });
+
+        server_.Post("/api/output/select-directory", [this](const httplib::Request& request, httplib::Response& response) {
+            if (!isJsonContentType(request.get_header_value("Content-Type"))) {
+                setJsonError(response, 415, "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json.");
+                return;
+            }
+
+            bool useDialog = false;
+            std::filesystem::path selectedPath;
+            try {
+                const Json body = Json::parse(request.body);
+                if (!body.is_object()) {
+                    setJsonError(response, 400, "INVALID_REQUEST", "Request must be an empty object or contain one directoryPath string.");
+                    return;
+                }
+                if (body.empty()) {
+                    useDialog = true;
+                } else if (body.size() == 1 && body.contains("directoryPath") &&
+                           body["directoryPath"].is_string()) {
+                    const std::string path = body["directoryPath"].get<std::string>();
+                    if (isWhitespaceOnly(path)) {
+                        setJsonError(response, 400, "INVALID_DIRECTORY_PATH", "directoryPath cannot be empty.");
+                        return;
+                    }
+                    selectedPath = std::filesystem::path(path);
+                } else {
+                    setJsonError(response, 400, "INVALID_REQUEST", "Request must be an empty object or contain one directoryPath string.");
+                    return;
+                }
+            } catch (const Json::exception&) {
+                setJsonError(response, 400, "INVALID_JSON", "Request body must contain valid JSON.");
+                return;
+            }
+
+            if (useDialog) {
+                NativeDialogResult result;
+                try {
+                    result = dialogProvider_->choose(NativeDialogKind::OutputDirectory);
+                } catch (...) {
+                    setDialogError(response, NativeDialogStatus::Failed, "Native directory dialog failed.");
+                    return;
+                }
+                if (result.status == NativeDialogStatus::Cancelled) {
+                    response.set_content(Json{{"status", "CANCELLED"}}.dump(), kJsonContentType);
+                    return;
+                }
+                if (result.status != NativeDialogStatus::Selected) {
+                    const char* message = result.status == NativeDialogStatus::Unavailable
+                        ? "Native directory dialog is unavailable."
+                        : result.status == NativeDialogStatus::TimedOut
+                            ? "Native directory dialog timed out."
+                            : "Native directory dialog failed.";
+                    setDialogError(response, result.status, message);
+                    return;
+                }
+                selectedPath = std::move(result.selectedPath);
+            }
+
+            std::filesystem::path normalizedPath;
+            if (!resolveSelectedDirectoryPath(selectedPath, normalizedPath)) {
+                setJsonError(response, 422, "INVALID_OUTPUT_DIRECTORY", "Selected path is not an existing directory.");
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(configMutex_);
+                activeOutputDirectory_ = normalizedPath;
+            }
+            response.set_content(
+                Json{{"status", "SELECTED"}, {"activeOutputDirectory", normalizedPath.string()}}.dump(),
+                kJsonContentType
+            );
         });
 
         server_.Post("/api/generate", [this](const httplib::Request& request, httplib::Response& response) {
@@ -727,6 +912,8 @@ private:
     std::filesystem::path activeOutputDirectory_;
     const GuiHttpServer::GenerationHandler generationHandler_;
     const GuiHttpServer::RefactoringHandler refactoringHandler_;
+    const std::shared_ptr<NativeDialogProvider> dialogProvider_;
+    std::mutex configMutex_;
     std::mutex proposalMutex_;
     std::unordered_map<std::string, PendingProposal> proposals_;
     std::uint64_t nextProposalId_ = 1;
@@ -768,11 +955,27 @@ GuiHttpServer::GuiHttpServer(
     GenerationHandler generationHandler,
     RefactoringHandler refactoringHandler
 )
+    : GuiHttpServer(
+          port,
+          std::move(launchWorkingDirectory),
+          std::move(generationHandler),
+          std::move(refactoringHandler),
+          {}
+      ) {}
+
+GuiHttpServer::GuiHttpServer(
+    int port,
+    std::filesystem::path launchWorkingDirectory,
+    GenerationHandler generationHandler,
+    RefactoringHandler refactoringHandler,
+    std::shared_ptr<NativeDialogProvider> dialogProvider
+)
     : impl_(std::make_unique<Impl>(
           port,
           std::move(launchWorkingDirectory),
           std::move(generationHandler),
-          std::move(refactoringHandler)
+          std::move(refactoringHandler),
+          std::move(dialogProvider)
       )) {}
 
 GuiHttpServer::~GuiHttpServer() = default;

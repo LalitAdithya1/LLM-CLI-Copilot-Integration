@@ -62,6 +62,7 @@ target_include_directories(UnifiedDiff
 
 add_library(GuiHttpServer
     src/GuiHttpServer.cpp
+    src/NativeDialog.cpp
 )
 
 target_include_directories(GuiHttpServer
