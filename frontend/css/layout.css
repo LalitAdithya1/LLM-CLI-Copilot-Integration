@@ -15,6 +15,26 @@
   min-height: 28rem;
 }
 
+.assistant-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.preview-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.conversation {
+  min-height: 12rem;
+  max-height: 27rem;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: #45434f var(--color-panel);
+  scrollbar-width: thin;
+}
+
 @media (max-width: 760px) {
   .main-content {
     padding-inline: var(--space-4);
@@ -22,5 +42,9 @@
 
   .workspace-panels {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .conversation {
+    max-height: 24rem;
   }
 }
