@@ -136,6 +136,34 @@
           </section>
         </div>
 
+        <section class="proposal-review" id="proposal-review" aria-labelledby="proposal-review-heading">
+          <header class="proposal-review__header">
+            <div>
+              <h2 id="proposal-review-heading">Proposal review</h2>
+              <p class="proposal-review__status" id="proposal-review-status" role="status">No proposal available</p>
+            </div>
+            <p class="proposal-review__availability" id="proposal-review-availability">
+              Backend proposal review is not connected.
+            </p>
+          </header>
+
+          <div class="proposal-review__code-panes">
+            <section class="proposal-code" aria-labelledby="proposal-original-heading">
+              <h3 id="proposal-original-heading">Original code</h3>
+              <pre class="proposal-code__content" aria-label="Original code">No original code loaded.</pre>
+            </section>
+            <section class="proposal-code" aria-labelledby="proposal-proposed-heading">
+              <h3 id="proposal-proposed-heading">Proposed code</h3>
+              <pre class="proposal-code__content" aria-label="Proposed code">No proposal available.</pre>
+            </section>
+          </div>
+
+          <div class="proposal-review__actions">
+            <button class="action-button" id="reject-proposal-button" type="button" aria-describedby="proposal-review-availability" disabled>Reject</button>
+            <button class="action-button action-button--primary" id="accept-proposal-button" type="button" aria-describedby="proposal-review-availability" disabled>Accept</button>
+          </div>
+        </section>
+
         <section class="bottom-actions" id="bottom-actions" aria-label="Code actions">
           <button class="action-button action-button--primary" id="generate-code-button" type="button" disabled>Generate code</button>
           <button class="action-button" id="review-changes-button" type="button" disabled>Review changes</button>
