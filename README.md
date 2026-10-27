@@ -12,6 +12,86 @@ Users can provide instructions to generate new code, analyze existing code for p
 
 The application communicates with an external LLM API. It does not train or host its own language model.
 
+## Quick Start
+
+Supported and tested platform: **Linux, including WSL2 on Windows (Ubuntu 24.04)**. A native Windows (MSVC/MinGW) build is not supported: `EnvLoader` uses POSIX `setenv`. macOS is untested.
+
+### Dependencies
+
+```bash
+sudo apt install build-essential cmake libcurl4-openssl-dev nlohmann-json3-dev nodejs
+```
+
+CMake downloads GoogleTest and cpp-httplib automatically the first time you configure. Node.js is only needed to run the frontend tests.
+
+### Configure the Gemini API key
+
+Create a `.env` file in the directory you launch `codeagent` from. The file is git-ignored.
+
+```text
+GEMINI_API_KEY=your-key-here
+```
+
+You can also `export GEMINI_API_KEY=...`. Existing environment variables take precedence over `.env`. The key is sent only to Gemini in the `x-goog-api-key` header. It is never printed, logged, or returned to the browser. The model is `gemini-3.5-flash`.
+
+### Build and test
+
+```bash
+cmake -S . -B build
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+node --test frontend/tests/*.test.mjs
+```
+
+### Run
+
+```bash
+./build/codeagent help
+./build/codeagent generate "Implement binary search in C++"
+./build/codeagent refactor src/example.cpp "Improve readability"
+./build/codeagent gui
+```
+
+`codeagent gui` is the only process you need to start. It:
+
+1. Starts the C++ server on `127.0.0.1:8080`. It binds to loopback only, never to `0.0.0.0`.
+2. Serves the browser frontend (HTML/CSS/JS) and the JSON API from that same origin.
+3. Opens your default browser: `wslview` or `explorer.exe` under WSL, `xdg-open` on Linux. If that is not possible, it prints the URL to open manually and keeps running.
+4. Runs until you press **Ctrl+C**.
+
+| Environment variable | Purpose |
+| --- | --- |
+| `GEMINI_API_KEY` | Gemini API key (or set it in `./.env`). |
+| `CODEAGENT_GUI_PORT` | Use another port, e.g. `CODEAGENT_GUI_PORT=8081 ./build/codeagent gui`. |
+| `CODEAGENT_NO_BROWSER` | Set to `1` to skip opening a browser (headless/SSH use). |
+| `CODEAGENT_FRONTEND_DIR` | Directory containing `index.html`, if the frontend is not found automatically. |
+
+`codeagent` finds the frontend without depending on your working directory. It checks, in order: `CODEAGENT_FRONTEND_DIR`; `frontend/` next to the executable or one level above it (the build tree); `../share/codeagent/frontend` (after `cmake --install build`); and finally the source tree it was built from.
+
+### Using the browser editor
+
+* **Generate:** enter a language and an instruction, then select *Generate code*. Gemini's output is shown for review. To keep it, enter a filename and select *Save file*.
+* **Refactor:** select *Open file in editor* to load a C/C++ file from your computer (or paste code), switch to *Refactor*, and describe the change. The backend creates a **proposal**. Select *Review changes* to load the unified diff, then *Accept* or *Reject*.
+  * A rejected proposal can never be saved.
+  * An accepted proposal is saved only when you select *Save file*.
+* **Saving** writes `<active output directory>/<filename>`.
+  * The output directory defaults to the launch directory. Change it with *Choose output directory*, either through a native dialog or a typed path when no dialog is available.
+  * Filenames must be plain names with a supported extension (`.c .cc .cpp .cxx .h .hh .hpp .hxx`). Paths and `..` are rejected.
+  * Replacing an existing file always asks for confirmation.
+  * Writes are atomic: the content goes to a temporary file that is then renamed into place.
+  * Buttons are disabled while a request is in flight, so double clicks cannot approve or save twice.
+* AI-generated code is **never executed**.
+
+### Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| Terminal: `Warning: GEMINI_API_KEY is not set`; browser: `GENERATION_FAILED` / `REFACTOR_FAILED` | Add the key to `.env` in the launch directory or export it, then restart. The terminal running `codeagent` prints the specific cause (missing key, HTTP status, network error); the browser intentionally shows only a generic message. |
+| `Could not start the GUI server on 127.0.0.1:8080` | Another program (often another `codeagent gui`) is using the port. Stop it, or run with `CODEAGENT_GUI_PORT=8081`. |
+| `Could not open a browser automatically` | Open the printed `http://127.0.0.1:<port>/` URL yourself. The server keeps running. |
+| `Frontend files were not found; only the API is available` | Set `CODEAGENT_FRONTEND_DIR=/path/to/repo/frontend`. |
+| *Choose source path* / *Choose output directory* say the dialog is unavailable | Native dialogs need `zenity` and a display (`sudo apt install zenity`). Without them, use *Open file in editor*; the output-directory button then asks for a typed path. |
+
 ## 2. Objectives
 
 * Develop a cross-platform terminal application using C++.
@@ -150,60 +230,17 @@ AI-Code-Assistant/
 
 This is a proposed structure; the final organization can be adjusted during implementation.
 
-## 7. Example Usage
+## 7. Usage Details
 
-The following commands illustrate the intended interface. Exact syntax will be finalized during implementation.
+The CLI commands are `help`, `gui`, `generate "<instruction>"`, and `refactor <file> "<instruction>"`. The CLI `generate` prints the code without saving it. The CLI `refactor` prints a unified diff and writes the file only after you answer `y`. See the Quick Start for the GUI workflow.
 
-### Generate code
+### GUI server security
 
-```bash
-ai-assistant generate "Implement binary search in C++"
-```
+The API accepts browser requests only from its own origin (`http://127.0.0.1:<port>` and `http://localhost:<port>`) and from the optional development origins `http://127.0.0.1:5500` and `http://localhost:5500`. Other origins and `Origin: null` are rejected. Every API request must carry a `Host` of `127.0.0.1:<port>` or `localhost:<port>`, which blocks DNS rebinding. Request bodies are limited to 1 MiB. Static files are served with `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`, and a same-origin `Content-Security-Policy`. cpp-httplib rejects `..` traversal and symlinks that escape the frontend directory.
 
-### Refactor a source file
+For frontend-only development you can still serve `frontend/` from a separate static server on port 5500. The page then calls the API on port 8080.
 
-```bash
-ai-assistant refactor ./src/main.cpp
-```
-
-### Refactor with specific instructions
-
-```bash
-ai-assistant refactor ./src/main.cpp \
-  --instruction "Improve readability and reduce duplication"
-```
-
-### Generate code and save the result
-
-```bash
-ai-assistant generate "Implement a stack using arrays" \
-  --language cpp \
-  --output ./generated/stack.cpp
-```
-
-### Display help
-
-```bash
-ai-assistant help
-```
-
-### Start the GUI backend
-
-```bash
-cmake -S . -B build
-cmake --build build -j2
-./build/codeagent gui
-```
-
-For local frontend development, serve the existing frontend from the exact allowed origin in a second terminal:
-
-```bash
-python3 -m http.server 5500 --bind 127.0.0.1 --directory frontend
-```
-
-Then open `http://127.0.0.1:5500` (or `http://localhost:5500`). The backend runs at `http://127.0.0.1:8080` until Ctrl+C. The API permits browser requests from these exact local frontend origins (`http://127.0.0.1:5500` and `http://localhost:5500`); other origins and `Origin: null` are rejected. Requests without an Origin are accepted for non-browser local clients, with Host validation still enforced.
-
-The frontend supports health/config display, code generation, refactoring from text in the editor, server-backed diff review, proposal approval/rejection, output-directory selection, and saving approved proposals. Save filenames must be supported C/C++ source filenames. Existing-file replacement requires a confirmation prompt. Generated output is not saved by the current UI. The source picker returns a path only; it does not load file contents. The editor is a plain text area. Files mode, settings, and copy controls are disabled placeholders.
+The *Choose source path* button reports only a selected path; by design the backend never returns file contents. Use *Open file in editor*, which reads the file in the browser. Files mode, settings, and copy controls are disabled placeholders.
 
 The backend retains at most 128 proposals and in-flight creation reservations combined. Refactor capacity is reserved before provider work begins. At capacity, the backend can replace only the oldest unreserved rejected or successfully applied proposal; pending, approved, saving, and actively reserved proposals remain protected. If no slot or terminal proposal is available, the request receives `503 PROPOSAL_CAPACITY` without invoking the provider. Failed provider or response-preparation work releases its reservation and preserves any proposal selected for replacement.
 
@@ -211,20 +248,15 @@ On POSIX systems, native dialogs require `zenity` and a graphical `DISPLAY` or `
 
 There is no `/api/session/exit` route. Stop the backend with Ctrl+C in its terminal.
 
-Run lightweight frontend checks with:
+Run the frontend checks with:
 
 ```bash
-node --check frontend/js/api.js
-node --check frontend/js/app.js
-node --check frontend/js/proposalWorkflow.js
 node frontend/tests/api.test.mjs
 node frontend/tests/proposalWorkflow.test.mjs
 node frontend/tests/appDomIntegration.test.mjs
 ```
 
-The app DOM integration test runs the real frontend module with a small dependency-free test DOM. It verifies HTML selectors and the review, approve, reject, and save event handlers; it does not replace a browser smoke test. Run the full backend checks with `cmake -S . -B build`, `cmake --build build -j2`, and `ctest --test-dir build --output-on-failure`.
-
-The older CLI examples above illustrate intended usage; some commands and options may not yet be available.
+The app DOM integration test runs the real frontend module against a small, dependency-free test DOM. It verifies the HTML selectors and the event handlers for file loading, generation, review, approve, reject, and save. It does not replace a browser smoke test.
 
 ## 8. Requirements
 
@@ -262,13 +294,7 @@ Before distributing the application, provide tested build instructions for each 
 
 The application requires an API endpoint, an API key, and any provider-specific model configuration.
 
-For example, the application may read an environment variable named:
-
-```text
-LLM_API_KEY
-```
-
-Set the variable in the user's environment before running the application. The exact API endpoint, authentication method, and model settings will depend on the chosen provider.
+The application reads the Gemini key from `GEMINI_API_KEY`, either from the environment or from a `.env` file in the launch directory. The endpoint and model (`gemini-3.5-flash`) are set in `src/LLMClient.cpp`.
 
 **Security requirements:**
 
