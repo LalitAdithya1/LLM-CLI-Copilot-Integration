@@ -23,8 +23,12 @@
 #else
 #include <cerrno>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
+#include <fstream>
+#include <iterator>
+#include <set>
 
 namespace {
 
@@ -221,6 +225,8 @@ bool writeFileSafely(const std::filesystem::path& target, const std::string& con
         if (fd < 0 && errno != EEXIST) break;
     }
     if (fd < 0) { error = std::error_code(errno, std::generic_category()); return false; }
+    // A replaced file keeps its permission bits instead of the temporary 0600.
+    if (exists) (void)::fchmod(fd, static_cast<mode_t>(status.permissions()) & 07777);
     std::size_t offset = 0;
     while (offset < content.size()) {
         const auto written = ::write(fd, content.data() + offset, content.size() - offset);
@@ -498,6 +504,35 @@ bool resolveSelectedDirectoryPath(
     return !error;
 }
 
+bool isWritableDirectory(const std::filesystem::path& directory) {
+#ifdef _WIN32
+    (void)directory;
+    return true;
+#else
+    return ::access(directory.c_str(), W_OK | X_OK) == 0;
+#endif
+}
+
+bool hasSupportedExtension(const std::filesystem::path& path) {
+    const auto& extensions = supportedExtensions();
+    return std::find(extensions.begin(), extensions.end(), path.extension().string()) !=
+           extensions.end();
+}
+
+bool readWholeFile(const std::filesystem::path& path, std::string& content) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        return false;
+    }
+    content.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    return !input.bad();
+}
+
+// Source files opened in the editor stay well under the 1 MiB request limit,
+// so their edited contents can still be sent back to be saved or refactored.
+constexpr std::uintmax_t kMaximumEditorFileBytes = 512 * 1024;
+constexpr std::size_t kMaximumOpenedDocuments = 256;
+
 void setDialogError(
     httplib::Response& response,
     const NativeDialogStatus status,
@@ -628,6 +663,151 @@ public:
             );
         });
 
+        // Opens a source file chosen by the user (dialog result or typed path)
+        // for editing. Its canonical path is remembered so that the editor can
+        // later save back to exactly that file and no other.
+        server_.Post("/api/files/read", [this](const httplib::Request& request, httplib::Response& response) {
+            if (!isJsonContentType(request.get_header_value("Content-Type"))) {
+                setJsonError(response, 415, "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json.");
+                return;
+            }
+            std::string requestedPath;
+            try {
+                const Json body = Json::parse(request.body);
+                if (!body.is_object() || body.size() != 1 || !body.contains("path") ||
+                    !body["path"].is_string()) {
+                    setJsonError(response, 400, "INVALID_REQUEST", "Request must contain only a string path field.");
+                    return;
+                }
+                requestedPath = body["path"].get<std::string>();
+            } catch (const Json::exception&) {
+                setJsonError(response, 400, "INVALID_JSON", "Request body must contain valid JSON.");
+                return;
+            }
+            if (isWhitespaceOnly(requestedPath)) {
+                setJsonError(response, 400, "INVALID_REQUEST", "path cannot be empty.");
+                return;
+            }
+
+            std::filesystem::path selectedPath;
+            std::error_code error;
+            std::filesystem::path canonicalPath;
+            if (resolveSelectedSourcePath(toHostPath(requestedPath), selectedPath)) {
+                canonicalPath = std::filesystem::canonical(selectedPath, error);
+            }
+            if (canonicalPath.empty() || error || !hasSupportedExtension(canonicalPath)) {
+                setJsonError(response, 422, "INVALID_SOURCE_FILE", "Path is not an existing file with a supported source extension.");
+                return;
+            }
+            const auto size = std::filesystem::file_size(canonicalPath, error);
+            if (error || size > kMaximumEditorFileBytes) {
+                setJsonError(response, 413, "FILE_TOO_LARGE", "Source files larger than 512 KiB cannot be opened in the editor.");
+                return;
+            }
+            std::string content;
+            if (!readWholeFile(canonicalPath, content)) {
+                setJsonError(response, 403, "READ_FAILED", "The file could not be read; check its permissions.");
+                return;
+            }
+            std::string serializedResponse;
+            try {
+                serializedResponse = Json{
+                    {"path", canonicalPath.string()},
+                    {"content", content},
+                    {"revision", hashEditorContent(content)}
+                }.dump();
+            } catch (const Json::exception&) {
+                setJsonError(response, 422, "UNSUPPORTED_ENCODING", "The file is not valid UTF-8 text.");
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(documentsMutex_);
+                if (openedDocuments_.count(canonicalPath.string()) == 0 &&
+                    openedDocuments_.size() >= kMaximumOpenedDocuments) {
+                    openedDocuments_.erase(openedDocuments_.begin());
+                }
+                openedDocuments_.insert(canonicalPath.string());
+            }
+            response.set_content(std::move(serializedResponse), kJsonContentType);
+        });
+
+        // Saves editor content back to a file opened through /api/files/read.
+        // baseRevision is the revision returned when the file was opened or last
+        // saved; if the file has changed on disk since, overwriting needs
+        // explicit confirmation.
+        server_.Post("/api/files/write", [this](const httplib::Request& request, httplib::Response& response) {
+            if (!isJsonContentType(request.get_header_value("Content-Type"))) {
+                setJsonError(response, 415, "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json.");
+                return;
+            }
+            std::string path;
+            std::string content;
+            std::string baseRevision;
+            bool overwriteConfirmed = false;
+            try {
+                const Json body = Json::parse(request.body);
+                if (!body.is_object() || body.size() != 4 ||
+                    !body.contains("path") || !body["path"].is_string() ||
+                    !body.contains("content") || !body["content"].is_string() ||
+                    !body.contains("baseRevision") || !body["baseRevision"].is_string() ||
+                    !body.contains("overwriteConfirmed") || !body["overwriteConfirmed"].is_boolean()) {
+                    setJsonError(response, 400, "INVALID_REQUEST", "Request must contain only string path, content, and baseRevision fields and a boolean overwriteConfirmed field.");
+                    return;
+                }
+                path = body["path"].get<std::string>();
+                content = body["content"].get<std::string>();
+                baseRevision = body["baseRevision"].get<std::string>();
+                overwriteConfirmed = body["overwriteConfirmed"].get<bool>();
+            } catch (const Json::exception&) {
+                setJsonError(response, 400, "INVALID_JSON", "Request body must contain valid JSON.");
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(documentsMutex_);
+                if (openedDocuments_.count(path) == 0) {
+                    setJsonError(response, 403, "FILE_NOT_OPENED", "Only files opened in this session can be saved in place. Use Save As to choose a destination.");
+                    return;
+                }
+            }
+            const std::filesystem::path target(path);
+            if (!hasSupportedExtension(target)) {
+                setJsonError(response, 400, "INVALID_FILENAME", "Only supported source files can be saved.");
+                return;
+            }
+
+            std::lock_guard<std::mutex> saveLock(saveMutex_);
+            std::error_code error;
+            const auto state = std::filesystem::symlink_status(target, error);
+            const bool exists = !error && state.type() != std::filesystem::file_type::not_found;
+            if (exists && (std::filesystem::is_symlink(state) || !std::filesystem::is_regular_file(state))) {
+                setJsonError(response, 422, "INVALID_TARGET", "Target must be a regular file and cannot be a symbolic link.");
+                return;
+            }
+            std::string current;
+            const bool unchanged = exists && readWholeFile(target, current) &&
+                                   hashEditorContent(current) == baseRevision;
+            if (!unchanged && !overwriteConfirmed) {
+                setJsonError(response, 409, "FILE_CHANGED_ON_DISK", exists
+                    ? "The file changed on disk since it was opened, for example in another editor. Reload it, or confirm to overwrite it."
+                    : "The file no longer exists on disk. Confirm to create it again.");
+                return;
+            }
+            if (!writeFileSafely(target, content, true, error)) {
+                const bool denied = error == std::errc::permission_denied ||
+                                    error == std::errc::operation_not_permitted ||
+                                    error == std::errc::read_only_file_system;
+                setJsonError(response, denied ? 403 : 500,
+                    denied ? "PERMISSION_DENIED" : "SAVE_FAILED",
+                    denied ? "Permission denied while writing the file." : "File could not be saved.");
+                return;
+            }
+            response.set_content(Json{
+                {"savedPath", target.string()},
+                {"status", "SAVED"},
+                {"revision", hashEditorContent(content)}
+            }.dump(), kJsonContentType);
+        });
+
         server_.Post("/api/output/select-directory", [this](const httplib::Request& request, httplib::Response& response) {
             if (!isJsonContentType(request.get_header_value("Content-Type"))) {
                 setJsonError(response, 415, "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json.");
@@ -651,7 +831,7 @@ public:
                         setJsonError(response, 400, "INVALID_DIRECTORY_PATH", "directoryPath cannot be empty.");
                         return;
                     }
-                    selectedPath = std::filesystem::path(path);
+                    selectedPath = toHostPath(path);
                 } else {
                     setJsonError(response, 400, "INVALID_REQUEST", "Request must be an empty object or contain one directoryPath string.");
                     return;
@@ -688,6 +868,10 @@ public:
             std::filesystem::path normalizedPath;
             if (!resolveSelectedDirectoryPath(selectedPath, normalizedPath)) {
                 setJsonError(response, 422, "INVALID_OUTPUT_DIRECTORY", "Selected path is not an existing directory.");
+                return;
+            }
+            if (!isWritableDirectory(normalizedPath)) {
+                setJsonError(response, 422, "OUTPUT_DIRECTORY_NOT_WRITABLE", "Selected directory is not writable; check its permissions.");
                 return;
             }
             {
@@ -997,26 +1181,37 @@ public:
             }
         });
 
-        server_.Post(R"(/api/changes/([^/]+)/(approve|reject))",
+        // approve/reject decide a pending proposal. mark-applied records that
+        // the client put an approved proposal into its editor; it writes no
+        // file and makes the proposal evictable, like a saved one.
+        server_.Post(R"(/api/changes/([^/]+)/(approve|reject|mark-applied))",
             [this](const httplib::Request& request, httplib::Response& response) {
                 if (!request.body.empty()) {
                     setJsonError(
                         response,
                         400,
                         "INVALID_REQUEST",
-                        "Approval and rejection requests must have an empty body."
+                        "Proposal state requests must have an empty body."
                     );
                     return;
                 }
 
                 const std::string proposalId = request.matches[1].str();
                 const std::string action = request.matches[2].str();
-                const ProposalStatus nextStatus = action == "approve"
+                const bool markApplied = action == "mark-applied";
+                const ProposalStatus requiredStatus = markApplied
                     ? ProposalStatus::Approved
-                    : ProposalStatus::Rejected;
-                const char* statusText = action == "approve"
-                    ? "APPROVED"
-                    : "REJECTED";
+                    : ProposalStatus::Pending;
+                const ProposalStatus nextStatus = markApplied
+                    ? ProposalStatus::Applied
+                    : action == "approve"
+                        ? ProposalStatus::Approved
+                        : ProposalStatus::Rejected;
+                const char* statusText = markApplied
+                    ? "APPLIED"
+                    : action == "approve"
+                        ? "APPROVED"
+                        : "REJECTED";
 
                 std::string serializedResponse;
                 {
@@ -1031,12 +1226,14 @@ public:
                         );
                         return;
                     }
-                    if (proposal->second.status != ProposalStatus::Pending) {
+                    if (proposal->second.status != requiredStatus) {
                         setJsonError(
                             response,
                             409,
                             "INVALID_PROPOSAL_STATE",
-                            "Only pending proposals can be approved or rejected."
+                            markApplied
+                                ? "Only approved proposals can be marked as applied."
+                                : "Only pending proposals can be approved or rejected."
                         );
                         return;
                     }
@@ -1316,6 +1513,9 @@ private:
     std::mutex configMutex_;
     std::mutex proposalMutex_;
     std::mutex saveMutex_;
+    std::mutex documentsMutex_;
+    // Canonical paths the user opened for editing; the only in-place save targets.
+    std::set<std::string> openedDocuments_;
     std::map<std::string, PendingProposal> proposals_;
     std::unordered_set<std::string> reservedEvictions_;
     std::size_t proposalReservations_ = 0;

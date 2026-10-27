@@ -1,8 +1,11 @@
 #include "ResponseParser.hpp"
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -270,4 +273,162 @@ TEST_F(ResponseParserTest, RejectsUnexpectedCandidateStructure) {
 
     EXPECT_FALSE(response.succeeded());
     EXPECT_EQ(response.error, ResponseParseError::UnexpectedStructure);
+}
+
+namespace {
+
+// Builds a Gemini response whose text parts are given verbatim. An empty
+// finishReason omits the field (legacy responses).
+std::string responseWithParts(
+    const std::vector<std::string>& parts,
+    const std::string& finishReason = "STOP"
+) {
+    nlohmann::json textParts = nlohmann::json::array();
+    for (const auto& part : parts) {
+        textParts.push_back({{"text", part}});
+    }
+    nlohmann::json candidate = {{"content", {{"parts", textParts}}}};
+    if (!finishReason.empty()) {
+        candidate["finishReason"] = finishReason;
+    }
+    return nlohmann::json{{"candidates", nlohmann::json::array({candidate})}}.dump();
+}
+
+std::string responseWithText(
+    const std::string& text,
+    const std::string& finishReason = "STOP"
+) {
+    return responseWithParts({text}, finishReason);
+}
+
+} // namespace
+
+TEST_F(ResponseParserTest, StripsAnEnclosingCodeFenceAndKeepsTheCodeExactly) {
+    const std::string code =
+        "#include <vector>\n"
+        "\n"
+        "int total(const std::vector<int>& values) {\n"
+        "    int sum = 0;\n"
+        "\n"
+        "    for (int value : values) {\n"
+        "        sum += value;\n"
+        "    }\n"
+        "    return sum;\n"
+        "}\n";
+    const ParsedResponse response =
+        parser.parseResponse(responseWithText("```cpp\n" + code + "```"));
+
+    ASSERT_TRUE(response.succeeded());
+    EXPECT_EQ(response.generatedText, code);
+    EXPECT_TRUE(response.isComplete());
+}
+
+TEST_F(ResponseParserTest, StripsFencesWithCommonOrMissingLanguageLabels) {
+    for (const std::string opening : {"```cpp", "```c++", "```C++", "```c", "```CPP",
+                                      "```", "``` cpp ", "````cpp"}) {
+        const std::string closing = opening.rfind("````", 0) == 0 ? "````" : "```";
+        const ParsedResponse response = parser.parseResponse(
+            responseWithText(opening + "\nint x = 1;\n" + closing)
+        );
+        ASSERT_TRUE(response.succeeded()) << opening;
+        EXPECT_EQ(response.generatedText, "int x = 1;\n") << opening;
+    }
+}
+
+TEST_F(ResponseParserTest, StripsFenceSurroundedByWhitespaceOrSplitAcrossParts) {
+    EXPECT_EQ(parser.parseResponse(responseWithText(
+                  "\n\n  ```cpp\nint a;\n```  \n\n")).generatedText,
+              "int a;\n");
+    EXPECT_EQ(parser.parseResponse(responseWithText(
+                  "```cpp\r\nint a;\r\nint b;\r\n```\r\n")).generatedText,
+              "int a;\r\nint b;\r\n");
+    EXPECT_EQ(parser.parseResponse(responseWithParts(
+                  {"```cpp\nint ", "a;\n", "```"})).generatedText,
+              "int a;\n");
+}
+
+TEST_F(ResponseParserTest, LeavesUnfencedCodeUnchanged) {
+    const std::string code = "int add(int a, int b) {\n    return a + b;\n}\n";
+    const ParsedResponse response = parser.parseResponse(responseWithText(code));
+    ASSERT_TRUE(response.succeeded());
+    EXPECT_EQ(response.generatedText, code);
+}
+
+TEST_F(ResponseParserTest, KeepsBackticksAndMarkdownLikeTextInsideTheCode) {
+    const std::string code =
+        "// Example: `add(1, 2)` returns 3. **Not** markdown.\n"
+        "const char* fence = \"```\";\n"
+        "const char* raw = R\"(```cpp)\";\n"
+        "# define NOTE \"- item\"\n";
+    EXPECT_EQ(parser.parseResponse(responseWithText("```cpp\n" + code + "```")).generatedText,
+              code);
+
+    // An inner ``` line is ordinary content inside a four-backtick fence.
+    const std::string withInnerFence = "/*\n```cpp\nexample();\n```\n*/\nint x;\n";
+    EXPECT_EQ(parser.parseResponse(responseWithText(
+                  "````cpp\n" + withInnerFence + "````")).generatedText,
+              withInnerFence);
+}
+
+TEST_F(ResponseParserTest, LeavesTextUnchangedWhenItIsNotExactlyOneFencedBlock) {
+    const std::vector<std::string> notEnclosed = {
+        "```cpp\nint x;\n",                         // no closing fence
+        "int x;\n```",                              // no opening fence
+        "Here is the code:\n```cpp\nint x;\n```",   // prose before
+        "```cpp\nint x;\n```\nHope this helps!",    // prose after
+        "```cpp\nint x;\n``` trailing",             // closing line has text
+        "````cpp\nint x;\n```",                     // mismatched fence lengths
+        "```cpp\nint x;\n````",                     // mismatched fence lengths
+        "```cpp\nint a;\n```\n\n```cpp\nint b;\n```",  // two blocks
+        "```cpp int x; ```",                        // single line
+        "```cpp title=\"a.cpp\"\nint x;\n```",      // not a plain language label
+        "``cpp\nint x;\n``",                        // two backticks is not a fence
+    };
+    for (const auto& text : notEnclosed) {
+        const ParsedResponse response = parser.parseResponse(responseWithText(text));
+        ASSERT_TRUE(response.succeeded()) << text;
+        EXPECT_EQ(response.generatedText, text) << text;
+    }
+}
+
+TEST_F(ResponseParserTest, AnEmptyFencedBlockIsReportedAsEmptyText) {
+    for (const std::string text : {"```cpp\n```", "```\n\n   \n```"}) {
+        const ParsedResponse response = parser.parseResponse(responseWithText(text));
+        EXPECT_FALSE(response.succeeded()) << text;
+        EXPECT_EQ(response.error, ResponseParseError::EmptyGeneratedText) << text;
+        EXPECT_TRUE(response.generatedText.empty()) << text;
+    }
+}
+
+TEST_F(ResponseParserTest, StripsFenceFromLegacyResponsesWithoutFinishReason) {
+    const ParsedResponse response =
+        parser.parseResponse(responseWithText("```cpp\nint x;\n```", ""));
+    ASSERT_TRUE(response.succeeded());
+    EXPECT_EQ(response.completionStatus, ResponseCompletionStatus::Unspecified);
+    EXPECT_EQ(response.generatedText, "int x;\n");
+}
+
+TEST_F(ResponseParserTest, PartialFencedOutputIsReturnedUnchanged) {
+    for (const std::string reason : {"MAX_TOKENS", "CONTINUATION"}) {
+        const std::string text = "```cpp\nint x;\n```";
+        const ParsedResponse response = parser.parseResponse(responseWithText(text, reason));
+        EXPECT_EQ(response.error, ResponseParseError::IncompleteResponse) << reason;
+        EXPECT_TRUE(response.isPartial()) << reason;
+        EXPECT_EQ(response.generatedText, text) << reason;
+    }
+}
+
+TEST_F(ResponseParserTest, BlockedRejectedAndUnknownFencedResponsesReturnNoText) {
+    const std::vector<std::pair<std::string, ResponseParseError>> cases = {
+        {"SAFETY", ResponseParseError::BlockedResponse},
+        {"MALFORMED_RESPONSE", ResponseParseError::RejectedFinishReason},
+        {"FUTURE_REASON", ResponseParseError::UnsupportedFinishReason},
+    };
+    for (const auto& [reason, error] : cases) {
+        const ParsedResponse response =
+            parser.parseResponse(responseWithText("```cpp\nint x;\n```", reason));
+        EXPECT_FALSE(response.succeeded()) << reason;
+        EXPECT_EQ(response.error, error) << reason;
+        EXPECT_TRUE(response.generatedText.empty()) << reason;
+    }
 }

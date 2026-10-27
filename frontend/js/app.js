@@ -5,14 +5,18 @@ import {
   getProposalDiff,
   getConfig,
   getHealth,
+  markProposalApplied,
   openSourceFileDialog,
+  readSourceFile,
   refactorCode,
   rejectProposal,
   saveGeneratedCode,
   saveProposal,
   selectOutputDirectory,
+  writeSourceFile,
 } from './api.js';
 import { createProposalWorkflow } from './proposalWorkflow.js';
+import { renderDiff } from './diffView.js';
 
 const SAMPLE_ORIGINAL_CODE = `#include <iostream>
 
@@ -26,6 +30,9 @@ int main() {
 const SOURCE_FILE_EXTENSIONS = ['.c', '.cc', '.cpp', '.cxx', '.h', '.hh', '.hpp', '.hxx'];
 // Keeps a loaded file and its refactoring instruction under the 1 MiB API limit.
 const MAX_LOADED_FILE_BYTES = 512 * 1024;
+// Name shown for editor content that is not tied to a file yet. It uses a
+// supported extension so Save As can keep it.
+const UNTITLED_DOCUMENT_NAME = 'untitled.cpp';
 
 const REQUIRED_ELEMENTS = [
   '[data-app="codeagent"]',
@@ -70,6 +77,16 @@ const REQUIRED_ELEMENTS = [
   '#select-source-file-button',
   '#load-source-file-button',
   '#load-source-file-input',
+  '#source-path-input',
+  '#open-source-path-button',
+  '#output-directory-input',
+  '#set-output-directory-button',
+  '#file-status',
+  '#copy-code-button',
+  '#save-document-button',
+  '#save-document-as-button',
+  '#reload-document-button',
+  '#document-status',
 ];
 
 let appInitializationStarted = false;
@@ -116,6 +133,16 @@ function initializeApp() {
   const selectSourceFileButton = document.querySelector('#select-source-file-button');
   const loadSourceFileButton = document.querySelector('#load-source-file-button');
   const loadSourceFileInput = document.querySelector('#load-source-file-input');
+  const sourcePathInput = document.querySelector('#source-path-input');
+  const openSourcePathButton = document.querySelector('#open-source-path-button');
+  const outputDirectoryInput = document.querySelector('#output-directory-input');
+  const setOutputDirectoryButton = document.querySelector('#set-output-directory-button');
+  const fileStatus = document.querySelector('#file-status');
+  const copyCodeButton = document.querySelector('#copy-code-button');
+  const saveDocumentButton = document.querySelector('#save-document-button');
+  const saveDocumentAsButton = document.querySelector('#save-document-as-button');
+  const reloadDocumentButton = document.querySelector('#reload-document-button');
+  const documentStatus = document.querySelector('#document-status');
   const proposalReviewStatus = document.querySelector('#proposal-review-status');
   const proposalReviewAvailability = document.querySelector('#proposal-review-availability');
   const proposalOriginalCode = document.querySelector('#proposal-original-code');
@@ -136,11 +163,23 @@ function initializeApp() {
   let backendRefreshPromise = null;
   let editorRevisionSequence = 0;
   let selectedMode = 'generate';
-  let originalCode = SAMPLE_ORIGINAL_CODE;
-  let draftCode = originalCode;
+  // The document in the editor. path and revision are set only when the
+  // content is tied to a file on disk that the backend can save in place;
+  // the sample and browser uploads have no path.
+  let currentDocument = {
+    name: UNTITLED_DOCUMENT_NAME,
+    path: null,
+    revision: null,
+    savedContent: SAMPLE_ORIGINAL_CODE,
+    origin: 'sample',
+  };
+  let draftCode = currentDocument.savedContent;
+  let documentOperationInProgress = false;
   // Latest generated (non-proposal) output: { code, saved }.
   let generatedOutput = null;
   let generatedSaveInProgress = false;
+  // ID of the proposal whose code was accepted into the editor.
+  let acceptedProposalId = null;
 
   const proposalWorkflow = createProposalWorkflow({
     getProposalDiff,
@@ -152,34 +191,45 @@ function initializeApp() {
   function renderDecisionControls() {
     const state = proposalWorkflow.getState();
     const hasPendingProposal = state.proposal?.status === 'PENDING';
-    const operationInProgress = Boolean(state.operation) || generatedSaveInProgress;
+    const operationInProgress = Boolean(state.operation) || generatedSaveInProgress
+      || Boolean(documentOperationInProgress);
     const actionLocked = workflowInProgress || operationInProgress;
     promptInput.disabled = actionLocked;
     languageInput.disabled = actionLocked;
     codeEditor.disabled = actionLocked;
     loadSourceFileButton.disabled = actionLocked;
+    openSourcePathButton.disabled = actionLocked || selectionInProgress;
+    selectSourceFileButton.disabled = actionLocked || selectionInProgress;
+    saveDocumentButton.disabled = actionLocked || !currentDocument.path || !isDocumentDirty();
+    saveDocumentAsButton.disabled = actionLocked;
+    reloadDocumentButton.disabled = actionLocked || !currentDocument.path;
+    saveDocumentButton.textContent = documentOperationInProgress === 'save' ? 'Saving…' : 'Save';
     modeButtons.forEach((button) => {
       button.disabled = actionLocked || button.dataset.mode === 'files';
     });
     submitButtons.forEach((button) => {
       button.disabled = actionLocked;
     });
-    const canDecide = hasPendingProposal && state.proposal.reviewed
-      && state.proposal.sourceMatches && !state.decisionBlocked
-      && !workflowInProgress && !operationInProgress;
+    const canDecideProposal = hasPendingProposal && state.proposal.reviewed
+      && state.proposal.sourceMatches && !state.decisionBlocked;
+    const canDecideGenerated = !state.proposal && generatedOutput !== null
+      && generatedOutput.decision === null;
+    const canDecide = (canDecideProposal || canDecideGenerated) && !actionLocked;
     reviewChangesButton.disabled = !hasPendingProposal || workflowInProgress || operationInProgress;
     reviewChangesButton.textContent = state.operation === 'review'
       ? 'Loading diff…'
       : state.proposal?.reviewed ? 'Refresh diff' : 'Review changes';
     acceptProposalButton.disabled = !canDecide;
     rejectProposalButton.disabled = !canDecide;
-    const canSaveProposal = state.proposal?.status === 'APPROVED' && state.proposal.sourceMatches;
-    const canSaveGenerated = !state.proposal && generatedOutput !== null && !generatedOutput.saved;
-    saveFileButton.disabled = !(canSaveProposal || canSaveGenerated) || actionLocked;
-    saveFileName.disabled = !(canSaveProposal || canSaveGenerated) || actionLocked;
+    // Accepted proposals are saved from the editor (Save / Save As); only
+    // generated output is written to the output directory from here.
+    const canSaveGenerated = !state.proposal && generatedOutput !== null
+      && !generatedOutput.saved && generatedOutput.decision !== 'rejected';
+    saveFileButton.disabled = !canSaveGenerated || actionLocked;
+    saveFileName.disabled = !canSaveGenerated || actionLocked;
     saveFileButton.textContent = state.operation === 'save' || generatedSaveInProgress
       ? 'Saving…'
-      : 'Save file';
+      : 'Save output';
   }
 
   function renderProposalState(state = proposalWorkflow.getState()) {
@@ -194,13 +244,18 @@ function initializeApp() {
 
     proposalOriginalCode.textContent = proposal.originalCode;
     proposalProposedCode.textContent = proposal.proposedCode;
-    proposalDiffContent.textContent = state.diff === null
-      ? state.operation === 'review' ? 'Loading diff…' : 'Select Review changes to load the backend diff.'
-      : state.diff.length > 0 ? state.diff : 'No differences were reported.';
+    if (state.diff === null) {
+      proposalDiffContent.textContent = state.operation === 'review'
+        ? 'Loading diff…'
+        : 'Select Review changes to load the backend diff.';
+    } else {
+      renderDiff(proposalDiffContent, state.diff);
+    }
 
+    const acceptedIntoEditor = proposal.status === 'APPROVED' && proposal.id === acceptedProposalId;
     const statusLabels = {
       PENDING: 'Proposal pending review',
-      APPROVED: 'Approved · not saved',
+      APPROVED: acceptedIntoEditor ? 'Accepted into the editor · not saved' : 'Approved',
       REJECTED: 'Rejected',
       APPLIED: 'Saved and applied',
     };
@@ -217,18 +272,20 @@ function initializeApp() {
       proposalReviewAvailability.textContent = `The backend confirmed the saved file: ${state.savedPath}`;
     } else if (state.error) {
       proposalReviewAvailability.textContent = state.error;
+    } else if (acceptedIntoEditor) {
+      proposalReviewAvailability.textContent = `The proposed code replaced the editor contents of ${currentDocument.name}. Nothing was written to disk: review or edit it, then select Save (Ctrl+S) or Save As.`;
     } else if (!proposal.sourceMatches) {
       proposalReviewAvailability.textContent = 'The editor content has changed since this proposal was created. Restore the original source shown above before approving or saving it.';
     } else if (proposal.status === 'PENDING') {
       proposalReviewAvailability.textContent = state.decisionBlocked
         ? 'The last decision was not confirmed. No proposal-status lookup is available, so further decisions are disabled.'
         : proposal.reviewed
-          ? 'Review the diff, then approve or reject this pending proposal.'
+          ? 'Review the diff, then Accept it into the editor or Reject it.'
           : 'Load the backend diff before approving or rejecting this proposal.';
     } else if (proposal.status === 'APPROVED') {
-      proposalReviewAvailability.textContent = 'The backend confirmed approval. Choose a filename and save this proposal.';
+      proposalReviewAvailability.textContent = 'The backend confirmed approval, but the proposal was not applied to the editor.';
     } else if (proposal.status === 'REJECTED') {
-      proposalReviewAvailability.textContent = 'The backend confirmed rejection. This proposal cannot be saved.';
+      proposalReviewAvailability.textContent = 'The backend confirmed rejection. The editor and files on disk are unchanged.';
     } else {
       proposalReviewAvailability.textContent = 'The backend confirmed the save. This proposal cannot be saved again.';
     }
@@ -265,26 +322,97 @@ function initializeApp() {
     editorLineNumbers.scrollTop = codeEditor.scrollTop;
   }
 
-  function renderCodeStatus() {
-    codeStatus.textContent = draftCode === originalCode
-      ? 'Unmodified'
-      : 'Unsaved changes';
+  function isDocumentDirty() {
+    return draftCode !== currentDocument.savedContent;
+  }
+
+  // Keeps the heading, footer, and dirty marker in step with currentDocument.
+  function renderDocumentState() {
+    const dirty = isDocumentDirty();
+    previewHeading.textContent = dirty ? `${currentDocument.name} ●` : currentDocument.name;
+    previewHeading.title = currentDocument.path || 'Not saved to disk';
+    codeLanguage.textContent = currentDocument.path
+      ? currentDocument.path
+      : currentDocument.origin === 'upload'
+        ? 'Opened in the browser · location unknown, use Save As to write it to disk'
+        : 'New document · not saved to disk';
+    codeStatus.textContent = dirty
+      ? 'Unsaved changes'
+      : currentDocument.path ? 'Saved to disk' : 'Not saved to disk';
   }
 
   function renderEditorState() {
     renderLineNumbers();
-    renderCodeStatus();
+    renderDocumentState();
+    renderDecisionControls();
   }
 
-  codeEditor.value = originalCode;
-  proposalWorkflow.setCurrentSourceCode(originalCode);
-  renderEditorState();
+  function renderMessage(element, message, tone = 'info') {
+    element.textContent = message;
+    element.dataset.tone = tone;
+    element.hidden = message.length === 0;
+    renderStatus(message);
+  }
+
+  function setDocumentOperation(operation) {
+    documentOperationInProgress = operation;
+    renderDecisionControls();
+  }
+
+  function editorIsBusy() {
+    return workflowInProgress || generatedSaveInProgress || documentOperationInProgress
+      || Boolean(proposalWorkflow.getState().operation);
+  }
+
+  // Asks before replacing editor content that has not been saved.
+  function confirmDiscardChanges(action) {
+    if (!isDocumentDirty()) return true;
+    return window.confirm(`${currentDocument.name} has unsaved changes. Discard them and ${action}?`);
+  }
+
+  function fileNameOf(path) {
+    return path.split(/[\\/]/).filter(Boolean).pop() || path;
+  }
+
+  // Replaces the editor with a new document; any proposal for the previous
+  // content no longer applies.
+  function loadDocument(nextDocument) {
+    proposalWorkflow.reset();
+    generatedOutput = null;
+    currentDocument = nextDocument;
+    draftCode = nextDocument.savedContent;
+    codeEditor.value = draftCode;
+    proposalWorkflow.setCurrentSourceCode(draftCode);
+    saveFileName.value = nextDocument.name;
+    renderEditorState();
+  }
+
+  codeEditor.value = draftCode;
+  proposalWorkflow.setCurrentSourceCode(draftCode);
+  renderLineNumbers();
+  renderDocumentState();
 
   codeEditor.addEventListener('input', () => {
     draftCode = codeEditor.value;
     renderEditorState();
     proposalWorkflow.setCurrentSourceCode(draftCode);
   });
+
+  codeEditor.addEventListener('keydown', (event) => {
+    if ((event.ctrlKey || event.metaKey) && String(event.key).toLowerCase() === 's') {
+      event.preventDefault();
+      void (currentDocument.path ? saveDocument() : saveDocumentAs());
+    }
+  });
+
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('beforeunload', (event) => {
+      if (isDocumentDirty() && currentDocument.origin !== 'sample') {
+        event.preventDefault();
+        event.returnValue = '';
+      }
+    });
+  }
 
   codeEditor.addEventListener('scroll', () => {
     editorLineNumbers.scrollTop = codeEditor.scrollTop;
@@ -313,80 +441,126 @@ function initializeApp() {
 
   function setSelectionInProgress(isInProgress) {
     selectionInProgress = isInProgress;
-    selectSourceFileButton.disabled = isInProgress;
     selectOutputDirectoryButton.disabled = isInProgress;
+    setOutputDirectoryButton.disabled = isInProgress;
+    renderDecisionControls();
+  }
+
+  // Opens a file by path through the backend, which validates it and remembers
+  // it so that Save can later write back to exactly this file.
+  async function openSourcePath(path) {
+    if (editorIsBusy()) return false;
+    if (!confirmDiscardChanges(`open ${fileNameOf(path)}`)) {
+      renderMessage(fileStatus, 'Opening was cancelled; the editor still has your unsaved changes.');
+      return false;
+    }
+    setDocumentOperation('open');
+    renderMessage(fileStatus, `Opening ${path}…`);
+    try {
+      const file = await readSourceFile(path);
+      const name = fileNameOf(file.path);
+      loadDocument({
+        name, path: file.path, revision: file.revision, savedContent: file.content, origin: 'disk',
+      });
+      sourcePathInput.value = file.path;
+      renderMessage(fileStatus, `Opened ${file.path}. Edit it here and select Save to write it back.`, 'success');
+      return true;
+    } catch (error) {
+      renderMessage(fileStatus, `Could not open the file: ${apiErrorMessage(error, 'check that the local backend is running.')}`, 'error');
+      return false;
+    } finally {
+      setDocumentOperation(false);
+    }
+  }
+
+  async function openTypedSourcePath() {
+    const path = sourcePathInput.value.trim();
+    if (!path) {
+      sourcePathInput.setAttribute('aria-invalid', 'true');
+      renderMessage(fileStatus, 'Enter the full path of a source file, for example /mnt/d/project/main.cpp or D:\\project\\main.cpp.', 'error');
+      sourcePathInput.focus();
+      return;
+    }
+    sourcePathInput.removeAttribute('aria-invalid');
+    await openSourcePath(path);
   }
 
   async function handleSourceFileSelection() {
-    if (selectionInProgress) {
+    if (selectionInProgress || editorIsBusy()) {
       return;
     }
     setSelectionInProgress(true);
-    renderStatus('Opening the native source-file dialog…');
+    renderMessage(fileStatus, 'Opening the file dialog… It may appear behind the browser window.');
+    let selectedPath = null;
     try {
       const result = await openSourceFileDialog();
       if (result.status === 'CANCELLED') {
-        renderStatus('Source-file selection cancelled. The displayed path is unchanged.');
+        renderMessage(fileStatus, 'Source-file selection cancelled. The editor is unchanged.');
         return;
       }
       if (result.status !== 'SELECTED') {
         throw new ApiError('INVALID_RESPONSE', 'The backend did not confirm a source-file selection.');
       }
-      previewHeading.textContent = result.selectedPath;
-      previewHeading.title = result.selectedPath;
-      codeLanguage.textContent = 'Path selected only · file contents not loaded';
-      renderStatus('Source path selected. The file contents were not read; use Open file in editor to load a file.');
+      selectedPath = result.selectedPath;
     } catch (error) {
-      const hint = error instanceof ApiError && error.code === 'DIALOG_UNAVAILABLE'
-        ? ' Use Open file in editor instead.'
-        : '';
-      renderStatus(`${pathSelectionErrorMessage(error, 'Source-file selection')}${hint}`);
+      if (error instanceof ApiError && error.code === 'DIALOG_UNAVAILABLE') {
+        renderMessage(fileStatus, 'No native file dialog is available here. Type the file path below and select Open path, or use Open file in editor.', 'error');
+        sourcePathInput.focus();
+      } else {
+        renderMessage(fileStatus, pathSelectionErrorMessage(error, 'Source-file selection'), 'error');
+      }
+      return;
     } finally {
       setSelectionInProgress(false);
     }
+    sourcePathInput.value = selectedPath;
+    await openSourcePath(selectedPath);
   }
 
-  // Reads a file chosen in the browser file picker. The contents stay in the
-  // page until the user sends them; the backend never reads arbitrary paths.
+  // Reads a file chosen in the browser file picker. Browsers do not reveal
+  // where such a file lives, so it can only be written with Save As.
   async function loadSourceFileIntoEditor(file) {
-    if (!file || workflowInProgress || generatedSaveInProgress
-      || proposalWorkflow.getState().operation) {
-      return;
-    }
-    const currentProposal = proposalWorkflow.getState().proposal;
-    if (currentProposal && ['PENDING', 'APPROVED'].includes(currentProposal.status)) {
-      renderStatus('Resolve the current proposal before loading another file.');
+    if (!file || editorIsBusy()) {
       return;
     }
     const dot = file.name.lastIndexOf('.');
     const extension = dot >= 0 ? file.name.slice(dot).toLowerCase() : '';
     if (!SOURCE_FILE_EXTENSIONS.includes(extension)) {
-      renderStatus(`${file.name} is not a supported source file (${SOURCE_FILE_EXTENSIONS.join(', ')}).`);
+      renderMessage(fileStatus, `${file.name} is not a supported source file (${SOURCE_FILE_EXTENSIONS.join(', ')}).`, 'error');
       return;
     }
     if (file.size > MAX_LOADED_FILE_BYTES) {
-      renderStatus(`${file.name} is larger than ${MAX_LOADED_FILE_BYTES / 1024} KiB and cannot be loaded.`);
+      renderMessage(fileStatus, `${file.name} is larger than ${MAX_LOADED_FILE_BYTES / 1024} KiB and cannot be loaded.`, 'error');
+      return;
+    }
+    if (!confirmDiscardChanges(`open ${file.name}`)) {
+      renderMessage(fileStatus, 'Opening was cancelled; the editor still has your unsaved changes.');
       return;
     }
     let text;
     try {
       text = await file.text();
     } catch {
-      renderStatus(`${file.name} could not be read.`);
+      renderMessage(fileStatus, `${file.name} could not be read.`, 'error');
       return;
     }
-    proposalWorkflow.reset();
-    generatedOutput = null;
-    originalCode = text;
-    draftCode = text;
-    codeEditor.value = text;
-    proposalWorkflow.setCurrentSourceCode(text);
-    renderEditorState();
-    previewHeading.textContent = file.name;
-    previewHeading.title = file.name;
-    codeLanguage.textContent = 'Loaded from your computer · the original file is unchanged';
-    saveFileName.value = file.name;
-    renderStatus(`Loaded ${file.name} into the editor. Switch to Refactor to propose changes; saving writes to the active output directory.`);
+    loadDocument({ name: file.name, path: null, revision: null, savedContent: text, origin: 'upload' });
+    renderMessage(fileStatus, `Loaded ${file.name}. The browser does not reveal its location, so use Save As to write it, or open it by path to save in place.`, 'success');
+  }
+
+  function applyOutputDirectory(result) {
+    if (result.status === 'CANCELLED') {
+      renderMessage(fileStatus, 'Output-directory selection cancelled. The output directory is unchanged.');
+      return;
+    }
+    if (result.status !== 'SELECTED') {
+      throw new ApiError('INVALID_RESPONSE', 'The backend did not confirm an output-directory selection.');
+    }
+    outputDirectorySelectionVersion += 1;
+    backendConfigOutputDirectory.textContent = result.activeOutputDirectory;
+    outputDirectoryInput.value = result.activeOutputDirectory;
+    backendConfigValues.hidden = false;
+    renderMessage(fileStatus, `Output directory set to ${result.activeOutputDirectory}.`, 'success');
   }
 
   async function handleOutputDirectorySelection() {
@@ -394,37 +568,163 @@ function initializeApp() {
       return;
     }
     setSelectionInProgress(true);
-    renderStatus('Opening the native output-directory dialog…');
+    renderMessage(fileStatus, 'Opening the directory dialog… It may appear behind the browser window.');
+    try {
+      applyOutputDirectory(await selectOutputDirectory());
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'DIALOG_UNAVAILABLE') {
+        renderMessage(fileStatus, 'No native directory dialog is available here. Type the directory path below and select Set directory.', 'error');
+        outputDirectoryInput.focus();
+      } else {
+        renderMessage(fileStatus, pathSelectionErrorMessage(error, 'Output-directory selection'), 'error');
+      }
+    } finally {
+      setSelectionInProgress(false);
+    }
+  }
+
+  // The backend checks that the typed path is an existing, writable directory
+  // and translates Windows paths such as D:\work under WSL.
+  async function setTypedOutputDirectory() {
+    if (selectionInProgress) return;
+    const path = outputDirectoryInput.value.trim();
+    if (!path) {
+      outputDirectoryInput.setAttribute('aria-invalid', 'true');
+      renderMessage(fileStatus, 'Enter the full path of an existing directory.', 'error');
+      outputDirectoryInput.focus();
+      return;
+    }
+    outputDirectoryInput.removeAttribute('aria-invalid');
+    setSelectionInProgress(true);
+    try {
+      applyOutputDirectory(await selectOutputDirectory(path));
+    } catch (error) {
+      outputDirectoryInput.setAttribute('aria-invalid', 'true');
+      renderMessage(fileStatus, pathSelectionErrorMessage(error, 'Setting the output directory'), 'error');
+    } finally {
+      setSelectionInProgress(false);
+    }
+  }
+
+  async function copyEditorContents() {
+    const text = codeEditor.value;
+    const lineCount = text.split('\n').length;
+    let copied = false;
+    const clipboard = globalThis.navigator?.clipboard;
+    if (typeof clipboard?.writeText === 'function') {
+      try {
+        await clipboard.writeText(text);
+        copied = true;
+      } catch {
+        copied = false;
+      }
+    }
+    // The Clipboard API needs a secure context and permission; fall back to
+    // copying a selection, which browsers allow during a click.
+    if (!copied && typeof document.execCommand === 'function') {
+      codeEditor.focus();
+      codeEditor.select?.();
+      try {
+        copied = document.execCommand('copy');
+      } catch {
+        copied = false;
+      }
+    }
+    renderMessage(documentStatus, copied
+      ? `Copied ${lineCount} line${lineCount === 1 ? '' : 's'} of ${currentDocument.name} to the clipboard.`
+      : 'Copy failed: clipboard access was denied. Select the editor text and press Ctrl+C instead.',
+    copied ? 'success' : 'error');
+  }
+
+  async function saveDocument() {
+    if (editorIsBusy() || !currentDocument.path) return false;
+    if (!isDocumentDirty()) {
+      renderMessage(documentStatus, `${currentDocument.name} has no unsaved changes.`);
+      return true;
+    }
+    const savedDocument = currentDocument;
+    const content = draftCode;
+    setDocumentOperation('save');
+    renderMessage(documentStatus, `Saving ${savedDocument.path}…`);
     try {
       let result;
       try {
-        result = await selectOutputDirectory();
+        result = await writeSourceFile({
+          path: savedDocument.path, content, baseRevision: savedDocument.revision, overwriteConfirmed: false,
+        });
       } catch (error) {
-        if (!(error instanceof ApiError) || error.code !== 'DIALOG_UNAVAILABLE') throw error;
-        // Without a native dialog (e.g. WSL without zenity), accept a typed
-        // path; the backend still checks that it is an existing directory.
-        const typedPath = window.prompt('The native directory dialog is unavailable. Enter the full path of an existing output directory:');
-        if (typeof typedPath !== 'string' || typedPath.trim().length === 0) {
-          renderStatus('Output-directory selection cancelled. The displayed directory is unchanged.');
-          return;
+        if (!(error instanceof ApiError) || error.code !== 'FILE_CHANGED_ON_DISK') throw error;
+        if (!window.confirm(`${savedDocument.name} was changed on disk after you opened it, for example in VS Code. Overwrite it with the editor contents?\n\n${error.message}`)) {
+          renderMessage(documentStatus, 'Save cancelled. The file on disk was not changed; use Reload to see its current contents.', 'error');
+          return false;
         }
-        result = await selectOutputDirectory(typedPath.trim());
+        result = await writeSourceFile({
+          path: savedDocument.path, content, baseRevision: savedDocument.revision, overwriteConfirmed: true,
+        });
       }
-      if (result.status === 'CANCELLED') {
-        renderStatus('Output-directory selection cancelled. The displayed directory is unchanged.');
-        return;
-      }
-      if (result.status !== 'SELECTED') {
-        throw new ApiError('INVALID_RESPONSE', 'The backend did not confirm an output-directory selection.');
-      }
-      outputDirectorySelectionVersion += 1;
-      backendConfigOutputDirectory.textContent = result.activeOutputDirectory;
-      backendConfigValues.hidden = false;
-      renderStatus('Output directory selection confirmed by the backend.');
+      currentDocument = { ...savedDocument, revision: result.revision, savedContent: content };
+      renderMessage(documentStatus, `Saved ${result.savedPath}.`, 'success');
+      return true;
     } catch (error) {
-      renderStatus(pathSelectionErrorMessage(error, 'Output-directory selection'));
+      renderMessage(documentStatus, `Save failed: ${apiErrorMessage(error, 'the file could not be saved.')}`, 'error');
+      return false;
     } finally {
-      setSelectionInProgress(false);
+      setDocumentOperation(false);
+      renderDocumentState();
+    }
+  }
+
+  // Writes the editor to <active output directory>/<name>, then reopens that
+  // file so later saves go to it.
+  async function saveDocumentAs() {
+    if (editorIsBusy()) return false;
+    const outputDirectory = backendConfigOutputDirectory.textContent.trim();
+    const answer = window.prompt(
+      `Save as (supported: ${SOURCE_FILE_EXTENSIONS.join(' ')}).\nThe file is written to the active output directory:\n${outputDirectory || '(not loaded)'}`,
+      currentDocument.name,
+    );
+    if (typeof answer !== 'string' || answer.trim().length === 0) {
+      renderMessage(documentStatus, 'Save As cancelled.');
+      return false;
+    }
+    const fileName = answer.trim();
+    const content = draftCode;
+    if (content.trim().length === 0) {
+      renderMessage(documentStatus, 'The editor is empty; there is nothing to save.', 'error');
+      return false;
+    }
+    setDocumentOperation('saveAs');
+    renderMessage(documentStatus, `Saving ${fileName}…`);
+    try {
+      let result;
+      try {
+        result = await saveGeneratedCode({ fileName, content, overwriteConfirmed: false });
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.code !== 'OVERWRITE_CONFIRMATION_REQUIRED') throw error;
+        if (!window.confirm(`${fileName} already exists in ${outputDirectory}. Replace it with the editor contents?`)) {
+          renderMessage(documentStatus, 'Save As cancelled. The existing file was not changed.');
+          return false;
+        }
+        result = await saveGeneratedCode({ fileName, content, overwriteConfirmed: true });
+      }
+      let file = null;
+      try {
+        file = await readSourceFile(result.savedPath);
+      } catch {
+        file = null;
+      }
+      currentDocument = file
+        ? { name: fileNameOf(file.path), path: file.path, revision: file.revision, savedContent: content, origin: 'disk' }
+        : { name: fileName, path: null, revision: null, savedContent: content, origin: 'upload' };
+      saveFileName.value = currentDocument.name;
+      renderMessage(documentStatus, `Saved ${result.savedPath}.`, 'success');
+      return true;
+    } catch (error) {
+      renderMessage(documentStatus, `Save As failed: ${apiErrorMessage(error, 'the file could not be saved.')}`, 'error');
+      return false;
+    } finally {
+      setDocumentOperation(false);
+      renderDocumentState();
     }
   }
 
@@ -472,6 +772,7 @@ function initializeApp() {
         backendConfigOutputDirectory.textContent = config.activeOutputDirectory.trim()
           ? config.activeOutputDirectory
           : 'No output directory reported';
+        if (!outputDirectoryInput.value) outputDirectoryInput.value = config.activeOutputDirectory;
       }
       backendConfigStatus.textContent = 'Configuration loaded';
       backendConfigValues.hidden = false;
@@ -534,19 +835,86 @@ function initializeApp() {
       : '';
   }
 
+  // Puts accepted code into the editor buffer. The document keeps its name
+  // and path, so the change shows as unsaved until the user saves it.
+  function applyCodeToEditor(code) {
+    draftCode = code;
+    codeEditor.value = code;
+    proposalWorkflow.setCurrentSourceCode(code);
+    renderEditorState();
+  }
+
+  function confirmReplaceEditor() {
+    return !isDocumentDirty() || window.confirm(
+      `${currentDocument.name} has unsaved changes. Replace the editor contents with the accepted code?`,
+    );
+  }
+
+  function decideGeneratedOutput(action) {
+    const output = generatedOutput;
+    if (!output || output.decision !== null) return;
+    if (action === 'approve') {
+      if (!confirmReplaceEditor()) {
+        renderStatus('Accept cancelled. The editor is unchanged.');
+        return;
+      }
+      output.decision = 'accepted';
+      applyCodeToEditor(output.code);
+      proposalReviewStatus.textContent = 'Accepted into the editor · not saved';
+      proposalReviewAvailability.textContent = `The generated code replaced the editor contents of ${currentDocument.name}. Nothing was written to disk: edit it, then select Save (Ctrl+S) or Save As.`;
+      renderStatus('Generated code accepted into the editor. It has not been saved.');
+    } else {
+      output.decision = 'rejected';
+      proposalReviewStatus.textContent = 'Generated output rejected';
+      proposalReviewAvailability.textContent = 'The generated code was discarded. The editor and files on disk are unchanged.';
+      renderStatus('Generated code rejected. The editor is unchanged.');
+      renderDecisionControls();
+    }
+  }
+
   async function submitProposalDecision(action) {
+    if (editorIsBusy()) return;
     const proposal = proposalWorkflow.getState().proposal;
-    if (workflowInProgress || proposal?.status !== 'PENDING') {
+    if (!proposal) {
+      decideGeneratedOutput(action);
+      return;
+    }
+    if (proposal.status !== 'PENDING') {
+      return;
+    }
+    if (action === 'approve' && !confirmReplaceEditor()) {
+      renderStatus('Accept cancelled. The editor and the proposal are unchanged.');
       return;
     }
     renderStatus(action === 'approve' ? 'Waiting for approval confirmation…' : 'Waiting for rejection confirmation…');
     const confirmed = await proposalWorkflow.decide(action);
     const current = proposalWorkflow.getState();
-    renderStatus(confirmed
-      ? action === 'approve'
-        ? 'Proposal approved by the backend. No file has been saved yet.'
-        : 'Proposal rejected by the backend. It cannot be saved.'
-      : `${action === 'approve' ? 'Approval' : 'Rejection'} was not confirmed. ${current.error}`);
+    if (!confirmed) {
+      renderStatus(`${action === 'approve' ? 'Approval' : 'Rejection'} was not confirmed. ${current.error}`);
+      return;
+    }
+    if (action === 'reject') {
+      renderStatus('Proposal rejected by the backend. The editor and files on disk are unchanged.');
+      return;
+    }
+    // Apply only the proposal that was reviewed, and only onto the text it
+    // was created from; the editor is locked while the approval is pending.
+    if (current.proposal?.id !== proposal.id || current.proposal.status !== 'APPROVED'
+      || codeEditor.value !== proposal.originalCode) {
+      renderStatus('The proposal was approved, but the editor changed meanwhile, so it was not applied.');
+      return;
+    }
+    acceptedProposalId = proposal.id;
+    applyCodeToEditor(current.proposal.proposedCode);
+    renderStatus('Proposal accepted into the editor. It has not been saved: review or edit it, then Save (Ctrl+S) or Save As.');
+    // Only now that the code is in the editor, let the backend release the
+    // proposal. A failure here leaves the editor as is; the backend just keeps
+    // the proposal until it restarts.
+    try {
+      await markProposalApplied(proposal.id);
+    } catch (error) {
+      renderStatus(`Proposal accepted into the editor and not saved. The backend could not record this (${apiErrorMessage(error, 'request failed')}); it keeps the proposal until it restarts.`);
+    }
   }
 
   async function reviewProposalChanges() {
@@ -597,52 +965,14 @@ function initializeApp() {
     }
   }
 
-  async function saveCurrentOutput() {
-    if (!proposalWorkflow.getState().proposal && generatedOutput) {
-      await saveGeneratedOutput();
-      return;
-    }
-    await saveApprovedProposal();
-  }
-
-  async function saveApprovedProposal() {
-    const state = proposalWorkflow.getState();
-    if (workflowInProgress || state.proposal?.status !== 'APPROVED' || state.operation) return;
-    if (!state.proposal.sourceMatches) {
-      renderStatus('The editor has changed since this proposal was created. Restore the original source before saving.');
-      return;
-    }
-    const fileName = saveFileName.value.trim();
-    if (!fileName) {
-      saveFileName.setAttribute('aria-invalid', 'true');
-      renderStatus('Enter a filename for the approved proposal.');
-      saveFileName.focus();
-      return;
-    }
-    saveFileName.removeAttribute('aria-invalid');
-    renderStatus('Saving the approved proposal through the backend…');
-    const saved = await proposalWorkflow.save(
-      fileName,
-      async (name) => window.confirm(
-        `The target file may already exist. Replace ${name}? The backend will validate the target again before writing.`,
-      ),
-    );
-    const result = proposalWorkflow.getState();
-    renderStatus(saved
-      ? `The backend confirmed the save: ${result.savedPath}`
-      : result.error || 'The save was not confirmed. The approved proposal remains available to retry.');
-  }
-
   async function submitWorkflow() {
-    if (workflowInProgress || generatedSaveInProgress || proposalWorkflow.getState().operation) {
+    if (editorIsBusy()) {
       return;
     }
 
     const currentProposal = proposalWorkflow.getState().proposal;
-    if (currentProposal && ['PENDING', 'APPROVED'].includes(currentProposal.status)) {
-      renderStatus(currentProposal.status === 'PENDING'
-        ? 'Review and approve or reject the current proposal before starting another request.'
-        : 'Save the approved proposal before starting another request.');
+    if (currentProposal?.status === 'PENDING') {
+      renderStatus('Review and accept or reject the current proposal before starting another request.');
       return;
     }
 
@@ -684,7 +1014,7 @@ function initializeApp() {
       : 'Generating code…';
     proposalReviewAvailability.textContent = requestMode === 'refactor'
       ? 'Waiting for a confirmed backend proposal.'
-      : 'Generated output cannot be approved or rejected.';
+      : 'Waiting for generated code.';
     renderStatus(requestMode === 'refactor'
       ? 'Creating a refactoring proposal with the backend…'
       : 'Generating code with the backend…');
@@ -703,9 +1033,9 @@ function initializeApp() {
         const response = await generateCode({ instruction, language });
         proposalOriginalCode.textContent = originalSource;
         proposalProposedCode.textContent = response.generatedCode;
-        generatedOutput = { code: response.generatedCode, saved: false };
+        generatedOutput = { code: response.generatedCode, saved: false, decision: null };
         proposalReviewStatus.textContent = 'Generated output · not saved';
-        proposalReviewAvailability.textContent = 'Generated code is not a refactoring proposal. Review it, enter a filename, and select Save file to write it to the output directory. Existing files are replaced only after you confirm.';
+        proposalReviewAvailability.textContent = 'Accept puts the generated code into the editor for you to edit and Save. Save output instead writes it as-is to the output directory; existing files are replaced only after you confirm.';
         renderStatus('Generated code is displayed. It has not been saved.');
       }
     } catch (error) {
@@ -765,7 +1095,7 @@ function initializeApp() {
     void reviewProposalChanges();
   });
   saveFileButton.addEventListener('click', () => {
-    void saveCurrentOutput();
+    void saveGeneratedOutput();
   });
 
   selectSourceFileButton.addEventListener('click', () => {
@@ -773,6 +1103,36 @@ function initializeApp() {
   });
   loadSourceFileButton.addEventListener('click', () => {
     loadSourceFileInput.click();
+  });
+  openSourcePathButton.addEventListener('click', () => {
+    void openTypedSourcePath();
+  });
+  sourcePathInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      void openTypedSourcePath();
+    }
+  });
+  setOutputDirectoryButton.addEventListener('click', () => {
+    void setTypedOutputDirectory();
+  });
+  outputDirectoryInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      void setTypedOutputDirectory();
+    }
+  });
+  copyCodeButton.addEventListener('click', () => {
+    void copyEditorContents();
+  });
+  saveDocumentButton.addEventListener('click', () => {
+    void saveDocument();
+  });
+  saveDocumentAsButton.addEventListener('click', () => {
+    void saveDocumentAs();
+  });
+  reloadDocumentButton.addEventListener('click', () => {
+    if (currentDocument.path) void openSourcePath(currentDocument.path);
   });
   loadSourceFileInput.addEventListener('change', () => {
     const file = loadSourceFileInput.files?.[0];

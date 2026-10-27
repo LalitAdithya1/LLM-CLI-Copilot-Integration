@@ -62,7 +62,7 @@
         </nav>
 
         <p class="availability-note" id="backend-unavailable">
-          Open a source file in the editor (or paste code), then refactor it into a proposal. Approved proposals and generated code are saved to the active output directory.
+          Open a source file by path to edit it and save it back in place, or paste code. Generated code and refactoring proposals appear below for review; Accept puts them into the editor, and nothing is written until you Save. Save As and Save output write to the active output directory.
         </p>
 
         <section class="backend-config" aria-labelledby="backend-config-heading">
@@ -84,12 +84,21 @@
               <dd id="backend-config-output-directory"></dd>
             </div>
           </dl>
-          <div class="backend-config__actions">
-            <button class="action-button" id="load-source-file-button" type="button">Open file in editor</button>
-            <input id="load-source-file-input" type="file" accept=".c,.cc,.cpp,.cxx,.h,.hh,.hpp,.hxx" hidden>
+          <div class="path-row">
+            <label for="source-path-input">Source file</label>
+            <input id="source-path-input" type="text" spellcheck="false" autocomplete="off" placeholder="/mnt/d/project/main.cpp or D:\project\main.cpp">
+            <button class="action-button" id="open-source-path-button" type="button">Open path</button>
             <button class="action-button" id="select-source-file-button" type="button">Choose source path</button>
+            <button class="action-button" id="load-source-file-button" type="button" title="Loads a copy; the browser cannot reveal its location, so save it with Save As">Open file in editor</button>
+            <input id="load-source-file-input" type="file" accept=".c,.cc,.cpp,.cxx,.h,.hh,.hpp,.hxx" hidden>
+          </div>
+          <div class="path-row">
+            <label for="output-directory-input">Output directory</label>
+            <input id="output-directory-input" type="text" spellcheck="false" autocomplete="off" placeholder="/mnt/d/project or D:\project">
+            <button class="action-button" id="set-output-directory-button" type="button">Set directory</button>
             <button class="action-button" id="select-output-directory-button" type="button">Choose output directory</button>
           </div>
+          <p class="file-status" id="file-status" role="status" aria-live="polite" hidden></p>
           <p class="backend-config__error" id="backend-config-error" role="alert" hidden></p>
         </section>
 
@@ -125,7 +134,7 @@
               <label class="visually-hidden" for="language-input">Programming language</label>
               <input id="language-input" name="language" type="text" placeholder="Programming language (for example, C++)" aria-describedby="prompt-help prompt-feedback">
               <textarea id="prompt-input" name="prompt" rows="3" placeholder="Describe the code to generate." aria-describedby="prompt-help prompt-feedback"></textarea>
-              <p class="visually-hidden" id="prompt-help">Enter a programming language and an instruction. Refactoring creates a proposal for diff review and approval. Only an approved proposal can be saved.</p>
+              <p class="visually-hidden" id="prompt-help">Enter a programming language and an instruction. Refactoring creates a proposal for diff review. Accepting it replaces the editor contents; save them with Save or Save As.</p>
               <p class="prompt-feedback" id="prompt-feedback" role="alert" aria-live="assertive" hidden></p>
               <button class="action-button action-button--primary" id="generate-submit-button" type="submit">Generate code</button>
             </form>
@@ -137,14 +146,19 @@
                 <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
                   <path d="m8 5-7 7 7 7M16 5l7 7-7 7M14 3l-4 18" />
                 </svg>
-                <h2 id="preview-heading">main.cpp</h2>
+                <h2 id="preview-heading">untitled.cpp</h2>
               </div>
-              <button class="icon-button" id="copy-code-button" type="button" aria-label="Copy code unavailable" disabled>
-                <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
-                  <rect x="8" y="8" width="13" height="13" rx="2" />
-                  <path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" />
-                </svg>
-              </button>
+              <div class="document-actions">
+                <button class="document-button" id="save-document-button" type="button" title="Save to the opened file (Ctrl+S)" disabled>Save</button>
+                <button class="document-button" id="save-document-as-button" type="button" title="Save to a new file in the output directory">Save As</button>
+                <button class="document-button" id="reload-document-button" type="button" title="Reload the opened file from disk" disabled>Reload</button>
+                <button class="icon-button" id="copy-code-button" type="button" aria-label="Copy editor contents" title="Copy editor contents">
+                  <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+                    <rect x="8" y="8" width="13" height="13" rx="2" />
+                    <path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" />
+                  </svg>
+                </button>
+              </div>
             </header>
 
             <div class="code-preview" id="code-preview" role="region" aria-label="Editable sample code workspace">
@@ -156,15 +170,16 @@
                 wrap="off"
                 spellcheck="false"
                 autocomplete="off"
-                aria-label="Editable C++ sample source for main.cpp"
+                aria-label="Code editor"
                 aria-describedby="editor-description"
               ></textarea>
             </div>
-            <p class="visually-hidden" id="editor-description">Sample source until you open a file. Refactoring sends editor text to the backend. Saving requires an approved proposal or generated code.</p>
+            <p class="visually-hidden" id="editor-description">Sample source until you open a file. Save writes back to a file opened by path; Save As writes to the output directory. Refactoring sends editor text to the backend.</p>
+            <p class="file-status" id="document-status" role="status" aria-live="polite" hidden></p>
 
             <footer class="preview-footer">
-              <span id="code-language">Sample workspace · not loaded from a file</span>
-              <span id="code-status" role="status">Unmodified</span>
+              <span id="code-language">New document · not saved to disk</span>
+              <span id="code-status" role="status">Not saved to disk</span>
             </footer>
           </section>
         </div>
@@ -176,7 +191,7 @@
               <p class="proposal-review__status" id="proposal-review-status" role="status">No proposal available</p>
             </div>
             <p class="proposal-review__availability" id="proposal-review-availability">
-              Review and save actions are available when the backend confirms a proposal.
+              Accept and Reject become available after you review a proposal or receive generated code.
             </p>
           </header>
 
@@ -206,9 +221,9 @@
         <section class="bottom-actions" id="bottom-actions" aria-label="Code actions">
           <button class="action-button action-button--primary" id="generate-code-button" type="submit" form="prompt-form">Generate code</button>
           <label class="save-file-name" for="save-file-name">Save filename
-            <input id="save-file-name" name="save-file-name" type="text" value="main.cpp" autocomplete="off" disabled>
+            <input id="save-file-name" name="save-file-name" type="text" value="untitled.cpp" autocomplete="off" disabled>
           </label>
-          <button class="action-button" id="save-file-button" type="button" disabled>Save file</button>
+          <button class="action-button" id="save-file-button" type="button" disabled>Save output</button>
         </section>
       </main>
 

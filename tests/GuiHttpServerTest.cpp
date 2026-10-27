@@ -21,6 +21,8 @@
 
 #include <gtest/gtest.h>
 
+#include <unistd.h>
+
 class ScriptedNativeDialogProvider final : public NativeDialogProvider {
 public:
     explicit ScriptedNativeDialogProvider(
@@ -1078,6 +1080,102 @@ TEST_F(GuiHttpServerProposalReviewTest, ApprovedProposalsAreNeverEvictedAtCapaci
     EXPECT_EQ(retained->status, 200);
 }
 
+TEST_F(GuiHttpServerProposalReviewTest, MarkAppliedOnlyMovesApprovedProposalsOnce) {
+    auto http = client();
+    const auto code = [](const httplib::Result& response) {
+        return nlohmann::json::parse(response->body).at("error").at("code").get<std::string>();
+    };
+
+    // A pending proposal cannot be marked applied, and stays decidable.
+    const std::string id = createProposal();
+    const auto early = http.Post("/api/changes/" + id + "/mark-applied");
+    ASSERT_TRUE(early);
+    EXPECT_EQ(early->status, 409);
+    EXPECT_EQ(code(early), "INVALID_PROPOSAL_STATE");
+    ASSERT_EQ(http.Post("/api/changes/" + id + "/approve")->status, 200);
+
+    const auto withBody = http.Post("/api/changes/" + id + "/mark-applied", "{}", "application/json");
+    ASSERT_TRUE(withBody);
+    EXPECT_EQ(withBody->status, 400);
+
+    const auto applied = http.Post("/api/changes/" + id + "/mark-applied");
+    ASSERT_TRUE(applied);
+    ASSERT_EQ(applied->status, 200);
+    EXPECT_EQ(nlohmann::json::parse(applied->body),
+              nlohmann::json({{"proposalId", id}, {"status", "APPLIED"}}));
+
+    for (const std::string action : {"mark-applied", "approve", "reject"}) {
+        const auto repeated = http.Post("/api/changes/" + id + "/" + action);
+        ASSERT_TRUE(repeated);
+        EXPECT_EQ(repeated->status, 409) << action;
+        EXPECT_EQ(code(repeated), "INVALID_PROPOSAL_STATE") << action;
+    }
+
+    // Marking applied writes nothing, and an applied proposal cannot be
+    // saved through the proposal save path afterwards.
+    const std::string fileName = "mark-applied-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()) + ".cpp";
+    const auto save = http.Post("/api/save",
+        nlohmann::json{{"proposalId", id}, {"fileName", fileName}}.dump(), "application/json");
+    ASSERT_TRUE(save);
+    EXPECT_EQ(save->status, 409);
+    EXPECT_FALSE(std::filesystem::exists(std::filesystem::current_path() / fileName));
+    const auto diff = http.Post("/api/diff", nlohmann::json{{"proposalId", id}}.dump(), "application/json");
+    ASSERT_TRUE(diff);
+    EXPECT_EQ(diff->status, 200);
+
+    const std::string rejectedId = createProposal();
+    ASSERT_EQ(http.Post("/api/changes/" + rejectedId + "/reject")->status, 200);
+    const auto rejected = http.Post("/api/changes/" + rejectedId + "/mark-applied");
+    ASSERT_TRUE(rejected);
+    EXPECT_EQ(rejected->status, 409);
+
+    const auto unknown = http.Post("/api/changes/prop-999/mark-applied");
+    ASSERT_TRUE(unknown);
+    EXPECT_EQ(unknown->status, 404);
+
+    const std::string foreignId = createProposal();
+    ASSERT_EQ(http.Post("/api/changes/" + foreignId + "/approve")->status, 200);
+    const auto foreign = http.Post("/api/changes/" + foreignId + "/mark-applied",
+        httplib::Headers{{"Origin", "http://evil.example"}}, "", "");
+    ASSERT_TRUE(foreign);
+    EXPECT_EQ(foreign->status, 403);
+    ASSERT_EQ(http.Post("/api/changes/" + foreignId + "/mark-applied")->status, 200)
+        << "the refused request did not change the state";
+}
+
+TEST_F(GuiHttpServerProposalReviewTest, CapacityRecoversAfterApprovedProposalsAreMarkedApplied) {
+    auto http = client();
+    std::vector<std::string> ids;
+    for (std::size_t index = 0; index < 128; ++index) {
+        ids.push_back(createProposal());
+        ASSERT_FALSE(ids.back().empty()) << "proposal index " << index;
+        ASSERT_EQ(http.Post("/api/changes/" + ids.back() + "/approve")->status, 200);
+    }
+    const auto full = http.Post("/api/refactor", requestBody(), "application/json");
+    ASSERT_TRUE(full);
+    ASSERT_EQ(full->status, 503);
+    EXPECT_EQ(handlerCalls_.load(), 128);
+
+    // Marking the two oldest proposals applied frees exactly two slots.
+    ASSERT_EQ(http.Post("/api/changes/" + ids[0] + "/mark-applied")->status, 200);
+    ASSERT_EQ(http.Post("/api/changes/" + ids[1] + "/mark-applied")->status, 200);
+    EXPECT_EQ(createProposal(), "prop-129");
+    EXPECT_EQ(createProposal(), "prop-130");
+    const auto stillFull = http.Post("/api/refactor", requestBody(), "application/json");
+    ASSERT_TRUE(stillFull);
+    EXPECT_EQ(stillFull->status, 503);
+
+    const auto diffStatus = [&http](const std::string& proposalId) {
+        return http.Post("/api/diff", nlohmann::json{{"proposalId", proposalId}}.dump(),
+                         "application/json")->status;
+    };
+    EXPECT_EQ(diffStatus(ids[0]), 404) << "applied proposals are evicted first";
+    EXPECT_EQ(diffStatus(ids[1]), 404);
+    EXPECT_EQ(diffStatus(ids[2]), 200) << "approved proposals are kept";
+    EXPECT_EQ(diffStatus("prop-129"), 200) << "the new pending proposal is kept";
+}
+
 TEST_F(GuiHttpServerProposalReviewTest, OriginChecksCoverEmptyBodyApprovalAndRejection) {
     httplib::Headers foreign{{"Origin", "http://evil.example"}};
     httplib::Headers allowed{{"Origin", "http://127.0.0.1:5500"}};
@@ -1574,4 +1672,204 @@ TEST(GuiHttpServerDialogTest, UpdatesOutputDirectoryForManualAndConcurrentSelect
     EXPECT_TRUE(activeDirectory == firstDirectory.string() ||
                 activeDirectory == secondDirectory.string());
     server.stop();
+}
+
+TEST(NativeDialogPathTest, TranslatesWindowsPathsToWslPaths) {
+    EXPECT_EQ(translateWindowsPathForWsl(R"(D:\LLM-CLI-Copilot-Integration\src)"),
+              "/mnt/d/LLM-CLI-Copilot-Integration/src");
+    EXPECT_EQ(translateWindowsPathForWsl("c:/Users/me/a.cpp"), "/mnt/c/Users/me/a.cpp");
+    EXPECT_EQ(translateWindowsPathForWsl(R"(E:\)"), "/mnt/e/");
+    EXPECT_EQ(translateWindowsPathForWsl(R"(\\wsl.localhost\Ubuntu\home\me\x.cpp)"),
+              "/home/me/x.cpp");
+    EXPECT_EQ(translateWindowsPathForWsl(R"(\\wsl$\Ubuntu\tmp)"), "/tmp");
+    EXPECT_EQ(translateWindowsPathForWsl("/home/me/x.cpp"), "/home/me/x.cpp");
+    EXPECT_EQ(translateWindowsPathForWsl("relative/x.cpp"), "relative/x.cpp");
+    EXPECT_EQ(translateWindowsPathForWsl("C:relative"), "C:relative");
+    EXPECT_EQ(translateWindowsPathForWsl(R"(\\fileserver\share\x.cpp)"),
+              R"(\\fileserver\share\x.cpp)");
+}
+
+class GuiHttpServerDocumentTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        directory_ = std::filesystem::temp_directory_path() / ("codeagent-doc-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(directory_);
+        source_ = directory_ / "insertion_sort.cpp";
+        write(source_, "int original;\n");
+        server_ = std::make_unique<GuiHttpServer>(0, directory_);
+        ASSERT_TRUE(server_->start());
+        http_ = std::make_unique<httplib::Client>("127.0.0.1", server_->port());
+    }
+
+    void TearDown() override {
+        if (server_) server_->stop();
+        std::error_code ignored;
+        std::filesystem::permissions(directory_, std::filesystem::perms::owner_all,
+                                     std::filesystem::perm_options::add, ignored);
+        std::filesystem::remove_all(directory_, ignored);
+    }
+
+    static void write(const std::filesystem::path& path, const std::string& content) {
+        std::ofstream(path, std::ios::binary) << content;
+    }
+
+    static std::string read(const std::filesystem::path& path) {
+        std::ifstream input(path, std::ios::binary);
+        return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    }
+
+    httplib::Result post(const std::string& path, const nlohmann::json& body) {
+        return http_->Post(path, body.dump(), "application/json");
+    }
+
+    std::filesystem::path directory_;
+    std::filesystem::path source_;
+    std::unique_ptr<GuiHttpServer> server_;
+    std::unique_ptr<httplib::Client> http_;
+};
+
+TEST_F(GuiHttpServerDocumentTest, OpensEditsAndSavesBackToTheSameFile) {
+    const auto opened = post("/api/files/read", {{"path", source_.string()}});
+    ASSERT_TRUE(opened);
+    ASSERT_EQ(opened->status, 200);
+    const auto document = nlohmann::json::parse(opened->body);
+    EXPECT_EQ(document.size(), 3u);
+    EXPECT_EQ(document.at("path"), std::filesystem::canonical(source_).string());
+    EXPECT_EQ(document.at("content"), "int original;\n");
+    const std::string revision = document.at("revision");
+    EXPECT_EQ(revision.rfind("fnv1a64:", 0), 0u);
+
+    const auto saved = post("/api/files/write", {
+        {"path", document.at("path")}, {"content", "int edited;\n"},
+        {"baseRevision", revision}, {"overwriteConfirmed", false}});
+    ASSERT_TRUE(saved);
+    ASSERT_EQ(saved->status, 200);
+    const auto result = nlohmann::json::parse(saved->body);
+    EXPECT_EQ(result.at("status"), "SAVED");
+    EXPECT_EQ(result.at("savedPath"), document.at("path"));
+    EXPECT_NE(result.at("revision"), revision);
+    EXPECT_EQ(read(source_), "int edited;\n");
+    for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
+        EXPECT_EQ(entry.path().filename().string().find(".tmp-"), std::string::npos);
+    }
+
+    // A second save based on the returned revision needs no confirmation.
+    const auto again = post("/api/files/write", {
+        {"path", document.at("path")}, {"content", "int again;\n"},
+        {"baseRevision", result.at("revision")}, {"overwriteConfirmed", false}});
+    ASSERT_TRUE(again);
+    EXPECT_EQ(again->status, 200);
+    EXPECT_EQ(read(source_), "int again;\n");
+}
+
+TEST_F(GuiHttpServerDocumentTest, ExternalChangesRequireConfirmationBeforeOverwrite) {
+    const auto opened = post("/api/files/read", {{"path", source_.string()}});
+    ASSERT_TRUE(opened);
+    const auto document = nlohmann::json::parse(opened->body);
+    write(source_, "int changedInVsCode;\n");
+
+    nlohmann::json body = {
+        {"path", document.at("path")}, {"content", "int fromBrowser;\n"},
+        {"baseRevision", document.at("revision")}, {"overwriteConfirmed", false}};
+    const auto conflict = post("/api/files/write", body);
+    ASSERT_TRUE(conflict);
+    EXPECT_EQ(conflict->status, 409);
+    EXPECT_EQ(nlohmann::json::parse(conflict->body).at("error").at("code"), "FILE_CHANGED_ON_DISK");
+    EXPECT_EQ(read(source_), "int changedInVsCode;\n");
+
+    body["overwriteConfirmed"] = true;
+    const auto confirmed = post("/api/files/write", body);
+    ASSERT_TRUE(confirmed);
+    EXPECT_EQ(confirmed->status, 200);
+    EXPECT_EQ(read(source_), "int fromBrowser;\n");
+
+    std::filesystem::remove(source_);
+    body["overwriteConfirmed"] = false;
+    const auto deleted = post("/api/files/write", body);
+    ASSERT_TRUE(deleted);
+    EXPECT_EQ(deleted->status, 409);
+    EXPECT_FALSE(std::filesystem::exists(source_));
+}
+
+TEST_F(GuiHttpServerDocumentTest, RefusesToWriteFilesThatWereNotOpened) {
+    const auto other = directory_ / "other.cpp";
+    write(other, "int keep;\n");
+    for (const auto& path : {other.string(), (directory_ / "new.cpp").string(),
+                             (directory_ / ".." / source_.filename()).string()}) {
+        const auto response = post("/api/files/write", {
+            {"path", path}, {"content", "int bad;\n"},
+            {"baseRevision", "fnv1a64:0000000000000000"}, {"overwriteConfirmed", true}});
+        ASSERT_TRUE(response);
+        EXPECT_EQ(response->status, 403);
+        EXPECT_EQ(nlohmann::json::parse(response->body).at("error").at("code"), "FILE_NOT_OPENED");
+    }
+    EXPECT_EQ(read(other), "int keep;\n");
+    EXPECT_FALSE(std::filesystem::exists(directory_ / "new.cpp"));
+
+    const auto malformed = http_->Post("/api/files/write",
+        R"({"path":"x.cpp","content":"x"})", "application/json");
+    ASSERT_TRUE(malformed);
+    EXPECT_EQ(malformed->status, 400);
+}
+
+TEST_F(GuiHttpServerDocumentTest, RejectsUnsupportedLargeAndNonUtf8Files) {
+    write(directory_ / "notes.txt", "text");
+    write(directory_ / "big.cpp", std::string(512 * 1024 + 1, 'x'));
+    write(directory_ / "binary.cpp", std::string("\xff\xfe\x00", 3));
+    std::filesystem::create_symlink(directory_ / "notes.txt", directory_ / "link.cpp");
+
+    const std::vector<std::pair<std::string, std::string>> cases = {
+        {(directory_ / "notes.txt").string(), "INVALID_SOURCE_FILE"},
+        {(directory_ / "missing.cpp").string(), "INVALID_SOURCE_FILE"},
+        {directory_.string(), "INVALID_SOURCE_FILE"},
+        {(directory_ / "link.cpp").string(), "INVALID_SOURCE_FILE"},
+        {(directory_ / "big.cpp").string(), "FILE_TOO_LARGE"},
+        {(directory_ / "binary.cpp").string(), "UNSUPPORTED_ENCODING"},
+    };
+    for (const auto& [path, code] : cases) {
+        const auto response = post("/api/files/read", {{"path", path}});
+        ASSERT_TRUE(response) << path;
+        EXPECT_GE(response->status, 400) << path;
+        EXPECT_EQ(nlohmann::json::parse(response->body).at("error").at("code"), code) << path;
+    }
+    const auto extraField = post("/api/files/read", {{"path", source_.string()}, {"x", 1}});
+    ASSERT_TRUE(extraField);
+    EXPECT_EQ(extraField->status, 400);
+}
+
+TEST_F(GuiHttpServerDocumentTest, SavingBackKeepsTheFilePermissions) {
+    std::filesystem::permissions(source_, std::filesystem::perms::owner_read |
+        std::filesystem::perms::owner_write | std::filesystem::perms::group_read);
+    const auto document = nlohmann::json::parse(
+        post("/api/files/read", {{"path", source_.string()}})->body);
+    const auto saved = post("/api/files/write", {
+        {"path", document.at("path")}, {"content", "int edited;\n"},
+        {"baseRevision", document.at("revision")}, {"overwriteConfirmed", false}});
+    ASSERT_TRUE(saved);
+    ASSERT_EQ(saved->status, 200);
+    EXPECT_EQ(std::filesystem::status(source_).permissions() & std::filesystem::perms::mask,
+              std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
+                  std::filesystem::perms::group_read);
+}
+
+TEST_F(GuiHttpServerDocumentTest, OutputDirectoryMustBeAnExistingWritableDirectory) {
+    const auto readOnly = directory_ / "read-only";
+    std::filesystem::create_directories(readOnly);
+    std::filesystem::permissions(readOnly, std::filesystem::perms::owner_read |
+                                               std::filesystem::perms::owner_exec);
+    const auto response = post("/api/output/select-directory", {{"directoryPath", readOnly.string()}});
+    ASSERT_TRUE(response);
+    if (::geteuid() != 0) {
+        EXPECT_EQ(response->status, 422);
+        EXPECT_EQ(nlohmann::json::parse(response->body).at("error").at("code"),
+                  "OUTPUT_DIRECTORY_NOT_WRITABLE");
+    }
+    const auto file = post("/api/output/select-directory", {{"directoryPath", source_.string()}});
+    ASSERT_TRUE(file);
+    EXPECT_EQ(file->status, 422);
+    EXPECT_EQ(nlohmann::json::parse(file->body).at("error").at("code"), "INVALID_OUTPUT_DIRECTORY");
+    const auto config = http_->Get("/api/config");
+    ASSERT_TRUE(config);
+    EXPECT_EQ(nlohmann::json::parse(config->body).at("activeOutputDirectory"), directory_.string());
 }

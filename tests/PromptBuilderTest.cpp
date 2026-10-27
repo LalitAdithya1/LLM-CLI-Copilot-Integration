@@ -44,6 +44,18 @@ TEST_F(PromptBuilderTest, BuildsRefactoringPrompt) {
     );
 }
 
+TEST_F(PromptBuilderTest, BothPromptsAskForRawCodeWithoutMarkdownFences) {
+    ASSERT_TRUE(builder.buildGenerationPrompt("Add two integers.", "C++", prompt));
+    EXPECT_NE(prompt.find("Return only the raw C++ source code"), std::string::npos);
+    EXPECT_NE(prompt.find("Do not wrap it in Markdown code fences"), std::string::npos);
+
+    ASSERT_TRUE(builder.buildRefactoringPrompt(
+        "Improve readability", "C++", "int add(int a,int b){return a+b;}", prompt));
+    EXPECT_NE(prompt.find("Return only the complete refactored C++ source code"),
+              std::string::npos);
+    EXPECT_NE(prompt.find("Do not wrap it in Markdown code fences"), std::string::npos);
+}
+
 TEST_F(PromptBuilderTest, RejectsEmptyGenerationInstruction) {
     prompt = "old prompt";
 

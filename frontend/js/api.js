@@ -136,6 +136,31 @@ function validateSave(payload) {
   return payload;
 }
 
+function isAbsolutePathString(value) {
+  return typeof value === 'string'
+    && (value.startsWith('/') || value.startsWith('\\\\') || /^[A-Za-z]:[\\/]/.test(value));
+}
+
+const REVISION_PATTERN = /^fnv1a64:[0-9a-f]{16}$/;
+
+function validateSourceFile(payload) {
+  expectFields(payload, ['path', 'content', 'revision'], 'source file');
+  if (!isAbsolutePathString(payload.path) || typeof payload.content !== 'string'
+    || !REVISION_PATTERN.test(payload.revision)) {
+    throw new ApiError('INVALID_RESPONSE', 'The backend returned an invalid source file.');
+  }
+  return payload;
+}
+
+function validateSourceWrite(payload, expectedPath) {
+  expectFields(payload, ['savedPath', 'status', 'revision'], 'file save');
+  if (payload.status !== 'SAVED' || payload.savedPath !== expectedPath
+    || !REVISION_PATTERN.test(payload.revision)) {
+    throw new ApiError('INVALID_RESPONSE', 'The backend did not confirm that the file was saved.');
+  }
+  return payload;
+}
+
 function validatePathSelection(payload, responsePathField, endpointName) {
   if (!isObject(payload) || typeof payload.status !== 'string') {
     throw new ApiError(
@@ -308,6 +333,12 @@ export function createApiClient({
       return sendProposalDecision(proposalId, 'reject', 'REJECTED');
     },
 
+    // Records that an approved proposal was applied to the editor. Writes no
+    // file; it lets the backend reclaim the proposal's storage.
+    async markProposalApplied(proposalId) {
+      return sendProposalDecision(proposalId, 'mark-applied', 'APPLIED');
+    },
+
     async getProposalDiff(proposalId) {
       if (typeof proposalId !== 'string' || proposalId.trim().length === 0) {
         throw new ApiError('INVALID_REQUEST', 'A valid proposal ID is required.');
@@ -354,6 +385,35 @@ export function createApiClient({
       }));
     },
 
+    async readSourceFile(path) {
+      if (typeof path !== 'string' || path.trim().length === 0) {
+        throw new ApiError('INVALID_REQUEST', 'A source file path is required.');
+      }
+      return validateSourceFile(await requestJson('/api/files/read', {
+        method: 'POST',
+        body: { path },
+      }));
+    },
+
+    async writeSourceFile(request = {}) {
+      if (!isObject(request)
+        || typeof request.path !== 'string' || request.path.trim().length === 0
+        || typeof request.content !== 'string'
+        || typeof request.baseRevision !== 'string'
+        || typeof request.overwriteConfirmed !== 'boolean') {
+        throw new ApiError('INVALID_REQUEST', 'An opened file path, content, and revision are required to save.');
+      }
+      return validateSourceWrite(await requestJson('/api/files/write', {
+        method: 'POST',
+        body: {
+          path: request.path,
+          content: request.content,
+          baseRevision: request.baseRevision,
+          overwriteConfirmed: request.overwriteConfirmed,
+        },
+      }), request.path);
+    },
+
     async openSourceFileDialog() {
       const payload = await requestJson('/api/files/open-dialog', {
         method: 'POST',
@@ -391,9 +451,12 @@ export const generateCode = (request) => defaultClient.generateCode(request);
 export const refactorCode = (request) => defaultClient.refactorCode(request);
 export const approveProposal = (proposalId) => defaultClient.approveProposal(proposalId);
 export const rejectProposal = (proposalId) => defaultClient.rejectProposal(proposalId);
+export const markProposalApplied = (proposalId) => defaultClient.markProposalApplied(proposalId);
 export const getProposalDiff = (proposalId) => defaultClient.getProposalDiff(proposalId);
 export const saveProposal = (request) => defaultClient.saveProposal(request);
 export const saveGeneratedCode = (request) => defaultClient.saveGeneratedCode(request);
+export const readSourceFile = (path) => defaultClient.readSourceFile(path);
+export const writeSourceFile = (request) => defaultClient.writeSourceFile(request);
 export const openSourceFileDialog = () => defaultClient.openSourceFileDialog();
 export const selectOutputDirectory = (directoryPath) =>
   defaultClient.selectOutputDirectory(directoryPath);

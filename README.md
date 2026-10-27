@@ -70,17 +70,36 @@ node --test frontend/tests/*.test.mjs
 
 ### Using the browser editor
 
-* **Generate:** enter a language and an instruction, then select *Generate code*. Gemini's output is shown for review. To keep it, enter a filename and select *Save file*.
-* **Refactor:** select *Open file in editor* to load a C/C++ file from your computer (or paste code), switch to *Refactor*, and describe the change. The backend creates a **proposal**. Select *Review changes* to load the unified diff, then *Accept* or *Reject*.
-  * A rejected proposal can never be saved.
-  * An accepted proposal is saved only when you select *Save file*.
-* **Saving** writes `<active output directory>/<filename>`.
-  * The output directory defaults to the launch directory. Change it with *Choose output directory*, either through a native dialog or a typed path when no dialog is available.
+* **Open a file to edit it in place.**
+  * Type its path in *Source file* and select *Open path* (or press Enter). Both WSL paths (`/mnt/d/project/insertion_sort.cpp`) and Windows paths (`D:\project\insertion_sort.cpp`, `\\wsl.localhost\Ubuntu\home\me\x.cpp`) work; under WSL the backend translates Windows paths.
+  * Alternatively, select *Choose source path* to pick the file in a native dialog. It uses zenity when installed; under WSL without zenity it opens a Windows file dialog through `powershell.exe`, which may appear behind the browser. If no dialog is available, the page says so and focuses the path field.
+  * The editor heading shows the file name. A `●` and *Unsaved changes* mark edits that are not yet on disk. A new document is shown as `untitled.cpp`.
+* **Save** (or Ctrl+S) writes the editor back to the file you opened, atomically. Its permission bits are kept.
+  * If the file changed on disk since you opened or last saved it (for example, you saved it in VS Code), Save asks before overwriting. *Reload* re-reads the file from disk.
+  * Opening another file, reloading, or uploading over unsaved edits asks for confirmation first.
+* **Save As** asks for a filename and writes it to the active output directory, asking before replacing an existing file. Later Saves go to the new file.
+* *Open file in editor* loads a copy through the browser file picker. Browsers do not reveal where such a file lives, so it can only be written with Save As.
+* *Copy* (the icon next to Save) copies the current editor text. It uses the Clipboard API and falls back to the browser's copy command; failures are reported next to the editor.
+* **Generate:** enter a language and an instruction, then select *Generate code*. Gemini's output is shown for review.
+  * *Accept* puts it into the editor (replacing the editor contents) to edit and save with Save or Save As.
+  * *Save output* instead writes it as-is to the output directory.
+  * *Reject* discards it.
+* **Refactor:** with code in the editor, switch to *Refactor* and describe the change. The backend creates a **proposal**. Select *Review changes* to load the unified diff, colored like `git diff`: removed lines red, added lines green, headers blue.
+  * *Accept* replaces the editor contents with the proposed code. Nothing is written to disk: the document is marked unsaved, you can keep editing, and Save (Ctrl+S) or Save As writes the final editor contents.
+  * If the editor has unsaved changes, Accept asks first. A proposal is applied only if it is still pending and the editor still contains the code it was created from.
+  * *Reject* leaves the editor and the files on disk unchanged.
+* **Saving output** writes `<active output directory>/<filename>`.
+  * The output directory defaults to the launch directory. Type a WSL or Windows path and select *Set directory*, or use *Choose output directory* for a native dialog. The backend accepts only existing, writable directories, and the active directory is always displayed.
   * Filenames must be plain names with a supported extension (`.c .cc .cpp .cxx .h .hh .hpp .hxx`). Paths and `..` are rejected.
   * Replacing an existing file always asks for confirmation.
   * Writes are atomic: the content goes to a temporary file that is then renamed into place.
   * Buttons are disabled while a request is in flight, so double clicks cannot approve or save twice.
-* AI-generated code is **never executed**.
+* Nothing is saved without an explicit Save, Save As, or Save output. AI-generated code is **never executed**.
+* The prompts ask Gemini for raw code. If a complete response is nevertheless one Markdown code block (`` ```cpp `` … `` ``` ``), the CLI and GUI receive only the code inside it. Any other response, including partial output or text around a code block, is shown exactly as returned.
+
+#### Editing the same file in VS Code
+
+Save writes the file on disk. It does not talk to VS Code. VS Code watches files, so a file open there without unsaved changes normally reloads to show the new contents. If it has unsaved changes, VS Code keeps your buffer and reports a conflict when you save it there. In the other direction, edits saved in VS Code are not pushed into the browser; select *Reload*. If you save in the browser without reloading, the backend detects the change and asks before overwriting it. This is not live two-way synchronization.
 
 ### Troubleshooting
 
@@ -90,7 +109,9 @@ node --test frontend/tests/*.test.mjs
 | `Could not start the GUI server on 127.0.0.1:8080` | Another program (often another `codeagent gui`) is using the port. Stop it, or run with `CODEAGENT_GUI_PORT=8081`. |
 | `Could not open a browser automatically` | Open the printed `http://127.0.0.1:<port>/` URL yourself. The server keeps running. |
 | `Frontend files were not found; only the API is available` | Set `CODEAGENT_FRONTEND_DIR=/path/to/repo/frontend`. |
-| *Choose source path* / *Choose output directory* say the dialog is unavailable | Native dialogs need `zenity` and a display (`sudo apt install zenity`). Without them, use *Open file in editor*; the output-directory button then asks for a typed path. |
+| *Choose source path* / *Choose output directory* say no dialog is available | On Linux, install zenity (`sudo apt install zenity`) and run in a graphical session. Under WSL, the Windows dialog needs `powershell.exe` to be reachable through WSL interop. Either way, typing the path and selecting *Open path* / *Set directory* always works. |
+| The dialog seems not to open | Under WSL the Windows dialog can open behind the browser window; check the taskbar. It closes itself after 2 minutes. |
+| *Save* says `FILE_NOT_OPENED` | Only files opened by path in this session can be saved in place. Use *Save As*, or open the file by path. |
 
 ## 2. Objectives
 
@@ -240,11 +261,11 @@ The API accepts browser requests only from its own origin (`http://127.0.0.1:<po
 
 For frontend-only development you can still serve `frontend/` from a separate static server on port 5500. The page then calls the API on port 8080.
 
-The *Choose source path* button reports only a selected path; by design the backend never returns file contents. Use *Open file in editor*, which reads the file in the browser. Files mode, settings, and copy controls are disabled placeholders.
+The backend reads a file only when the user explicitly opens it by path or through the dialog (`POST /api/files/read`). Only supported source extensions up to 512 KiB of UTF-8 text are accepted. It writes back in place only to files opened that way in the current session (`POST /api/files/write`), checking that the file has not changed since; every other write goes through the output-directory rules above. Files mode and settings are disabled placeholders.
 
-The backend retains at most 128 proposals and in-flight creation reservations combined. Refactor capacity is reserved before provider work begins. At capacity, the backend can replace only the oldest unreserved rejected or successfully applied proposal; pending, approved, saving, and actively reserved proposals remain protected. If no slot or terminal proposal is available, the request receives `503 PROPOSAL_CAPACITY` without invoking the provider. Failed provider or response-preparation work releases its reservation and preserves any proposal selected for replacement.
+The backend retains at most 128 proposals and in-flight creation reservations combined. Refactor capacity is reserved before provider work begins. At capacity, the backend can replace only the oldest unreserved rejected or applied proposal. A proposal counts as applied once it has been saved, or once the browser has put it into the editor (`mark-applied`). Pending, approved, saving, and actively reserved proposals remain protected. If no slot or terminal proposal is available, the request receives `503 PROPOSAL_CAPACITY` without invoking the provider. Failed provider or response-preparation work releases its reservation and preserves any proposal selected for replacement.
 
-On POSIX systems, native dialogs require `zenity` and a graphical `DISPLAY` or `WAYLAND_DISPLAY`, and time out after 30 seconds. Windows reports native dialogs unavailable. macOS uses the POSIX `zenity` path and has no native dialog integration. Automated tests cover dialog outcomes through an injected provider; no real desktop dialog was exercised here.
+On POSIX systems, native dialogs use `zenity` when it is installed and a graphical `DISPLAY` or `WAYLAND_DISPLAY` exists. Under WSL without zenity, they use a Windows Forms dialog started through `powershell.exe`, and the returned Windows path is translated to its WSL path. Dialogs time out after 2 minutes. A native Windows build reports dialogs unavailable. macOS has no native dialog integration. Automated tests cover dialog outcomes through an injected provider. The WSL PowerShell dialog has not been exercised with a real click in automated testing; only its launch, path translation, and script syntax have been verified.
 
 There is no `/api/session/exit` route. Stop the backend with Ctrl+C in its terminal.
 

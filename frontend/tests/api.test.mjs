@@ -118,6 +118,62 @@ test('backend URL is same-origin when the C++ server serves the frontend', () =>
   assert.equal(getBackendBaseUrl(undefined), 'http://127.0.0.1:8080');
 });
 
+test('source file open and save-back send exact fields and validate responses', async () => {
+  const captured = [];
+  const responses = [
+    { path: '/work/a.cpp', content: 'int a;\n', revision: 'fnv1a64:0123456789abcdef' },
+    { savedPath: '/work/a.cpp', status: 'SAVED', revision: 'fnv1a64:fedcba9876543210' },
+    { path: 'relative.cpp', content: '', revision: 'fnv1a64:0123456789abcdef' },
+    { savedPath: '/work/other.cpp', status: 'SAVED', revision: 'fnv1a64:fedcba9876543210' },
+  ];
+  const client = createApiClient({
+    fetchImpl: async (url, options) => {
+      captured.push({ url, body: JSON.parse(options.body) });
+      return jsonResponse(responses.shift());
+    },
+  });
+  assert.equal((await client.readSourceFile('/work/a.cpp')).content, 'int a;\n');
+  assert.equal((await client.writeSourceFile({
+    path: '/work/a.cpp', content: 'int b;\n', baseRevision: 'fnv1a64:0123456789abcdef', overwriteConfirmed: false,
+  })).revision, 'fnv1a64:fedcba9876543210');
+  assert.deepEqual(captured.map((request) => request.url), [
+    'http://127.0.0.1:8080/api/files/read', 'http://127.0.0.1:8080/api/files/write',
+  ]);
+  assert.deepEqual(captured[0].body, { path: '/work/a.cpp' });
+  assert.deepEqual(captured[1].body, {
+    path: '/work/a.cpp', content: 'int b;\n', baseRevision: 'fnv1a64:0123456789abcdef', overwriteConfirmed: false,
+  });
+  await assert.rejects(client.readSourceFile('/work/a.cpp'), (error) => error.code === 'INVALID_RESPONSE');
+  await assert.rejects(client.writeSourceFile({
+    path: '/work/a.cpp', content: 'x', baseRevision: 'fnv1a64:0123456789abcdef', overwriteConfirmed: false,
+  }), (error) => error.code === 'INVALID_RESPONSE', 'a save confirming another path is rejected');
+  await assert.rejects(client.readSourceFile('  '), (error) => error.code === 'INVALID_REQUEST');
+  await assert.rejects(
+    client.writeSourceFile({ path: '/work/a.cpp', content: 'x', baseRevision: 'r' }),
+    (error) => error.code === 'INVALID_REQUEST',
+  );
+});
+
+test('markProposalApplied posts an empty body and requires an APPLIED confirmation', async () => {
+  const captured = [];
+  const responses = [
+    { proposalId: 'prop-3', status: 'APPLIED' },
+    { proposalId: 'prop-3', status: 'APPROVED' },
+  ];
+  const client = createApiClient({
+    fetchImpl: async (url, options) => {
+      captured.push({ url, options });
+      return jsonResponse(responses.shift());
+    },
+  });
+  assert.deepEqual(await client.markProposalApplied('prop-3'), { proposalId: 'prop-3', status: 'APPLIED' });
+  assert.equal(captured[0].url, 'http://127.0.0.1:8080/api/changes/prop-3/mark-applied');
+  assert.equal(captured[0].options.method, 'POST');
+  assert.equal(captured[0].options.body, undefined);
+  await assert.rejects(client.markProposalApplied('prop-3'), (error) => error.code === 'INVALID_RESPONSE');
+  await assert.rejects(client.markProposalApplied(' '), (error) => error.code === 'INVALID_REQUEST');
+});
+
 test('generated-code save sends exactly the backend save fields', async () => {
   let captured;
   const client = createApiClient({

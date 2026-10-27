@@ -30,8 +30,16 @@ public:
 };
 
 // Creates the platform provider. Ubuntu/Linux uses zenity when a graphical
-// display is available; unsupported or headless systems report unavailable.
+// display is available; under WSL without zenity it uses a Windows dialog via
+// powershell.exe. Unsupported or headless systems report unavailable.
 std::shared_ptr<NativeDialogProvider> createNativeDialogProvider();
+
+// Maps C:\dir, C:/dir and \\wsl.localhost\<distribution>\dir (or \\wsl$\...)
+// to /mnt/c/dir and /dir. Any other path is returned unchanged.
+std::string translateWindowsPathForWsl(const std::string& path);
+
+// Applies translateWindowsPathForWsl under WSL; elsewhere returns path as is.
+std::filesystem::path toHostPath(const std::string& path);
 
 // Asks the desktop to open url in the default browser without waiting for it.
 // WSL uses wslview or explorer.exe, Linux uses xdg-open, macOS uses open.

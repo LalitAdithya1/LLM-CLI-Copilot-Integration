@@ -108,6 +108,77 @@ FinishReasonResult classifyFinishReason(const std::string& reason) {
     };
 }
 
+std::string trimSpacesAndTabs(const std::string& text) {
+    const auto first = text.find_first_not_of(" \t\r");
+    if (first == std::string::npos) {
+        return "";
+    }
+    const auto last = text.find_last_not_of(" \t\r");
+    return text.substr(first, last - first + 1);
+}
+
+// Returns the code inside one Markdown fence that encloses the whole text,
+// such as "```cpp\n...\n```". Returns nothing unless the text is exactly one
+// fenced block: an opening line of three or more backticks with an optional
+// language label, and a last line holding the same backticks alone.
+std::optional<std::string> stripEnclosingCodeFence(const std::string& text) {
+    const auto first = text.find_first_not_of(" \t\r\n");
+    const auto last = text.find_last_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return std::nullopt;
+    }
+
+    std::size_t fenceLength = 0;
+    while (first + fenceLength <= last && text[first + fenceLength] == '`') {
+        ++fenceLength;
+    }
+    if (fenceLength < 3) {
+        return std::nullopt;
+    }
+    const std::string fence(fenceLength, '`');
+
+    const auto openingEnd = text.find('\n', first);
+    if (openingEnd == std::string::npos || openingEnd > last) {
+        return std::nullopt;
+    }
+    // The label is a language name such as cpp, c++, C++ or c, or nothing.
+    const std::string label = trimSpacesAndTabs(
+        text.substr(first + fenceLength, openingEnd - first - fenceLength)
+    );
+    for (unsigned char ch : label) {
+        if (!std::isalnum(ch) && ch != '+' && ch != '#' && ch != '-' &&
+            ch != '_' && ch != '.') {
+            return std::nullopt;
+        }
+    }
+
+    const auto closingLineBreak = text.rfind('\n', last);
+    if (closingLineBreak == std::string::npos || closingLineBreak < openingEnd ||
+        trimSpacesAndTabs(text.substr(closingLineBreak + 1, last - closingLineBreak)) != fence) {
+        return std::nullopt;
+    }
+
+    // Keep the code exactly, including the line break that ends its last line.
+    std::string code = text.substr(openingEnd + 1, closingLineBreak - openingEnd);
+
+    // Another fence line inside means several blocks or prose around code.
+    std::size_t lineStart = 0;
+    while (lineStart < code.size()) {
+        const auto lineEnd = code.find('\n', lineStart);
+        const auto contentStart = code.find_first_not_of(" \t", lineStart);
+        if (contentStart != std::string::npos &&
+            (lineEnd == std::string::npos || contentStart < lineEnd) &&
+            code.compare(contentStart, fenceLength, fence) == 0) {
+            return std::nullopt;
+        }
+        if (lineEnd == std::string::npos) {
+            break;
+        }
+        lineStart = lineEnd + 1;
+    }
+    return code;
+}
+
 } // namespace
 
 ParsedResponse ResponseParser::parseResponse(
@@ -264,6 +335,21 @@ ParsedResponse ResponseParser::parseResponse(
             ResponseParseError::EmptyGeneratedText,
             "Gemini returned no generated text."
         );
+    }
+
+    // Models often wrap code in a Markdown fence despite the prompt. Only a
+    // complete (or legacy unspecified) response is unwrapped; partial output
+    // is returned exactly as received.
+    if (finishResult.error == ResponseParseError::None) {
+        if (auto code = stripEnclosingCodeFence(generatedText)) {
+            if (isWhitespaceOnly(*code)) {
+                return failWithFinishReason(
+                    ResponseParseError::EmptyGeneratedText,
+                    "Gemini returned an empty code block."
+                );
+            }
+            generatedText = std::move(*code);
+        }
     }
 
     ParsedResponse response;

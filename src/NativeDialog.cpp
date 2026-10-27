@@ -1,5 +1,7 @@
 #include "NativeDialog.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <string>
 
@@ -35,7 +37,8 @@ extern char** environ;
 
 namespace {
 
-constexpr auto kDialogTimeout = std::chrono::seconds(30);
+// Long enough to browse to a file; the request waits while the dialog is open.
+constexpr auto kDialogTimeout = std::chrono::seconds(120);
 constexpr std::size_t kMaximumPathBytes = 64 * 1024;
 
 bool graphicalDisplayAvailable() {
@@ -45,13 +48,24 @@ bool graphicalDisplayAvailable() {
            (waylandDisplay != nullptr && *waylandDisplay != '\0');
 }
 
-class SystemNativeDialogProvider final : public NativeDialogProvider {
-public:
-    NativeDialogResult choose(NativeDialogKind kind) override {
-        if (!graphicalDisplayAvailable()) {
-            return {NativeDialogStatus::Unavailable, {}};
-        }
+bool runningUnderWsl() {
+    const char* distribution = std::getenv("WSL_DISTRO_NAME");
+    if (distribution != nullptr && *distribution != '\0') {
+        return true;
+    }
+    std::ifstream release("/proc/sys/kernel/osrelease");
+    std::string text;
+    std::getline(release, text);
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return text.find("microsoft") != std::string::npos;
+}
 
+// Runs a dialog program and reads the selected path from its stdout. Exit
+// status 0 means selected, 1 cancelled, 127 (or a missing program) unavailable.
+NativeDialogResult runDialogProcess(const std::vector<std::string>& argumentList) {
+    {
         int outputPipe[2] = {-1, -1};
         if (::pipe(outputPipe) != 0) {
             return {NativeDialogStatus::Failed, {}};
@@ -86,25 +100,24 @@ public:
                 &actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0
             );
         }
+        // Keep Windows interop programs from reading the server's terminal.
+        if (actionResult == 0) {
+            actionResult = ::posix_spawn_file_actions_addopen(
+                &actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0
+            );
+        }
 
-        char fileArguments[] = "--file-selection";
-        char directoryArgument[] = "--directory";
-        char filterArgument[] = "--file-filter=Source files | *.c *.cc *.cpp *.cxx *.h *.hh *.hpp *.hxx";
-        char program[] = "zenity";
-        char* fileArgumentsVector[] = {
-            program, fileArguments, filterArgument, nullptr
-        };
-        char* directoryArgumentsVector[] = {
-            program, fileArguments, directoryArgument, nullptr
-        };
+        std::vector<std::string> argumentStorage(argumentList);
+        std::vector<char*> arguments;
+        for (auto& argument : argumentStorage) {
+            arguments.push_back(argument.data());
+        }
+        arguments.push_back(nullptr);
         pid_t child = -1;
         int spawnResult = actionResult;
         if (spawnResult == 0) {
-            char** arguments = kind == NativeDialogKind::SourceFile
-                ? fileArgumentsVector
-                : directoryArgumentsVector;
             spawnResult = ::posix_spawnp(
-                &child, "zenity", &actions, nullptr, arguments, environ
+                &child, arguments[0], &actions, nullptr, arguments.data(), environ
             );
         }
         ::posix_spawn_file_actions_destroy(&actions);
@@ -200,6 +213,55 @@ public:
         }
         return {NativeDialogStatus::Selected, std::filesystem::path(output)};
     }
+}
+
+// A Windows Forms dialog started through WSL interop. The script uses only
+// single quotes so interop's argument quoting cannot alter it; failures exit 2.
+std::vector<std::string> windowsDialogArguments(NativeDialogKind kind) {
+    const std::string dialog = kind == NativeDialogKind::SourceFile
+        ? "$d = New-Object Windows.Forms.OpenFileDialog; "
+          "$d.Title = 'CodeAgent - choose a source file'; "
+          "$d.Filter = 'C/C++ source|*.c;*.cc;*.cpp;*.cxx;*.h;*.hh;*.hpp;*.hxx'; "
+          "$ok = $d.ShowDialog($o) -eq 'OK'; $p = $d.FileName; "
+        : "$d = New-Object Windows.Forms.FolderBrowserDialog; "
+          "$d.Description = 'CodeAgent - choose the output directory'; "
+          "$ok = $d.ShowDialog($o) -eq 'OK'; $p = $d.SelectedPath; ";
+    return {
+        "powershell.exe", "-NoProfile", "-NonInteractive", "-STA", "-Command",
+        "try { Add-Type -AssemblyName System.Windows.Forms; "
+        "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
+        "$o = New-Object Windows.Forms.Form -Property @{TopMost = $true; "
+        "ShowInTaskbar = $false; Opacity = 0; StartPosition = 'CenterScreen'}; "
+        "$o.Show(); $o.Activate(); " + dialog +
+        "$o.Close(); if ($ok) { [Console]::Out.Write($p); exit 0 } else { exit 1 } "
+        "} catch { exit 2 }"
+    };
+}
+
+class SystemNativeDialogProvider final : public NativeDialogProvider {
+public:
+    NativeDialogResult choose(NativeDialogKind kind) override {
+        if (graphicalDisplayAvailable()) {
+            const NativeDialogResult result = runDialogProcess(
+                kind == NativeDialogKind::SourceFile
+                    ? std::vector<std::string>{"zenity", "--file-selection",
+                          "--file-filter=Source files | *.c *.cc *.cpp *.cxx *.h *.hh *.hpp *.hxx"}
+                    : std::vector<std::string>{"zenity", "--file-selection", "--directory"}
+            );
+            if (result.status != NativeDialogStatus::Unavailable) {
+                return result;
+            }
+        }
+        // WSL without zenity: use the Windows dialog and map its path back.
+        if (runningUnderWsl()) {
+            NativeDialogResult result = runDialogProcess(windowsDialogArguments(kind));
+            if (result.status == NativeDialogStatus::Selected) {
+                result.selectedPath = toHostPath(result.selectedPath.string());
+            }
+            return result;
+        }
+        return {NativeDialogStatus::Unavailable, {}};
+    }
 };
 
 } // namespace
@@ -210,7 +272,46 @@ std::shared_ptr<NativeDialogProvider> createNativeDialogProvider() {
     return std::make_shared<SystemNativeDialogProvider>();
 }
 
+std::string translateWindowsPathForWsl(const std::string& path) {
+    const auto isSeparator = [](char c) { return c == '\\' || c == '/'; };
+    std::string rest;
+    std::string prefix;
+    if (path.size() >= 3 && std::isalpha(static_cast<unsigned char>(path[0])) &&
+        path[1] == ':' && isSeparator(path[2])) {
+        prefix = std::string("/mnt/") +
+                 static_cast<char>(std::tolower(static_cast<unsigned char>(path[0])));
+        rest = path.substr(2);
+    } else {
+        // \\wsl.localhost\<distribution>\... and \\wsl$\<distribution>\...
+        // name this distribution's own root filesystem.
+        for (const std::string host : {"wsl.localhost", "wsl$"}) {
+            if (path.size() > host.size() + 2 && isSeparator(path[0]) &&
+                isSeparator(path[1])) {
+                std::string candidate = path.substr(2, host.size());
+                std::transform(candidate.begin(), candidate.end(), candidate.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (candidate == host && isSeparator(path[host.size() + 2])) {
+                    const auto distributionEnd =
+                        path.find_first_of("\\/", host.size() + 3);
+                    rest = distributionEnd == std::string::npos
+                        ? "/" : path.substr(distributionEnd);
+                    break;
+                }
+            }
+        }
+        if (rest.empty()) {
+            return path;
+        }
+    }
+    std::replace(rest.begin(), rest.end(), '\\', '/');
+    return prefix + rest;
+}
+
 #ifdef _WIN32
+
+std::filesystem::path toHostPath(const std::string& path) {
+    return path;
+}
 
 bool launchDefaultBrowser(const std::string&) {
     return false;
@@ -218,21 +319,11 @@ bool launchDefaultBrowser(const std::string&) {
 
 #else
 
-namespace {
-
-bool runningUnderWsl() {
-    const char* distribution = std::getenv("WSL_DISTRO_NAME");
-    if (distribution != nullptr && *distribution != '\0') {
-        return true;
-    }
-    std::ifstream release("/proc/sys/kernel/osrelease");
-    std::string text;
-    std::getline(release, text);
-    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return text.find("microsoft") != std::string::npos;
+std::filesystem::path toHostPath(const std::string& path) {
+    return runningUnderWsl() ? translateWindowsPathForWsl(path) : path;
 }
+
+namespace {
 
 // Starts program with url as its only argument, detached from the terminal's
 // process group so Ctrl+C on the server does not reach the browser. Arguments

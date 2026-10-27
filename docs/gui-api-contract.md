@@ -69,7 +69,10 @@ All `/api/` errors use this JSON shape. Unknown API routes return `404 NOT_FOUND
 | `POST /api/diff` | Return a diff for two code buffers or an existing proposal ID. |
 | `POST /api/changes/{id}/approve` | Mark a pending proposal as approved. Does not save. |
 | `POST /api/changes/{id}/reject` | Reject a pending proposal. It cannot subsequently be saved. |
-| `POST /api/files/open-dialog` | Open a native file picker, validate the selected C/C++ file, and return its path without reading its contents. |
+| `POST /api/changes/{id}/mark-applied` | Record that an approved proposal was applied to the client's editor. Writes no file; frees the proposal for eviction. |
+| `POST /api/files/open-dialog` | Open a native file picker, validate the selected C/C++ file, and return its path without reading its contents (the editor then calls `/api/files/read`). |
+| `POST /api/files/read` | Open a user-chosen source file by path for editing; returns its content and revision. |
+| `POST /api/files/write` | Save editor content back to a file opened with `/api/files/read`, detecting changes made on disk since. |
 | `POST /api/output/select-directory` | Open a directory picker or set a validated session output directory. |
 | `POST /api/save` | Save generated code or an approved proposal to the requested output location. |
 
@@ -247,14 +250,20 @@ The backend retains `editorRevision` and `baseEditorHash` unchanged in proposal 
 
 The current browser UI additionally compares the editor text with the proposal's original source and disables approval/save if it has changed. This is a client-side guard only; the backend cannot verify freshness across clients because decision/save requests do not include a current revision or content hash.
 
+#### `POST /api/changes/{id}/mark-applied`
+
+The request body must be empty. Only an `APPROVED` proposal may transition; success returns HTTP `200` with `{"proposalId":"prop-1","status":"APPLIED"}`. A pending, rejected, or already applied proposal returns `409 INVALID_PROPOSAL_STATE` and is not changed; an unknown ID returns `404`. The operation writes no file. It moves the proposal to the same terminal `APPLIED` state as a proposal saved through `/api/save`, so it can no longer be saved and becomes eligible for eviction at capacity.
+
+The browser UI's *Accept* first approves the proposal, then replaces the editor contents with the proposed code, and only after that sends `mark-applied`. If `mark-applied` fails, the editor keeps the accepted code and the proposal simply stays `APPROVED` (protected from eviction) until the server restarts.
+
 B8 errors use the common JSON error object from Section 2:
 
 | Status | Error code | Meaning |
 |---|---|---|
 | `400` | `INVALID_JSON` | The diff request body is not valid JSON. |
-| `400` | `INVALID_REQUEST` | The diff request does not match one of the documented shapes, or an approval/rejection request has a body. |
+| `400` | `INVALID_REQUEST` | The diff request does not match one of the documented shapes, or an approve/reject/mark-applied request has a body. |
 | `404` | `PROPOSAL_NOT_FOUND` | The requested proposal ID does not exist in this server session. |
-| `409` | `INVALID_PROPOSAL_STATE` | The proposal is no longer pending. |
+| `409` | `INVALID_PROPOSAL_STATE` | The proposal is not pending (approve/reject) or not approved (mark-applied). |
 | `413` | `PAYLOAD_TOO_LARGE` | A B8 request body exceeds 1 MiB. |
 | `415` | `UNSUPPORTED_MEDIA_TYPE` | The diff request content type is not `application/json`. |
 | `500` | `DIFF_FAILED` | The diff could not be generated. |
@@ -282,7 +291,7 @@ The request may be `{}` to open the native directory picker, or exactly one stri
 {"directoryPath":"/absolute/path/to/output"}
 ```
 
-The selected path must be an existing directory. On success the session's `activeOutputDirectory` is updated and HTTP `200` returns:
+The selected path must be an existing, writable directory. Under WSL, a Windows path such as `D:\out` or `\\wsl.localhost\Ubuntu\home\me` is first translated to `/mnt/d/out` or `/home/me`. On success the session's `activeOutputDirectory` is updated and HTTP `200` returns:
 
 ```json
 {"status":"SELECTED","activeOutputDirectory":"/absolute/path/to/output"}
@@ -301,11 +310,32 @@ B9 errors use the common JSON error object from Section 2:
 | `415` | `UNSUPPORTED_MEDIA_TYPE` | The content type is not `application/json`. |
 | `422` | `INVALID_SOURCE_FILE` | The selected path is not an existing regular source file with a supported extension. |
 | `422` | `INVALID_OUTPUT_DIRECTORY` | The selected path is not an existing directory. |
+| `422` | `OUTPUT_DIRECTORY_NOT_WRITABLE` | The selected directory exists but cannot be written. |
 | `500` | `DIALOG_FAILED` | The native dialog could not complete. |
 | `503` | `DIALOG_UNAVAILABLE` | The dialog utility or graphical display is unavailable. |
-| `504` | `DIALOG_TIMEOUT` | The native dialog exceeded its 30-second timeout. |
+| `504` | `DIALOG_TIMEOUT` | The native dialog exceeded its 2-minute timeout. |
 
-The POSIX provider invokes `zenity` with fixed argument vectors through `posix_spawn` (no shell), requires `DISPLAY` or `WAYLAND_DISPLAY`, caps returned path data, and enforces a 30-second timeout. Windows currently reports dialogs unavailable. On macOS, this POSIX implementation also requires a separately installed `zenity`; native macOS dialog support is not implemented. Automated tests use an injected provider and do not exercise a real desktop dialog.
+The POSIX provider invokes `zenity` with fixed argument vectors through `posix_spawn` (no shell) when `DISPLAY` or `WAYLAND_DISPLAY` is set. Under WSL, if zenity is missing, it starts `powershell.exe` through WSL interop with a fixed Windows Forms script and translates the returned Windows path. Returned path data is capped and dialogs time out after 2 minutes. A native Windows build reports dialogs unavailable. On macOS, this implementation requires a separately installed `zenity`. Automated tests use an injected provider and do not exercise a real desktop dialog.
+
+### B10: Editing files in place
+
+#### `POST /api/files/read`
+
+Request: exactly `{"path": "<absolute or Windows path>"}`. The path is translated under WSL, then must name an existing regular file whose canonical (symlink-resolved) path has a supported extension, is at most 512 KiB, and is valid UTF-8. Success returns HTTP `200`:
+
+```json
+{"path":"/canonical/path/insertion_sort.cpp","content":"...","revision":"fnv1a64:0123456789abcdef"}
+```
+
+The canonical path is remembered for this server session as an in-place save target. Errors: `400 INVALID_REQUEST`/`INVALID_JSON`, `413 FILE_TOO_LARGE`, `403 READ_FAILED`, `422 INVALID_SOURCE_FILE`, `422 UNSUPPORTED_ENCODING`.
+
+#### `POST /api/files/write`
+
+Request: exactly `{"path": string, "content": string, "baseRevision": string, "overwriteConfirmed": boolean}`. `path` must be a canonical path previously returned by `/api/files/read` in this session; any other path is refused with `403 FILE_NOT_OPENED`. If the file on disk no longer matches `baseRevision` (it was edited elsewhere or deleted) and `overwriteConfirmed` is false, the response is `409 FILE_CHANGED_ON_DISK` and nothing is written. The write is atomic, preserves the file's permission bits, and refuses symlinks and non-regular files (`422 INVALID_TARGET`). Permission failures return `403 PERMISSION_DENIED`. Success returns HTTP `200`:
+
+```json
+{"savedPath":"/canonical/path/insertion_sort.cpp","status":"SAVED","revision":"fnv1a64:fedcba9876543210"}
+```
 
 ### Example: save generated code
 
