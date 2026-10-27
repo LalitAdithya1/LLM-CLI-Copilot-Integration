@@ -1,6 +1,11 @@
 # CMake build files
 build
 /build-cli/
+# CMake build directories
+/build/
+/build-cli/
+
+# Project/runtime files
 .codeagent
 .env
 
@@ -11,9 +16,9 @@ build
 
 # CMake generated files
 CMakeCache.txt
-CMakeFiles
+CMakeFiles/
 cmake_install.cmake
 Makefile
 
 # IDE/editor files
-.vscode/ 
+.vscode/
