@@ -39,13 +39,13 @@
 
       <main id="main-content" class="main-content">
         <nav class="mode-cards" aria-label="Assistant mode">
-          <button class="mode-card" id="mode-generate" type="button" data-mode="generate" aria-describedby="backend-unavailable" disabled>
+          <button class="mode-card" id="mode-generate" type="button" data-mode="generate" aria-pressed="true">
             <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
               <path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8m0-12.8L5.6 18.4" />
             </svg>
             <span>Generate</span>
           </button>
-          <button class="mode-card" id="mode-refactor" type="button" data-mode="refactor" aria-describedby="backend-unavailable" disabled>
+          <button class="mode-card" id="mode-refactor" type="button" data-mode="refactor" aria-pressed="false">
             <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
               <path d="m14 6 4-4 4 4-4 4M18 2v9a5 5 0 0 1-5 5H6m4 2-4 4-4-4m4 4v-9a5 5 0 0 1 5-5h1" />
             </svg>
@@ -90,9 +90,11 @@
             </div>
 
             <form class="prompt-form" id="prompt-form">
-              <label class="visually-hidden" for="prompt-input">Message CodeAgent</label>
-              <textarea id="prompt-input" name="prompt" rows="3" placeholder="Backend connection is not available yet." disabled></textarea>
-              <p class="visually-hidden" id="prompt-help">Generation and refactoring controls are disabled until a backend API is available.</p>
+              <label class="visually-hidden" for="prompt-input">Instruction for CodeAgent</label>
+              <textarea id="prompt-input" name="prompt" rows="3" placeholder="Enter an instruction to validate locally." aria-describedby="prompt-help prompt-feedback"></textarea>
+              <p class="visually-hidden" id="prompt-help">Instructions are validated locally. Backend execution is not connected.</p>
+              <p class="prompt-feedback" id="prompt-feedback" role="alert" aria-live="assertive" hidden></p>
+              <button class="action-button" id="validate-instruction-button" type="submit">Validate instruction</button>
             </form>
           </section>
 

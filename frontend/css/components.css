@@ -187,6 +187,17 @@
   box-shadow: 0 4px 12px rgb(0 0 0 / 18%), inset 0 1px rgb(255 255 255 / 3%);
 }
 
+.mode-card[aria-pressed="true"] {
+  border-color: rgb(139 92 246 / 72%);
+  background: rgb(139 92 246 / 13%);
+  color: var(--color-text);
+  box-shadow: inset 0 0 0 1px rgb(139 92 246 / 18%);
+}
+
+.mode-card[aria-pressed="true"] svg {
+  stroke: #b49af8;
+}
+
 .mode-card:focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: 3px;
@@ -337,6 +348,21 @@
 
 .prompt-form {
   margin-top: auto;
+}
+
+.prompt-form [hidden] {
+  display: none;
+}
+
+.prompt-feedback {
+  margin: var(--space-2) 0 0;
+  color: #f0ad4e;
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+
+.prompt-form .action-button {
+  margin-top: var(--space-3);
 }
 
 .prompt-form textarea {
