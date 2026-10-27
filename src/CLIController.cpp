@@ -4,14 +4,18 @@
 #include "FileManager.hpp"
 #include "PromptBuilder.hpp"
 #include "LLMClient.hpp"
+#include "UnifiedDiff.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <iostream>
 #include <string>
+#include <utility>
 
 namespace {
 
-void displayHelp() {
-    std::cout
+void displayHelp(std::ostream& output) {
+    output
         << "CodingCLI - AI Coding Assistant\n\n"
         << "Usage:\n"
         << "  codeagent help\n"
@@ -25,9 +29,39 @@ void displayHelp() {
         << "  -h, --help Display this help message\n";
 }
 
-void displayUsageError(const std::string& message) {
-    std::cerr << "Error: " << message << "\n\n";
-    std::cerr << "Run 'codeagent help' for usage instructions.\n";
+void displayUsageError(std::ostream& error, const std::string& message) {
+    error << "Error: " << message << "\n\n";
+    error << "Run 'codeagent help' for usage instructions.\n";
+}
+
+bool isApproval(const std::string& response) {
+    std::string normalized;
+    const auto first = response.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return false;
+    }
+    const auto last = response.find_last_not_of(" \t\r\n");
+    normalized = response.substr(first, last - first + 1);
+    std::transform(
+        normalized.begin(), normalized.end(), normalized.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); }
+    );
+    return normalized == "y" || normalized == "yes";
+}
+
+bool isRejection(const std::string& response) {
+    std::string normalized;
+    const auto first = response.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return false;
+    }
+    const auto last = response.find_last_not_of(" \t\r\n");
+    normalized = response.substr(first, last - first + 1);
+    std::transform(
+        normalized.begin(), normalized.end(), normalized.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); }
+    );
+    return normalized == "n" || normalized == "no";
 }
 
 std::string joinArguments(
@@ -50,9 +84,36 @@ std::string joinArguments(
 
 } // namespace
 
+CLIController::CLIController()
+    : CLIController(
+          [](const std::string& prompt,
+             std::string& response,
+             bool requireExplicitCompletion) {
+              LLMClient client;
+              return requireExplicitCompletion
+                  ? client.generateCompleteContent(prompt, response)
+                  : client.generateContent(prompt, response);
+          },
+          std::cin,
+          std::cout,
+          std::cerr) {
+}
+
+CLIController::CLIController(
+    LLMCall llmCall,
+    std::istream& input,
+    std::ostream& output,
+    std::ostream& error
+)
+    : llmCall_(std::move(llmCall)),
+      input_(input),
+      output_(output),
+      error_(error) {
+}
+
 int CLIController::run(int argc, char* argv[]) {
     if (argc < 2) {
-        displayUsageError("No command provided.");
+        displayUsageError(error_, "No command provided.");
         return 1;
     }
 
@@ -65,7 +126,7 @@ int CLIController::run(int argc, char* argv[]) {
     if (command == "help" ||
         command == "--help" ||
         command == "-h") {
-        displayHelp();
+        displayHelp(output_);
         return 0;
     }
 
@@ -75,7 +136,7 @@ int CLIController::run(int argc, char* argv[]) {
 
     if (command == "generate") {
         if (argc < 3) {
-            displayUsageError(
+            displayUsageError(error_,
                 "The generate command requires an instruction."
             );
             return 1;
@@ -93,26 +154,25 @@ int CLIController::run(int argc, char* argv[]) {
                 instruction,
                 language,
                 prompt)) {
-            std::cerr
+            error_
                 << "Error: Could not build generation prompt.\n";
             return 1;
         }
 
-        LLMClient llmClient;
         std::string generatedCode;
 
-        std::cout
+        output_
             << "Sending generation request to Gemini...\n";
 
-        if (!llmClient.generateContent(prompt, generatedCode)) {
-            std::cerr
+        if (!llmCall_(prompt, generatedCode, false)) {
+            error_
                 << "Error: Code generation failed. Check your "
                 << ".env API key, internet connection, and Gemini "
                 << "API configuration.\n";
             return 1;
         }
 
-        std::cout
+        output_
             << "\nGenerated code:\n\n"
             << generatedCode
             << '\n';
@@ -126,7 +186,7 @@ int CLIController::run(int argc, char* argv[]) {
 
     if (command == "refactor") {
         if (argc < 4) {
-            displayUsageError(
+            displayUsageError(error_,
                 "The refactor command requires a file path "
                 "and an instruction."
             );
@@ -137,11 +197,11 @@ int CLIController::run(int argc, char* argv[]) {
         const std::string instruction =
             joinArguments(argc, argv, 3);
 
-        FileManager fileManager;
+        FileManager fileManager(input_, output_, error_);
         std::string sourceCode;
 
         if (!fileManager.readFile(filePath, sourceCode)) {
-            std::cerr
+            error_
                 << "Refactoring cancelled because the source file "
                 << "could not be read.\n";
             return 1;
@@ -156,29 +216,58 @@ int CLIController::run(int argc, char* argv[]) {
                 language,
                 sourceCode,
                 prompt)) {
-            std::cerr
+            error_
                 << "Error: Could not build refactoring prompt.\n";
             return 1;
         }
 
-        LLMClient llmClient;
         std::string refactoredCode;
 
-        std::cout
+        output_
             << "Sending refactoring request to Gemini...\n";
 
-        if (!llmClient.generateContent(prompt, refactoredCode)) {
-            std::cerr
+        if (!llmCall_(prompt, refactoredCode, true)) {
+            error_
                 << "Error: Refactoring failed. Check your "
                 << ".env API key, internet connection, and Gemini "
                 << "API configuration.\n";
             return 1;
         }
 
-        std::cout
-            << "\nRefactored code:\n\n"
-            << refactoredCode
-            << '\n';
+        output_ << "\nRefactoring diff:\n"
+                << makeUnifiedDiff(sourceCode, refactoredCode);
+
+        if (sourceCode == refactoredCode) {
+            output_ << "No changes to apply.\n";
+            return 0;
+        }
+
+        output_ << "\nApply these changes? [y/N]: ";
+        std::string approval;
+        if (!std::getline(input_, approval)) {
+            error_
+                << "Refactoring was not approved; source file was not modified.\n";
+            return 1;
+        }
+
+        if (!isApproval(approval)) {
+            if (isRejection(approval)) {
+                output_
+                    << "Refactoring rejected; source file was not modified.\n";
+                return 0;
+            }
+            error_
+                << "Invalid approval input; source file was not modified.\n";
+            return 1;
+        }
+
+        if (!fileManager.writeFile(filePath, refactoredCode)) {
+            error_
+                << "Refactoring was approved but could not be saved.\n";
+            return 1;
+        }
+
+        output_ << "Refactoring applied successfully.\n";
 
         return 0;
     }
@@ -187,6 +276,6 @@ int CLIController::run(int argc, char* argv[]) {
     // UNKNOWN COMMAND
     // ------------------------------------------------------------
 
-    displayUsageError("Unknown command: " + command);
+    displayUsageError(error_, "Unknown command: " + command);
     return 1;
 }

@@ -46,6 +46,7 @@ add_executable(codeagent
     src/ResponseParser.cpp
     src/LLMClient.cpp
     src/EnvLoader.cpp
+    src/UnifiedDiff.cpp
 )
 
 target_include_directories(codeagent
@@ -137,6 +138,50 @@ target_link_libraries(ResponseParserTest
 )
 
 # --------------------------------------------------
+# Unified diff tests
+# --------------------------------------------------
+add_executable(UnifiedDiffTest
+    tests/UnifiedDiffTest.cpp
+    src/UnifiedDiff.cpp
+)
+
+target_include_directories(UnifiedDiffTest
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(UnifiedDiffTest
+    PRIVATE
+        GTest::gtest_main
+)
+
+# --------------------------------------------------
+# CLI refactoring workflow tests
+# --------------------------------------------------
+add_executable(CLIControllerTest
+    tests/CLIControllerTest.cpp
+    src/CLIController.cpp
+    src/FileManager.cpp
+    src/PromptBuilder.cpp
+    src/LLMClient.cpp
+    src/ResponseParser.cpp
+    src/EnvLoader.cpp
+    src/UnifiedDiff.cpp
+)
+
+target_include_directories(CLIControllerTest
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(CLIControllerTest
+    PRIVATE
+        GTest::gtest_main
+        CURL::libcurl
+        nlohmann_json::nlohmann_json
+)
+
+# --------------------------------------------------
 # Test discovery
 # --------------------------------------------------
 include(GoogleTest)
@@ -145,6 +190,8 @@ gtest_discover_tests(FileManagerTest)
 gtest_discover_tests(PromptBuilderTest)
 gtest_discover_tests(LLMClientTest)
 gtest_discover_tests(ResponseParserTest)
+gtest_discover_tests(UnifiedDiffTest)
+gtest_discover_tests(CLIControllerTest)
 
 # --------------------------------------------------
 # Compiler warnings
@@ -155,6 +202,8 @@ if(MSVC)
     target_compile_options(PromptBuilderTest PRIVATE /W4)
     target_compile_options(LLMClientTest PRIVATE /W4)
     target_compile_options(ResponseParserTest PRIVATE /W4)
+    target_compile_options(UnifiedDiffTest PRIVATE /W4)
+    target_compile_options(CLIControllerTest PRIVATE /W4)
 else()
     target_compile_options(codeagent PRIVATE
         -Wall -Wextra -Wpedantic
@@ -173,6 +222,14 @@ else()
     )
 
     target_compile_options(ResponseParserTest PRIVATE
+        -Wall -Wextra -Wpedantic
+    )
+
+    target_compile_options(UnifiedDiffTest PRIVATE
+        -Wall -Wextra -Wpedantic
+    )
+
+    target_compile_options(CLIControllerTest PRIVATE
         -Wall -Wextra -Wpedantic
     )
 endif()

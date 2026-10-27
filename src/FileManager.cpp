@@ -15,10 +15,21 @@ constexpr const char* kPermissionFile = "permissions.txt";
 } // namespace
 
 FileManager::FileManager()
+    : FileManager(std::cin, std::cout, std::cerr) {
+}
+
+FileManager::FileManager(
+    std::istream& input,
+    std::ostream& output,
+    std::ostream& error
+)
     : permissionFilePath_(
           std::filesystem::path(kPermissionDirectory) /
           kPermissionFile
-      ) {
+      ),
+      input_(input),
+      output_(output),
+      error_(error) {
 }
 
 bool FileManager::readFile(
@@ -28,7 +39,7 @@ bool FileManager::readFile(
     content.clear();
 
     if (!isValidSourceFile(filePath)) {
-        std::cerr
+        error_
             << "Error: Invalid or unsupported source file: "
             << filePath << '\n';
 
@@ -36,7 +47,7 @@ bool FileManager::readFile(
     }
 
     if (!requestPermission(filePath, PermissionType::Read)) {
-        std::cerr
+        error_
             << "Error: Read access denied for: "
             << filePath << '\n';
 
@@ -46,7 +57,7 @@ bool FileManager::readFile(
     std::ifstream inputFile(filePath);
 
     if (!inputFile.is_open()) {
-        std::cerr
+        error_
             << "Error: Unable to open file for reading: "
             << filePath << '\n';
 
@@ -59,7 +70,7 @@ bool FileManager::readFile(
     );
 
     if (inputFile.bad()) {
-        std::cerr
+        error_
             << "Error: Failed while reading file: "
             << filePath << '\n';
 
@@ -75,7 +86,7 @@ bool FileManager::writeFile(
     const std::string& content
 ) const {
     if (filePath.empty()) {
-        std::cerr
+        error_
             << "Error: Output file path cannot be empty.\n";
 
         return false;
@@ -90,7 +101,7 @@ bool FileManager::writeFile(
     if (!parentDirectory.empty() &&
         !std::filesystem::exists(parentDirectory)) {
 
-        std::cerr
+        error_
             << "Error: Parent directory does not exist: "
             << parentDirectory << '\n';
 
@@ -100,7 +111,7 @@ bool FileManager::writeFile(
     if (!parentDirectory.empty() &&
         !std::filesystem::is_directory(parentDirectory)) {
 
-        std::cerr
+        error_
             << "Error: Parent path is not a directory: "
             << parentDirectory << '\n';
 
@@ -108,7 +119,7 @@ bool FileManager::writeFile(
     }
 
     if (!requestPermission(normalizedPath, PermissionType::Write)) {
-        std::cerr
+        error_
             << "Error: Write access denied for: "
             << normalizedPath << '\n';
 
@@ -120,7 +131,7 @@ bool FileManager::writeFile(
 
     if (fileAlreadyExists) {
         if (!std::filesystem::is_regular_file(normalizedPath)) {
-            std::cerr
+            error_
                 << "Error: Target path is not a regular file: "
                 << normalizedPath << '\n';
 
@@ -134,7 +145,7 @@ bool FileManager::writeFile(
          * explicit approval from the user.
          */
         if (!requestOverwritePermission(normalizedPath)) {
-            std::cerr
+            error_
                 << "File was not modified.\n";
 
             return false;
@@ -156,7 +167,7 @@ bool FileManager::writeFile(
     );
 
     if (!outputFile.is_open()) {
-        std::cerr
+        error_
             << "Error: Unable to create temporary output file: "
             << temporaryPath << '\n';
 
@@ -174,7 +185,7 @@ bool FileManager::writeFile(
             cleanupError
         );
 
-        std::cerr
+        error_
             << "Error: Failed while writing temporary file.\n";
 
         return false;
@@ -189,7 +200,7 @@ bool FileManager::writeFile(
             cleanupError
         );
 
-        std::cerr
+        error_
             << "Error: Failed while writing temporary file.\n";
 
         return false;
@@ -203,14 +214,14 @@ bool FileManager::writeFile(
         renameError
     )) {
 
-        std::cerr
+        error_
             << "Error: Unable to finalize file write: "
             << renameError.message() << '\n';
 
         return false;
     }
 
-    std::cout
+    output_
         << "File written successfully: "
         << normalizedPath << '\n';
 
@@ -251,7 +262,7 @@ bool FileManager::requestPermission(
             ? "read"
             : "write";
 
-    std::cout
+    output_
         << "\nCodeAgent wants permission to "
         << permissionName << ":\n\n"
         << "    " << normalizePath(filePath) << "\n\n"
@@ -262,7 +273,7 @@ bool FileManager::requestPermission(
 
     std::string choice;
 
-    if (!std::getline(std::cin, choice)) {
+    if (!std::getline(input_, choice)) {
         return false;
     }
 
@@ -334,7 +345,7 @@ bool FileManager::savePermanentPermission(
             permissionFilePath_.parent_path()
         );
     } catch (const std::filesystem::filesystem_error& error) {
-        std::cerr
+        error_
             << "Error: Unable to create permission directory: "
             << error.what() << '\n';
 
@@ -351,7 +362,7 @@ bool FileManager::savePermanentPermission(
     );
 
     if (!permissionFile.is_open()) {
-        std::cerr
+        error_
             << "Error: Unable to save file permission.\n";
 
         return false;
@@ -369,7 +380,7 @@ bool FileManager::savePermanentPermission(
         << '\n';
 
     if (!permissionFile.good()) {
-        std::cerr
+        error_
             << "Error: Failed to save file permission.\n";
 
         return false;
@@ -381,7 +392,7 @@ bool FileManager::savePermanentPermission(
 bool FileManager::requestOverwritePermission(
     const std::filesystem::path& filePath
 ) const {
-    std::cout
+    output_
         << "\nWARNING: CodeAgent is requesting permission "
         << "to overwrite an existing file:\n\n"
         << "    " << normalizePath(filePath) << "\n\n"
@@ -390,7 +401,7 @@ bool FileManager::requestOverwritePermission(
 
     std::string choice;
 
-    if (!std::getline(std::cin, choice)) {
+    if (!std::getline(input_, choice)) {
         return false;
     }
 

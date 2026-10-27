@@ -183,6 +183,21 @@ bool LLMClient::generateContent(
     const std::string& prompt,
     std::string& response
 ) const {
+    return generateContentImpl(prompt, response, false);
+}
+
+bool LLMClient::generateCompleteContent(
+    const std::string& prompt,
+    std::string& response
+) const {
+    return generateContentImpl(prompt, response, true);
+}
+
+bool LLMClient::generateContentImpl(
+    const std::string& prompt,
+    std::string& response,
+    bool requireExplicitCompletion
+) const {
     response.clear();
 
     if (!isValidPrompt(prompt) || !transport_ || model_.empty()) {
@@ -258,10 +273,13 @@ bool LLMClient::generateContent(
         return false;
     }
 
-    if (!parsedResponse.succeeded()) {
+    if (!parsedResponse.succeeded() ||
+        (requireExplicitCompletion && !parsedResponse.isComplete())) {
         std::cerr
             << "Error: "
-            << parsedResponse.errorMessage
+            << (parsedResponse.errorMessage.empty()
+                    ? "Gemini did not confirm that the response is complete."
+                    : parsedResponse.errorMessage)
             << '\n';
         return false;
     }

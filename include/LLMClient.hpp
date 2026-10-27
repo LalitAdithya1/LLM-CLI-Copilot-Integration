@@ -32,8 +32,19 @@ public:
         std::string& response
     ) const;
 
+    // Refactoring requires an explicitly complete provider response.
+    bool generateCompleteContent(
+        const std::string& prompt,
+        std::string& response
+    ) const;
+
 private:
     bool isValidPrompt(const std::string& prompt) const;
+    bool generateContentImpl(
+        const std::string& prompt,
+        std::string& response,
+        bool requireExplicitCompletion
+    ) const;
 
     HttpTransport transport_;
     std::string model_;

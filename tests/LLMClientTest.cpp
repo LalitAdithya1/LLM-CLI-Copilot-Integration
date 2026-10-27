@@ -283,6 +283,83 @@ TEST_F(LLMClientTest, RejectsPartialOutputAndLeavesResponseEmpty) {
     EXPECT_TRUE(response.empty());
 }
 
+TEST_F(LLMClientTest, RefactoringRequiresExplicitCompleteFinishReason) {
+    LLMClient client(
+        [](
+            const std::string&,
+            const std::string&,
+            const std::string&,
+            std::string& responseBody,
+            long& httpStatus
+        ) {
+            responseBody = validGeminiResponse();
+            httpStatus = 200;
+            return true;
+        }
+    );
+
+    response = "old response";
+    EXPECT_FALSE(client.generateCompleteContent("Refactor code", response));
+    EXPECT_TRUE(response.empty());
+}
+
+TEST_F(LLMClientTest, AcceptsExplicitlyCompleteRefactoringResponse) {
+    LLMClient client(
+        [](
+            const std::string&,
+            const std::string&,
+            const std::string&,
+            std::string& responseBody,
+            long& httpStatus
+        ) {
+            responseBody = R"({"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"complete code"}]}}]})";
+            httpStatus = 200;
+            return true;
+        }
+    );
+
+    ASSERT_TRUE(client.generateCompleteContent("Refactor code", response));
+    EXPECT_EQ(response, "complete code");
+}
+
+TEST_F(LLMClientTest, RefactoringRejectsBlockedResponse) {
+    LLMClient client(
+        [](
+            const std::string&,
+            const std::string&,
+            const std::string&,
+            std::string& responseBody,
+            long& httpStatus
+        ) {
+            responseBody = R"({"candidates":[{"finishReason":"SAFETY","content":{"parts":[{"text":"blocked code"}]}}]})";
+            httpStatus = 200;
+            return true;
+        }
+    );
+
+    EXPECT_FALSE(client.generateCompleteContent("Refactor code", response));
+    EXPECT_TRUE(response.empty());
+}
+
+TEST_F(LLMClientTest, RefactoringRejectsIncompleteResponse) {
+    LLMClient client(
+        [](
+            const std::string&,
+            const std::string&,
+            const std::string&,
+            std::string& responseBody,
+            long& httpStatus
+        ) {
+            responseBody = R"({"candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[{"text":"partial code"}]}}]})";
+            httpStatus = 200;
+            return true;
+        }
+    );
+
+    EXPECT_FALSE(client.generateCompleteContent("Refactor code", response));
+    EXPECT_TRUE(response.empty());
+}
+
 TEST_F(LLMClientTest, SupportsCustomModel) {
     LLMClient client(
         [](

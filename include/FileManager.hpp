@@ -2,11 +2,17 @@
 #define FILE_MANAGER_HPP
 
 #include <filesystem>
+#include <iosfwd>
 #include <string>
 
 class FileManager {
 public:
     FileManager();
+    FileManager(
+        std::istream& input,
+        std::ostream& output,
+        std::ostream& error
+    );
 
     bool readFile(
         const std::filesystem::path& filePath,
@@ -56,6 +62,9 @@ private:
     ) const;
 
     std::filesystem::path permissionFilePath_;
+    std::istream& input_;
+    std::ostream& output_;
+    std::ostream& error_;
 };
 
 #endif
