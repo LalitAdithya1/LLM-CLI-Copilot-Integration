@@ -2,13 +2,16 @@ import {
   ApiError,
   approveProposal,
   generateCode,
+  getProposalDiff,
   getConfig,
   getHealth,
   openSourceFileDialog,
   refactorCode,
   rejectProposal,
+  saveProposal,
   selectOutputDirectory,
 } from './api.js';
+import { createProposalWorkflow } from './proposalWorkflow.js';
 
 const SAMPLE_ORIGINAL_CODE = `#include <iostream>
 
@@ -50,9 +53,12 @@ const REQUIRED_ELEMENTS = [
   '#proposal-review-availability',
   '#proposal-original-code',
   '#proposal-proposed-code',
+  '#proposal-diff-content',
+  '#review-changes-button',
   '#accept-proposal-button',
   '#reject-proposal-button',
   '#save-file-button',
+  '#save-file-name',
   '#preview-heading',
   '#code-language',
   '#select-source-file-button',
@@ -104,9 +110,12 @@ function initializeApp() {
   const proposalReviewAvailability = document.querySelector('#proposal-review-availability');
   const proposalOriginalCode = document.querySelector('#proposal-original-code');
   const proposalProposedCode = document.querySelector('#proposal-proposed-code');
+  const proposalDiffContent = document.querySelector('#proposal-diff-content');
+  const reviewChangesButton = document.querySelector('#review-changes-button');
   const acceptProposalButton = document.querySelector('#accept-proposal-button');
   const rejectProposalButton = document.querySelector('#reject-proposal-button');
   const saveFileButton = document.querySelector('#save-file-button');
+  const saveFileName = document.querySelector('#save-file-name');
   const submitButtons = [
     document.querySelector('#generate-submit-button'),
     document.querySelector('#generate-code-button'),
@@ -117,15 +126,99 @@ function initializeApp() {
   let backendRefreshPromise = null;
   let editorRevisionSequence = 0;
   let selectedMode = 'generate';
-  let activeProposal = null;
   const originalCode = SAMPLE_ORIGINAL_CODE;
   let draftCode = originalCode;
 
+  const proposalWorkflow = createProposalWorkflow({
+    getProposalDiff,
+    approveProposal,
+    rejectProposal,
+    saveProposal,
+  }, renderProposalState);
+
   function renderDecisionControls() {
-    const canDecide = activeProposal?.status === 'PENDING' && !workflowInProgress;
+    const state = proposalWorkflow.getState();
+    const hasPendingProposal = state.proposal?.status === 'PENDING';
+    const operationInProgress = Boolean(state.operation);
+    const actionLocked = workflowInProgress || operationInProgress;
+    promptInput.disabled = actionLocked;
+    languageInput.disabled = actionLocked;
+    codeEditor.disabled = actionLocked;
+    modeButtons.forEach((button) => {
+      button.disabled = actionLocked || button.dataset.mode === 'files';
+    });
+    submitButtons.forEach((button) => {
+      button.disabled = actionLocked;
+    });
+    const canDecide = hasPendingProposal && state.proposal.reviewed
+      && state.proposal.sourceMatches && !state.decisionBlocked
+      && !workflowInProgress && !operationInProgress;
+    reviewChangesButton.disabled = !hasPendingProposal || workflowInProgress || operationInProgress;
+    reviewChangesButton.textContent = state.operation === 'review'
+      ? 'Loading diff…'
+      : state.proposal?.reviewed ? 'Refresh diff' : 'Review changes';
     acceptProposalButton.disabled = !canDecide;
     rejectProposalButton.disabled = !canDecide;
-    saveFileButton.disabled = true;
+    saveFileButton.disabled = state.proposal?.status !== 'APPROVED'
+      || !state.proposal?.sourceMatches
+      || workflowInProgress || operationInProgress;
+    saveFileName.disabled = state.proposal?.status !== 'APPROVED'
+      || !state.proposal?.sourceMatches
+      || workflowInProgress || operationInProgress;
+    saveFileButton.textContent = state.operation === 'save' ? 'Saving…' : 'Save file';
+  }
+
+  function renderProposalState(state = proposalWorkflow.getState()) {
+    const proposal = state.proposal;
+    if (!proposal) {
+      proposalReviewStatus.textContent = 'No proposal available';
+      proposalReviewAvailability.textContent = 'Generated code is not a proposal and cannot be approved or saved.';
+      proposalDiffContent.textContent = 'No diff loaded.';
+      renderDecisionControls();
+      return;
+    }
+
+    proposalOriginalCode.textContent = proposal.originalCode;
+    proposalProposedCode.textContent = proposal.proposedCode;
+    proposalDiffContent.textContent = state.diff === null
+      ? state.operation === 'review' ? 'Loading diff…' : 'Select Review changes to load the backend diff.'
+      : state.diff.length > 0 ? state.diff : 'No differences were reported.';
+
+    const statusLabels = {
+      PENDING: 'Proposal pending review',
+      APPROVED: 'Approved · not saved',
+      REJECTED: 'Rejected',
+      APPLIED: 'Saved and applied',
+    };
+    proposalReviewStatus.textContent = state.operation === 'review'
+      ? 'Loading proposal diff…'
+      : state.operation === 'approve'
+        ? 'Waiting for approval confirmation…'
+        : state.operation === 'reject'
+          ? 'Waiting for rejection confirmation…'
+          : state.operation === 'save'
+            ? 'Saving approved proposal…'
+            : statusLabels[proposal.status] || 'Proposal status unavailable';
+    if (state.savedPath) {
+      proposalReviewAvailability.textContent = `The backend confirmed the saved file: ${state.savedPath}`;
+    } else if (state.error) {
+      proposalReviewAvailability.textContent = state.error;
+    } else if (!proposal.sourceMatches) {
+      proposalReviewAvailability.textContent = 'The editor content has changed since this proposal was created. Restore the original source shown above before approving or saving it.';
+    } else if (proposal.status === 'PENDING') {
+      proposalReviewAvailability.textContent = state.decisionBlocked
+        ? 'The last decision was not confirmed. No proposal-status lookup is available, so further decisions are disabled.'
+        : proposal.reviewed
+          ? 'Review the diff, then approve or reject this pending proposal.'
+          : 'Load the backend diff before approving or rejecting this proposal.';
+    } else if (proposal.status === 'APPROVED') {
+      proposalReviewAvailability.textContent = 'The backend confirmed approval. Choose a filename and save this proposal.';
+    } else if (proposal.status === 'REJECTED') {
+      proposalReviewAvailability.textContent = 'The backend confirmed rejection. This proposal cannot be saved.';
+    } else {
+      proposalReviewAvailability.textContent = 'The backend confirmed the save. This proposal cannot be saved again.';
+    }
+    renderDecisionControls();
   }
 
   function setWorkflowInProgress(isInProgress, actionLabel = '') {
@@ -170,11 +263,13 @@ function initializeApp() {
   }
 
   codeEditor.value = originalCode;
+  proposalWorkflow.setCurrentSourceCode(originalCode);
   renderEditorState();
 
   codeEditor.addEventListener('input', () => {
     draftCode = codeEditor.value;
     renderEditorState();
+    proposalWorkflow.setCurrentSourceCode(draftCode);
   });
 
   codeEditor.addEventListener('scroll', () => {
@@ -358,70 +453,69 @@ function initializeApp() {
     return `Generation failed${code}: ${message}`;
   }
 
-  function clearProposalForNewRequest() {
-    activeProposal = null;
-    renderDecisionControls();
-  }
-
-  function decisionFailureMessage(error, action) {
-    const actionName = action === 'approve' ? 'Approval' : 'Rejection';
-    if (error instanceof ApiError && error.status === 409) {
-      return `${actionName} conflicted with the backend state (HTTP 409). The current decision is unknown.`;
-    }
-    if (error instanceof ApiError && error.status === 404) {
-      return 'The backend no longer has this proposal (HTTP 404). Its decision state is unknown.';
-    }
-    if (error instanceof ApiError && error.status !== null) {
-      return `${actionName} was not confirmed (HTTP ${error.status}). The proposal is no longer actionable here.`;
-    }
-    if (error instanceof ApiError) {
-      return `${actionName} was not confirmed. ${error.message} The backend may have processed it; the proposal is disabled because its current state cannot be queried.`;
-    }
-    return `${actionName} was not confirmed. The backend may have processed it; the proposal is disabled because its current state cannot be queried.`;
-  }
-
   async function submitProposalDecision(action) {
-    if (workflowInProgress || activeProposal?.status !== 'PENDING') {
+    const proposal = proposalWorkflow.getState().proposal;
+    if (workflowInProgress || proposal?.status !== 'PENDING') {
       return;
     }
-
-    const proposal = activeProposal;
-    setWorkflowInProgress(true, action === 'approve' ? 'Approving…' : 'Rejecting…');
     renderStatus(action === 'approve' ? 'Waiting for approval confirmation…' : 'Waiting for rejection confirmation…');
+    const confirmed = await proposalWorkflow.decide(action);
+    const current = proposalWorkflow.getState();
+    renderStatus(confirmed
+      ? action === 'approve'
+        ? 'Proposal approved by the backend. No file has been saved yet.'
+        : 'Proposal rejected by the backend. It cannot be saved.'
+      : `${action === 'approve' ? 'Approval' : 'Rejection'} was not confirmed. ${current.error}`);
+  }
 
-    try {
-      const confirmed = action === 'approve'
-        ? await approveProposal(proposal.id)
-        : await rejectProposal(proposal.id);
+  async function reviewProposalChanges() {
+    if (workflowInProgress || proposalWorkflow.getState().operation) return;
+    renderStatus('Requesting the proposal diff from the backend…');
+    const confirmed = await proposalWorkflow.review();
+    const state = proposalWorkflow.getState();
+    renderStatus(confirmed
+      ? 'The backend diff is ready. Review it before approving or rejecting.'
+      : `Diff review failed. ${state.error}`);
+  }
 
-      if (activeProposal?.id !== proposal.id) {
-        return;
-      }
-      activeProposal = { ...proposal, status: confirmed.status };
-      proposalReviewStatus.textContent = confirmed.status === 'APPROVED'
-        ? 'Approved'
-        : 'Rejected';
-      proposalReviewAvailability.textContent = confirmed.status === 'APPROVED'
-        ? 'The backend confirmed approval. This proposal has not been saved or applied.'
-        : 'The backend confirmed rejection. This proposal cannot be approved or saved.';
-      renderStatus(confirmed.status === 'APPROVED'
-        ? 'Proposal approved. No file was saved or changed.'
-        : 'Proposal rejected. No file was saved or changed.');
-    } catch (error) {
-      if (activeProposal?.id === proposal.id) {
-        activeProposal = { ...proposal, status: 'UNKNOWN' };
-      }
-      const message = decisionFailureMessage(error, action);
-      proposalReviewStatus.textContent = 'Decision unconfirmed';
-      proposalReviewAvailability.textContent = `${message} No proposal-status lookup is available, so further decisions are disabled.`;
-      renderStatus(message);
-    } finally {
-      setWorkflowInProgress(false);
+  async function saveApprovedProposal() {
+    const state = proposalWorkflow.getState();
+    if (workflowInProgress || state.proposal?.status !== 'APPROVED' || state.operation) return;
+    if (!state.proposal.sourceMatches) {
+      renderStatus('The editor has changed since this proposal was created. Restore the original source before saving.');
+      return;
     }
+    const fileName = saveFileName.value.trim();
+    if (!fileName) {
+      saveFileName.setAttribute('aria-invalid', 'true');
+      renderStatus('Enter a filename for the approved proposal.');
+      saveFileName.focus();
+      return;
+    }
+    saveFileName.removeAttribute('aria-invalid');
+    renderStatus('Saving the approved proposal through the backend…');
+    const saved = await proposalWorkflow.save(
+      fileName,
+      async (name) => window.confirm(
+        `The target file may already exist. Replace ${name}? The backend will validate the target again before writing.`,
+      ),
+    );
+    const result = proposalWorkflow.getState();
+    renderStatus(saved
+      ? `The backend confirmed the save: ${result.savedPath}`
+      : result.error || 'The save was not confirmed. The approved proposal remains available to retry.');
   }
 
   async function submitWorkflow() {
-    if (workflowInProgress) {
+    if (workflowInProgress || proposalWorkflow.getState().operation) {
+      return;
+    }
+
+    const currentProposal = proposalWorkflow.getState().proposal;
+    if (currentProposal && ['PENDING', 'APPROVED'].includes(currentProposal.status)) {
+      renderStatus(currentProposal.status === 'PENDING'
+        ? 'Review and approve or reject the current proposal before starting another request.'
+        : 'Save the approved proposal before starting another request.');
       return;
     }
 
@@ -451,7 +545,7 @@ function initializeApp() {
     }
 
     const requestMode = selectedMode;
-    clearProposalForNewRequest();
+    proposalWorkflow.reset();
     setWorkflowInProgress(true, requestMode === 'refactor' ? 'Creating…' : 'Generating…');
     proposalOriginalCode.textContent = originalSource;
     proposalProposedCode.textContent = requestMode === 'refactor'
@@ -475,25 +569,17 @@ function initializeApp() {
           language,
           editorRevision: `frontend-revision-${++editorRevisionSequence}`,
         });
-        activeProposal = {
-          id: proposal.proposalId,
-          status: 'PENDING',
-        };
-        proposalOriginalCode.textContent = proposal.originalCode;
-        proposalProposedCode.textContent = proposal.proposedCode;
-        proposalReviewStatus.textContent = 'Proposed · PENDING';
-        proposalReviewAvailability.textContent = 'This proposal is pending backend review. Approval does not save or apply it.';
+        proposalWorkflow.setProposal(proposal);
         renderStatus('Refactoring proposal is ready for review. It has not been approved or saved.');
       } else {
         const response = await generateCode({ instruction, language });
         proposalOriginalCode.textContent = originalSource;
         proposalProposedCode.textContent = response.generatedCode;
         proposalReviewStatus.textContent = 'Generated output · not a proposal';
-        proposalReviewAvailability.textContent = 'Generated output has no proposal ID and cannot be approved or rejected.';
+        proposalReviewAvailability.textContent = 'Generated output has no proposal ID and cannot be approved or saved through the approved-proposal workflow.';
         renderStatus('Generated code is displayed. It is not a proposal and has not been saved.');
       }
     } catch (error) {
-      activeProposal = null;
       const message = requestMode === 'refactor'
         ? error instanceof ApiError
           ? `Proposal was not confirmed (${error.code}): ${error.message}`
@@ -505,6 +591,7 @@ function initializeApp() {
       proposalReviewStatus.textContent = requestMode === 'refactor'
         ? 'Proposal unconfirmed'
         : 'Generation failed';
+      proposalDiffContent.textContent = 'No diff loaded.';
       proposalReviewAvailability.textContent = requestMode === 'refactor'
         ? 'No confirmed proposal ID is available, so review decisions are disabled.'
         : 'Generation did not produce reviewable proposal state.';
@@ -517,7 +604,7 @@ function initializeApp() {
   }
 
   function selectMode(selectedButton) {
-    if (workflowInProgress) {
+    if (workflowInProgress || proposalWorkflow.getState().operation) {
       return;
     }
     selectedMode = selectedButton.dataset.mode;
@@ -545,6 +632,12 @@ function initializeApp() {
   rejectProposalButton.addEventListener('click', () => {
     void submitProposalDecision('reject');
   });
+  reviewChangesButton.addEventListener('click', () => {
+    void reviewProposalChanges();
+  });
+  saveFileButton.addEventListener('click', () => {
+    void saveApprovedProposal();
+  });
 
   selectSourceFileButton.addEventListener('click', () => {
     void handleSourceFileSelection();
@@ -553,7 +646,7 @@ function initializeApp() {
     void handleOutputDirectorySelection();
   });
 
-  renderDecisionControls();
+  renderProposalState();
 
   backendRetryButton.addEventListener('click', () => {
     void refreshBackendInformation();

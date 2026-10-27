@@ -106,6 +106,26 @@ function validateProposalDecision(payload, expectedProposalId, expectedStatus) {
   return payload;
 }
 
+function validateDiff(payload) {
+  expectFields(payload, ['diff'], 'diff');
+  if (typeof payload.diff !== 'string') {
+    throw new ApiError('INVALID_RESPONSE', 'The backend returned an invalid diff response.');
+  }
+  return payload;
+}
+
+function validateSave(payload) {
+  expectFields(payload, ['savedPath', 'status'], 'save');
+  const isAbsolutePath = typeof payload.savedPath === 'string'
+    && (payload.savedPath.startsWith('/')
+      || payload.savedPath.startsWith('\\\\')
+      || /^[A-Za-z]:[\\/]/.test(payload.savedPath));
+  if (payload.status !== 'SAVED' || !isAbsolutePath || payload.savedPath.trim().length === 0) {
+    throw new ApiError('INVALID_RESPONSE', 'The backend returned an invalid save response.');
+  }
+  return payload;
+}
+
 function validatePathSelection(payload, responsePathField, endpointName) {
   if (!isObject(payload) || typeof payload.status !== 'string') {
     throw new ApiError(
@@ -278,6 +298,33 @@ export function createApiClient({
       return sendProposalDecision(proposalId, 'reject', 'REJECTED');
     },
 
+    async getProposalDiff(proposalId) {
+      if (typeof proposalId !== 'string' || proposalId.trim().length === 0) {
+        throw new ApiError('INVALID_REQUEST', 'A valid proposal ID is required.');
+      }
+      return validateDiff(await requestJson('/api/diff', {
+        method: 'POST',
+        body: { proposalId },
+      }));
+    },
+
+    async saveProposal(request = {}) {
+      if (!isObject(request)
+        || typeof request.proposalId !== 'string'
+        || request.proposalId.trim().length === 0
+        || typeof request.fileName !== 'string'
+        || request.fileName.trim().length === 0
+        || (request.overwriteConfirmed !== undefined
+          && typeof request.overwriteConfirmed !== 'boolean')) {
+        throw new ApiError('INVALID_REQUEST', 'A proposal ID and source filename are required to save.');
+      }
+      const body = { proposalId: request.proposalId, fileName: request.fileName };
+      if (request.overwriteConfirmed !== undefined) {
+        body.overwriteConfirmed = request.overwriteConfirmed;
+      }
+      return validateSave(await requestJson('/api/save', { method: 'POST', body }));
+    },
+
     async openSourceFileDialog() {
       const payload = await requestJson('/api/files/open-dialog', {
         method: 'POST',
@@ -315,6 +362,8 @@ export const generateCode = (request) => defaultClient.generateCode(request);
 export const refactorCode = (request) => defaultClient.refactorCode(request);
 export const approveProposal = (proposalId) => defaultClient.approveProposal(proposalId);
 export const rejectProposal = (proposalId) => defaultClient.rejectProposal(proposalId);
+export const getProposalDiff = (proposalId) => defaultClient.getProposalDiff(proposalId);
+export const saveProposal = (request) => defaultClient.saveProposal(request);
 export const openSourceFileDialog = () => defaultClient.openSourceFileDialog();
 export const selectOutputDirectory = (directoryPath) =>
   defaultClient.selectOutputDirectory(directoryPath);

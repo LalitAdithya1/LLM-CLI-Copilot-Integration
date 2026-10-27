@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="CodeAgent — C++ Coding Copilot. Conceptual interface preview.">
+    <meta name="description" content="CodeAgent — a local C++ coding assistant interface.">
     <title>CodeAgent — C++ Coding Copilot</title>
     <link rel="stylesheet" href="css/main.css">
     <link rel="stylesheet" href="css/layout.css">
@@ -61,7 +61,7 @@
         </nav>
 
         <p class="availability-note" id="backend-unavailable">
-          Source selection returns a path only; file contents are not loaded. Saving is unavailable.
+          Source selection returns a path only. Paste source into the editor to refactor it; approved proposals can be saved through the backend.
         </p>
 
         <section class="backend-config" aria-labelledby="backend-config-heading">
@@ -106,7 +106,7 @@
               </article>
               <article class="message-card message-card--copilot" id="copilot-response" aria-live="polite">
                 <p class="message-label">COPILOT</p>
-                <p class="message-placeholder">Generated code will appear in proposal review.</p>
+                <p class="message-placeholder">Backend results and proposal review appear in the workspace below.</p>
               </article>
             </div>
 
@@ -122,7 +122,7 @@
               <label class="visually-hidden" for="language-input">Programming language</label>
               <input id="language-input" name="language" type="text" placeholder="Programming language (for example, C++)" aria-describedby="prompt-help prompt-feedback">
               <textarea id="prompt-input" name="prompt" rows="3" placeholder="Describe the code to generate." aria-describedby="prompt-help prompt-feedback"></textarea>
-              <p class="visually-hidden" id="prompt-help">Enter a programming language and an instruction. Generated code is shown as a proposal and is not saved or applied.</p>
+              <p class="visually-hidden" id="prompt-help">Enter a programming language and an instruction. Refactoring creates a proposal for diff review and approval. Only an approved proposal can be saved.</p>
               <p class="prompt-feedback" id="prompt-feedback" role="alert" aria-live="assertive" hidden></p>
               <button class="action-button action-button--primary" id="generate-submit-button" type="submit">Generate code</button>
             </form>
@@ -157,7 +157,7 @@
                 aria-describedby="editor-description"
               ></textarea>
             </div>
-            <p class="visually-hidden" id="editor-description">Sample source only; it was not loaded from a file. Edits stay in this page and are not saved or sent to a backend.</p>
+            <p class="visually-hidden" id="editor-description">Sample source only; selecting a file does not load its contents. Refactoring sends editor text to the backend. Saving requires an approved proposal.</p>
 
             <footer class="preview-footer">
               <span id="code-language">Sample workspace · not loaded from a file</span>
@@ -173,7 +173,7 @@
               <p class="proposal-review__status" id="proposal-review-status" role="status">No proposal available</p>
             </div>
             <p class="proposal-review__availability" id="proposal-review-availability">
-              Backend proposal review is not connected.
+              Review and save actions are available when the backend confirms a proposal.
             </p>
           </header>
 
@@ -188,7 +188,13 @@
             </section>
           </div>
 
+          <section class="proposal-diff" aria-labelledby="proposal-diff-heading">
+            <h3 id="proposal-diff-heading">Unified diff</h3>
+            <pre class="proposal-diff__content" id="proposal-diff-content" role="region" aria-live="polite" aria-label="Proposal diff">No diff loaded.</pre>
+          </section>
+
           <div class="proposal-review__actions">
+            <button class="action-button" id="review-changes-button" type="button" aria-describedby="proposal-review-availability" disabled>Review changes</button>
             <button class="action-button" id="reject-proposal-button" type="button" aria-describedby="proposal-review-availability" disabled>Reject</button>
             <button class="action-button action-button--primary" id="accept-proposal-button" type="button" aria-describedby="proposal-review-availability" disabled>Accept</button>
           </div>
@@ -196,15 +202,17 @@
 
         <section class="bottom-actions" id="bottom-actions" aria-label="Code actions">
           <button class="action-button action-button--primary" id="generate-code-button" type="submit" form="prompt-form">Generate code</button>
-          <button class="action-button" id="review-changes-button" type="button" disabled>Review changes</button>
+          <label class="save-file-name" for="save-file-name">Save filename
+            <input id="save-file-name" name="save-file-name" type="text" value="main.cpp" autocomplete="off" disabled>
+          </label>
           <button class="action-button" id="save-file-button" type="button" disabled>Save file</button>
         </section>
       </main>
 
       <footer class="app-footer">
-        <p id="concept-note">Conceptual layout preview, not the finished application. Monaco Editor will provide the actual editing experience.</p>
+        <p id="concept-note">The editor is a plain text workspace. Selected file contents are not loaded automatically.</p>
         <div id="notification-area" role="status" aria-live="polite" aria-label="Status and notifications">
-          File and proposal review actions are not connected yet.
+          Ready to connect to the local backend.
         </div>
       </footer>
     </div>

@@ -6,9 +6,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -127,6 +130,148 @@ TEST(GuiHttpServerTest, HealthEndpointReturnsJsonSuccess) {
     server.stop();
 }
 
+TEST(GuiHttpServerTest, AllowsConfiguredOriginAndReturnsCorsHeader) {
+    GuiHttpServer server(0);
+    ASSERT_TRUE(server.start());
+    httplib::Client client("127.0.0.1", server.port());
+    httplib::Headers headers{{"Origin", "http://127.0.0.1:5500"}};
+    const auto response = client.Get("/api/health", headers);
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 200);
+    EXPECT_EQ(response->get_header_value("Access-Control-Allow-Origin"),
+              "http://127.0.0.1:5500");
+    EXPECT_EQ(response->get_header_value("Vary"), "Origin");
+    server.stop();
+}
+
+TEST(GuiHttpServerTest, HandlesAllowedJsonPostPreflight) {
+    GuiHttpServer server(0);
+    ASSERT_TRUE(server.start());
+    httplib::Client client("127.0.0.1", server.port());
+    httplib::Headers headers{
+        {"Origin", "http://127.0.0.1:5500"},
+        {"Access-Control-Request-Method", "POST"},
+        {"Access-Control-Request-Headers", "content-type"}
+    };
+    const auto response = client.Options("/api/save", headers);
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 204);
+    EXPECT_EQ(response->get_header_value("Access-Control-Allow-Origin"),
+              "http://127.0.0.1:5500");
+    EXPECT_EQ(response->get_header_value("Access-Control-Allow-Methods"),
+              "GET, POST, OPTIONS");
+    EXPECT_EQ(response->get_header_value("Access-Control-Allow-Headers"), "Content-Type");
+    server.stop();
+}
+
+TEST(GuiHttpServerTest, RejectsForeignOriginAndUnexpectedHost) {
+    GuiHttpServer server(0);
+    ASSERT_TRUE(server.start());
+    httplib::Client client("127.0.0.1", server.port());
+    httplib::Headers foreign{{"Origin", "http://evil.example"}};
+    const auto originResponse = client.Get("/api/health", foreign);
+    ASSERT_TRUE(originResponse);
+    EXPECT_EQ(originResponse->status, 403);
+    EXPECT_TRUE(originResponse->get_header_value("Access-Control-Allow-Origin").empty());
+    EXPECT_EQ(nlohmann::json::parse(originResponse->body).at("error").at("code"),
+              "ORIGIN_NOT_ALLOWED");
+
+    httplib::Headers foreignPreflight{
+        {"Origin", "http://evil.example"},
+        {"Access-Control-Request-Method", "POST"},
+        {"Access-Control-Request-Headers", "content-type"}
+    };
+    const auto preflightResponse = client.Options("/api/save", foreignPreflight);
+    ASSERT_TRUE(preflightResponse);
+    EXPECT_EQ(preflightResponse->status, 403);
+    EXPECT_TRUE(preflightResponse->get_header_value("Access-Control-Allow-Origin").empty());
+
+    httplib::Headers unexpectedHost{{"Host", "127.0.0.1:1"}};
+    const auto hostResponse = client.Get("/api/health", unexpectedHost);
+    ASSERT_TRUE(hostResponse);
+    EXPECT_EQ(hostResponse->status, 400);
+    EXPECT_EQ(nlohmann::json::parse(hostResponse->body).at("error").at("code"),
+              "INVALID_HOST");
+
+    httplib::Headers localHost{{"Host", "localhost:" + std::to_string(server.port())}};
+    const auto localHostResponse = client.Get("/api/health", localHost);
+    ASSERT_TRUE(localHostResponse);
+    EXPECT_EQ(localHostResponse->status, 200);
+    server.stop();
+}
+
+TEST(GuiHttpServerTest, RejectsNullAndMalformedOrigins) {
+    GuiHttpServer server(0);
+    ASSERT_TRUE(server.start());
+    httplib::Client client("127.0.0.1", server.port());
+    for (const auto& origin : {std::string("null"), std::string("http://127.0.0.1:5500/path")}) {
+        httplib::Headers headers{{"Origin", origin}};
+        const auto response = client.Get("/api/health", headers);
+        ASSERT_TRUE(response);
+        EXPECT_EQ(response->status, 403);
+        EXPECT_TRUE(response->get_header_value("Access-Control-Allow-Origin").empty());
+    }
+    server.stop();
+}
+
+TEST(GuiHttpServerTest, RejectsMissingAndDuplicateHostHeaders) {
+    GuiHttpServer server(0);
+    ASSERT_TRUE(server.start());
+    httplib::Client client("127.0.0.1", server.port());
+
+    // An empty explicit Host value is sent as the sole Host header by cpp-httplib.
+    const auto missing = client.Get("/api/health", httplib::Headers{{"Host", ""}});
+    const httplib::Headers duplicate{
+        {"Host", "127.0.0.1:" + std::to_string(server.port())},
+        {"Host", "localhost:" + std::to_string(server.port())}
+    };
+    const auto duplicated = client.Get("/api/health", duplicate);
+
+    ASSERT_TRUE(missing);
+    ASSERT_TRUE(duplicated);
+    EXPECT_EQ(missing->status, 400);
+    EXPECT_EQ(duplicated->status, 400);
+    EXPECT_EQ(nlohmann::json::parse(missing->body).at("error").at("code"), "INVALID_HOST");
+    EXPECT_EQ(nlohmann::json::parse(duplicated->body).at("error").at("code"), "INVALID_HOST");
+    server.stop();
+}
+
+TEST(GuiHttpServerTest, RejectsDuplicateOriginAndMalformedPreflights) {
+    GuiHttpServer server(0);
+    ASSERT_TRUE(server.start());
+    httplib::Client client("127.0.0.1", server.port());
+    const auto expectedOrigin = std::string("http://127.0.0.1:5500");
+    httplib::Headers duplicateOrigin{{"Origin", expectedOrigin}, {"Origin", expectedOrigin}};
+    const auto duplicate = client.Get("/api/health", duplicateOrigin);
+    ASSERT_TRUE(duplicate);
+    EXPECT_EQ(duplicate->status, 403);
+    EXPECT_TRUE(duplicate->get_header_value("Access-Control-Allow-Origin").empty());
+
+    const auto unsupportedMethod = client.Options("/api/refactor", httplib::Headers{
+        {"Origin", expectedOrigin}, {"Access-Control-Request-Method", "DELETE"}
+    });
+    const auto duplicateMethod = client.Options("/api/refactor", httplib::Headers{
+        {"Origin", expectedOrigin},
+        {"Access-Control-Request-Method", "POST"},
+        {"Access-Control-Request-Method", "GET"}
+    });
+    const auto malformedMethod = client.Options("/api/refactor", httplib::Headers{
+        {"Origin", expectedOrigin}, {"Access-Control-Request-Method", "POST, GET"}
+    });
+    const auto unsupportedHeaders = client.Options("/api/refactor", httplib::Headers{
+        {"Origin", expectedOrigin},
+        {"Access-Control-Request-Method", "POST"},
+        {"Access-Control-Request-Headers", "content-type, authorization"}
+    });
+    for (const auto* response : {&unsupportedMethod, &duplicateMethod, &malformedMethod, &unsupportedHeaders}) {
+        ASSERT_TRUE(*response);
+        EXPECT_EQ((*response)->status, 403);
+        EXPECT_TRUE((*response)->get_header_value("Access-Control-Allow-Origin").empty());
+        EXPECT_EQ(nlohmann::json::parse((*response)->body).at("error").at("code"), "INVALID_PREFLIGHT");
+    }
+    server.stop();
+}
+
 TEST(GuiHttpServerTest, ConfigReturnsSafeDirectoriesAndSupportedExtensions) {
     const std::filesystem::path launchDirectory =
         std::filesystem::current_path() / "gui-launch-directory";
@@ -166,6 +311,25 @@ TEST(GuiHttpServerTest, UnknownRouteStillReturnsNotFound) {
     ASSERT_TRUE(response);
     EXPECT_EQ(response->status, 404);
 
+    server.stop();
+}
+
+TEST(GuiHttpServerTest, UnknownApiRoutesAndUnsupportedMethodsReturnJsonErrors) {
+    GuiHttpServer server(0);
+    ASSERT_TRUE(server.start());
+    httplib::Client client("127.0.0.1", server.port());
+    const auto unknown = client.Get("/api/not-a-route");
+    const auto apiRoot = client.Get("/api");
+    const auto unsupported = client.Put("/api/health", httplib::Headers{});
+    ASSERT_TRUE(unknown);
+    ASSERT_TRUE(apiRoot);
+    ASSERT_TRUE(unsupported);
+    EXPECT_EQ(unknown->status, 404);
+    EXPECT_EQ(nlohmann::json::parse(unknown->body).at("error").at("code"), "NOT_FOUND");
+    EXPECT_EQ(apiRoot->status, 404);
+    EXPECT_EQ(nlohmann::json::parse(apiRoot->body).at("error").at("code"), "NOT_FOUND");
+    EXPECT_EQ(unsupported->status, 404);
+    EXPECT_EQ(nlohmann::json::parse(unsupported->body).at("error").at("code"), "NOT_FOUND");
     server.stop();
 }
 
@@ -422,6 +586,12 @@ protected:
                    const std::string& sourceCode,
                    std::string& refactoredCode) {
                 handlerCalls_.fetch_add(1);
+                if (instruction == "wait") {
+                    std::unique_lock<std::mutex> lock(providerWaitMutex_);
+                    providerEntered_ = true;
+                    providerWaitCondition_.notify_all();
+                    providerWaitCondition_.wait(lock, [this] { return releaseProvider_; });
+                }
                 if (instruction == "blocked" || instruction == "incomplete") {
                     return false;
                 }
@@ -465,6 +635,10 @@ protected:
 
     std::unique_ptr<GuiHttpServer> server_;
     std::atomic<int> handlerCalls_{0};
+    std::mutex providerWaitMutex_;
+    std::condition_variable providerWaitCondition_;
+    bool providerEntered_ = false;
+    bool releaseProvider_ = false;
 };
 
 TEST(GuiHttpServerTest, RefactoringWithoutHandlerReturnsServiceUnavailable) {
@@ -661,6 +835,18 @@ TEST_F(GuiHttpServerRefactoringTest, ProviderFailuresAndEmptyResultsReturnSafeEr
               "REFACTOR_FAILED");
 }
 
+TEST_F(GuiHttpServerRefactoringTest, PreflightDoesNotInvokeRefactorHandler) {
+    auto http = client();
+    const auto response = http.Options("/api/refactor", httplib::Headers{
+        {"Origin", "http://127.0.0.1:5500"},
+        {"Access-Control-Request-Method", "POST"},
+        {"Access-Control-Request-Headers", "content-type"}
+    });
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 204);
+    EXPECT_EQ(handlerCalls_.load(), 0);
+}
+
 class GuiHttpServerProposalReviewTest : public GuiHttpServerRefactoringTest {
 protected:
     std::string createProposal() {
@@ -676,6 +862,166 @@ protected:
         return nlohmann::json::parse(response->body).at("proposalId").get<std::string>();
     }
 };
+
+TEST_F(GuiHttpServerProposalReviewTest, BoundsProposalRetentionWhenNoSafeEvictionExists) {
+    for (std::size_t index = 0; index < 128; ++index) {
+        ASSERT_FALSE(createProposal().empty()) << "proposal index " << index;
+    }
+    auto http = client();
+    const auto full = http.Post("/api/refactor", requestBody(), "application/json");
+    ASSERT_TRUE(full);
+    EXPECT_EQ(full->status, 503);
+    EXPECT_EQ(nlohmann::json::parse(full->body).at("error").at("code"), "PROPOSAL_CAPACITY");
+    EXPECT_EQ(handlerCalls_.load(), 128);
+}
+
+TEST_F(GuiHttpServerProposalReviewTest, FailedRefactorPreservesTerminalProposalAtCapacity) {
+    auto http = client();
+    std::string rejectedId;
+    for (std::size_t index = 0; index < 128; ++index) {
+        const auto id = createProposal();
+        ASSERT_FALSE(id.empty());
+        if (index == 0) rejectedId = id;
+    }
+    const auto rejected = http.Post("/api/changes/" + rejectedId + "/reject");
+    ASSERT_TRUE(rejected);
+    ASSERT_EQ(rejected->status, 200);
+
+    const auto failed = http.Post("/api/refactor", requestBody("int x;", "throw"), "application/json");
+    ASSERT_TRUE(failed);
+    EXPECT_EQ(failed->status, 502);
+    const auto stillAvailable = http.Post("/api/diff", nlohmann::json{{"proposalId", rejectedId}}.dump(), "application/json");
+    ASSERT_TRUE(stillAvailable);
+    EXPECT_EQ(stillAvailable->status, 200);
+    EXPECT_EQ(createProposal(), "prop-129");
+}
+
+TEST_F(GuiHttpServerProposalReviewTest, ConcurrentRefactorsCannotOverbookLastCapacitySlot) {
+    std::string terminalId;
+    for (std::size_t index = 0; index < 128; ++index) {
+        const auto id = createProposal();
+        ASSERT_FALSE(id.empty());
+        if (index == 0) terminalId = id;
+    }
+    auto http = client();
+    const auto rejected = http.Post("/api/changes/" + terminalId + "/reject");
+    ASSERT_TRUE(rejected);
+    ASSERT_EQ(rejected->status, 200);
+
+    std::optional<httplib::Result> firstResult;
+    std::thread firstRequest([&] {
+        auto http = client();
+        firstResult = http.Post("/api/refactor", requestBody("int x;", "wait"), "application/json");
+    });
+    bool providerEntered = false;
+    {
+        std::unique_lock<std::mutex> lock(providerWaitMutex_);
+        providerEntered = providerWaitCondition_.wait_for(lock, std::chrono::seconds(3), [this] {
+            return providerEntered_;
+        });
+    }
+    if (!providerEntered) {
+        {
+            std::lock_guard<std::mutex> lock(providerWaitMutex_);
+            releaseProvider_ = true;
+        }
+        providerWaitCondition_.notify_all();
+        firstRequest.join();
+        FAIL() << "refactor handler did not enter within the timeout";
+    }
+
+    const auto denied = http.Post("/api/refactor", requestBody(), "application/json");
+    ASSERT_TRUE(denied);
+    EXPECT_EQ(denied->status, 503);
+    EXPECT_EQ(handlerCalls_.load(), 129);
+
+    {
+        std::lock_guard<std::mutex> lock(providerWaitMutex_);
+        releaseProvider_ = true;
+    }
+    providerWaitCondition_.notify_all();
+    firstRequest.join();
+    ASSERT_TRUE(firstResult.has_value());
+    ASSERT_TRUE(*firstResult);
+    EXPECT_EQ((*firstResult)->status, 200);
+    EXPECT_EQ(nlohmann::json::parse((*firstResult)->body).at("proposalId"), "prop-129");
+    const auto evicted = http.Post("/api/diff", nlohmann::json{{"proposalId", terminalId}}.dump(), "application/json");
+    ASSERT_TRUE(evicted);
+    EXPECT_EQ(evicted->status, 404);
+}
+
+TEST_F(GuiHttpServerProposalReviewTest, EvictsOldestRejectedProposalAndKeepsPendingWork) {
+    auto http = client();
+    std::string rejectedId;
+    std::string lastPendingId;
+    for (std::size_t index = 0; index < 128; ++index) {
+        const std::string id = createProposal();
+        ASSERT_FALSE(id.empty()) << "proposal index " << index;
+        if (index == 0) rejectedId = id;
+        lastPendingId = id;
+    }
+    ASSERT_EQ(lastPendingId, "prop-128");
+    const auto full = http.Post("/api/refactor", requestBody(), "application/json");
+    ASSERT_TRUE(full);
+    ASSERT_EQ(full->status, 503);
+    const auto rejection = http.Post("/api/changes/" + rejectedId + "/reject");
+    ASSERT_TRUE(rejection);
+    ASSERT_EQ(rejection->status, 200);
+
+    const std::string nextId = createProposal();
+    EXPECT_EQ(nextId, "prop-129");
+    const auto evictedDiff = http.Post("/api/diff", nlohmann::json{{"proposalId", rejectedId}}.dump(), "application/json");
+    const auto pendingDiff = http.Post("/api/diff", nlohmann::json{{"proposalId", lastPendingId}}.dump(), "application/json");
+    ASSERT_TRUE(evictedDiff);
+    ASSERT_TRUE(pendingDiff);
+    EXPECT_EQ(evictedDiff->status, 404);
+    EXPECT_EQ(pendingDiff->status, 200);
+}
+
+TEST_F(GuiHttpServerProposalReviewTest, ApprovedProposalsAreNeverEvictedAtCapacity) {
+    auto http = client();
+    std::string firstId;
+    for (std::size_t index = 0; index < 128; ++index) {
+        const std::string id = createProposal();
+        ASSERT_FALSE(id.empty()) << "proposal index " << index;
+        if (index == 0) firstId = id;
+        const auto decision = http.Post("/api/changes/" + id + "/approve");
+        ASSERT_TRUE(decision);
+        ASSERT_EQ(decision->status, 200);
+    }
+    const auto full = http.Post("/api/refactor", requestBody(), "application/json");
+    const auto retained = http.Post("/api/diff", nlohmann::json{{"proposalId", firstId}}.dump(), "application/json");
+    ASSERT_TRUE(full);
+    ASSERT_TRUE(retained);
+    EXPECT_EQ(full->status, 503);
+    EXPECT_EQ(retained->status, 200);
+}
+
+TEST_F(GuiHttpServerProposalReviewTest, OriginChecksCoverEmptyBodyApprovalAndRejection) {
+    httplib::Headers foreign{{"Origin", "http://evil.example"}};
+    httplib::Headers allowed{{"Origin", "http://127.0.0.1:5500"}};
+    auto http = client();
+
+    const std::string approvalId = createProposal();
+    ASSERT_FALSE(approvalId.empty());
+    const auto deniedApproval = http.Post("/api/changes/" + approvalId + "/approve", foreign);
+    ASSERT_TRUE(deniedApproval);
+    EXPECT_EQ(deniedApproval->status, 403);
+    EXPECT_TRUE(deniedApproval->get_header_value("Access-Control-Allow-Origin").empty());
+    const auto approved = http.Post("/api/changes/" + approvalId + "/approve", allowed);
+    ASSERT_TRUE(approved);
+    EXPECT_EQ(approved->status, 200);
+
+    const std::string rejectionId = createProposal();
+    ASSERT_FALSE(rejectionId.empty());
+    const auto deniedRejection = http.Post("/api/changes/" + rejectionId + "/reject", foreign);
+    ASSERT_TRUE(deniedRejection);
+    EXPECT_EQ(deniedRejection->status, 403);
+    EXPECT_TRUE(deniedRejection->get_header_value("Access-Control-Allow-Origin").empty());
+    const auto rejected = http.Post("/api/changes/" + rejectionId + "/reject", allowed);
+    ASSERT_TRUE(rejected);
+    EXPECT_EQ(rejected->status, 200);
+}
 
 class GuiHttpServerSaveTest : public ::testing::Test {
 protected:
@@ -699,6 +1045,36 @@ protected:
     std::filesystem::path directory_;
     std::unique_ptr<GuiHttpServer> server_;
 };
+
+TEST_F(GuiHttpServerSaveTest, RejectsForeignOriginForSaveButAllowsOriginlessLocalClient) {
+    auto http = client();
+    httplib::Headers foreign{{"Origin", "http://evil.example"}};
+    const std::string body = R"({"fileName":"origin-check.cpp","content":"safe","overwriteConfirmed":false})";
+    const auto denied = http.Post("/api/save", foreign, body, "application/json");
+    ASSERT_TRUE(denied);
+    EXPECT_EQ(denied->status, 403);
+    EXPECT_FALSE(std::filesystem::exists(directory_ / "origin-check.cpp"));
+
+    const auto allowed = http.Post("/api/save", body, "application/json");
+    ASSERT_TRUE(allowed);
+    EXPECT_EQ(allowed->status, 200);
+    EXPECT_TRUE(std::filesystem::exists(directory_ / "origin-check.cpp"));
+}
+
+TEST_F(GuiHttpServerSaveTest, RejectsForeignOriginBeforeChangingOutputDirectory) {
+    auto http = client();
+    const auto alternateDirectory = directory_ / "alternate";
+    ASSERT_TRUE(std::filesystem::create_directory(alternateDirectory));
+    httplib::Headers foreign{{"Origin", "http://evil.example"}};
+    const auto denied = http.Post("/api/output/select-directory", foreign,
+                                  nlohmann::json{{"directoryPath", alternateDirectory.string()}}.dump(),
+                                  "application/json");
+    ASSERT_TRUE(denied);
+    EXPECT_EQ(denied->status, 403);
+    const auto config = http.Get("/api/config");
+    ASSERT_TRUE(config);
+    EXPECT_EQ(nlohmann::json::parse(config->body).at("activeOutputDirectory"), directory_.string());
+}
 
 TEST_F(GuiHttpServerSaveTest, SavesGeneratedCodeExplicitlyAndRequiresOverwriteConfirmation) {
     auto http = client();

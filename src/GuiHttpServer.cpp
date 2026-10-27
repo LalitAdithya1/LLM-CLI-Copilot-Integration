@@ -9,11 +9,13 @@
 #include <cctype>
 #include <cstdint>
 #include <iomanip>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <system_error>
 #include <thread>
-#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #ifdef _WIN32
@@ -28,7 +30,9 @@ namespace {
 
 constexpr const char* kLoopbackAddress = "127.0.0.1";
 constexpr const char* kJsonContentType = "application/json; charset=utf-8";
+constexpr const char* kAllowedGuiOrigin = "http://127.0.0.1:5500";
 constexpr std::size_t kMaxRequestBodyBytes = 1024 * 1024;
+constexpr std::size_t kMaximumRetainedProposals = 128;
 
 using Json = nlohmann::json;
 
@@ -63,6 +67,10 @@ bool isJsonContentType(const std::string& contentType) {
     return mediaType == "application/json";
 }
 
+bool isApiPath(const std::string& path) {
+    return path == "/api" || path.compare(0, 5, "/api/") == 0;
+}
+
 void setJsonError(
     httplib::Response& response,
     int status,
@@ -74,6 +82,39 @@ void setJsonError(
         Json{{"error", {{"code", code}, {"message", message}}}}.dump(),
         kJsonContentType
     );
+}
+
+bool hasSingleHeader(const httplib::Request& request, const std::string& name,
+                     std::string& value) {
+    auto range = request.headers.equal_range(name);
+    if (range.first == range.second) return false;
+    const auto first = range.first;
+    ++range.first;
+    if (range.first != range.second) return false;
+    value = first->second;
+    return true;
+}
+
+bool isAllowedPreflightHeaderList(const std::string& value) {
+    std::size_t start = 0;
+    bool sawContentType = false;
+    while (start < value.size()) {
+        const auto comma = value.find(',', start);
+        auto token = value.substr(start, comma == std::string::npos ? comma : comma - start);
+        const auto first = token.find_first_not_of(" \t");
+        const auto last = token.find_last_not_of(" \t");
+        if (first == std::string::npos) return false;
+        token = token.substr(first, last - first + 1);
+        std::transform(token.begin(), token.end(), token.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (token != "content-type" || sawContentType) return false;
+        sawContentType = true;
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+        if (start == value.size()) return false;
+    }
+    return true;
 }
 
 struct SaveRequest {
@@ -473,6 +514,36 @@ void setDialogError(
 } // namespace
 
 class GuiHttpServer::Impl {
+    enum class ProposalStatus {
+        Pending,
+        Approved,
+        Rejected,
+        Applied
+    };
+
+    struct PendingProposal {
+        std::string originalCode;
+        std::string proposedCode;
+        std::string editorRevision;
+        std::string baseEditorHash;
+        ProposalStatus status = ProposalStatus::Pending;
+        std::uint64_t sequence = 0;
+    };
+
+    struct ProposalCapacityReservation {
+        Impl* owner = nullptr;
+        std::optional<std::string> evictionId;
+        bool active = false;
+
+        ProposalCapacityReservation() = default;
+        explicit ProposalCapacityReservation(Impl* server) : owner(server) {}
+        ProposalCapacityReservation(const ProposalCapacityReservation&) = delete;
+        ProposalCapacityReservation& operator=(const ProposalCapacityReservation&) = delete;
+        ~ProposalCapacityReservation() {
+            if (active) owner->releaseProposalCapacity(*this);
+        }
+    };
+
 public:
     explicit Impl(
         int requestedPort,
@@ -764,6 +835,9 @@ public:
                 return;
             }
 
+            ProposalCapacityReservation reservation(this);
+            if (!reserveProposalCapacity(reservation, response)) return;
+
             std::string proposedCode;
             try {
                 if (!refactoringHandler_(
@@ -796,7 +870,20 @@ public:
             std::string serializedResponse;
             try {
                 std::lock_guard<std::mutex> lock(proposalMutex_);
-                proposalId = "prop-" + std::to_string(nextProposalId_++);
+                if (reservation.evictionId) {
+                    const auto eviction = proposals_.find(*reservation.evictionId);
+                    if (eviction == proposals_.end() ||
+                        (eviction->second.status != ProposalStatus::Rejected &&
+                         eviction->second.status != ProposalStatus::Applied)) {
+                        setJsonError(response, 503, "PROPOSAL_CAPACITY", "Proposal capacity is full; resolve or save existing proposals before creating another.");
+                        return;
+                    }
+                } else if (proposals_.size() >= kMaximumRetainedProposals) {
+                    setJsonError(response, 503, "PROPOSAL_CAPACITY", "Proposal capacity is full; resolve or save existing proposals before creating another.");
+                    return;
+                }
+                const std::uint64_t proposalSequence = nextProposalId_;
+                proposalId = "prop-" + std::to_string(proposalSequence);
                 const Json result = {
                     {"proposalId", proposalId},
                     {"status", "PENDING"},
@@ -805,16 +892,40 @@ public:
                     {"baseEditorHash", baseEditorHash}
                 };
                 serializedResponse = result.dump();
-                proposals_.emplace(
+                std::map<std::string, PendingProposal> staged;
+                staged.emplace(
                     proposalId,
                     PendingProposal{
                         refactoringRequest.sourceCode,
                         proposedCode,
                         refactoringRequest.editorRevision,
                         baseEditorHash,
-                        ProposalStatus::Pending
+                        ProposalStatus::Pending,
+                        proposalSequence
                     }
                 );
+                auto stagedNode = staged.extract(proposalId);
+                if (reservation.evictionId) {
+                    auto evictedNode = proposals_.extract(*reservation.evictionId);
+                    try {
+                        const auto inserted = proposals_.insert(std::move(stagedNode));
+                        if (!inserted.inserted) {
+                            proposals_.insert(std::move(evictedNode));
+                            setJsonError(response, 502, "REFACTOR_FAILED", "Code refactoring result could not be prepared.");
+                            return;
+                        }
+                    } catch (...) {
+                        if (!evictedNode.empty()) proposals_.insert(std::move(evictedNode));
+                        throw;
+                    }
+                } else {
+                    const auto inserted = proposals_.insert(std::move(stagedNode));
+                    if (!inserted.inserted) {
+                        setJsonError(response, 502, "REFACTOR_FAILED", "Code refactoring result could not be prepared.");
+                        return;
+                    }
+                }
+                ++nextProposalId_;
             } catch (...) {
                 setJsonError(
                     response,
@@ -941,15 +1052,78 @@ public:
             }
         );
 
+        server_.set_pre_routing_handler([this](const httplib::Request& request,
+                                               httplib::Response& response) {
+            if (!isApiPath(request.path)) {
+                return httplib::Server::HandlerResponse::Unhandled;
+            }
+
+            const std::string expectedPort = ":" + std::to_string(boundPort_);
+            std::string host;
+            if (!hasSingleHeader(request, "Host", host) ||
+                (host != std::string("127.0.0.1") + expectedPort &&
+                 host != std::string("localhost") + expectedPort)) {
+                setJsonError(response, 400, "INVALID_HOST", "Host is not allowed.");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+
+            response.set_header("Vary", "Origin");
+            std::string origin;
+            const auto originRange = request.headers.equal_range("Origin");
+            const bool hasOrigin = originRange.first != originRange.second;
+            if (hasOrigin) {
+                if (!hasSingleHeader(request, "Origin", origin) || origin != kAllowedGuiOrigin) {
+                    setJsonError(response, 403, "ORIGIN_NOT_ALLOWED", "Request origin is not allowed.");
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+            }
+
+            if (request.method == "OPTIONS") {
+                std::string requestedMethod;
+                std::string requestedHeaders;
+                if (!hasOrigin || !hasSingleHeader(request, "Access-Control-Request-Method", requestedMethod) ||
+                    (requestedMethod != "GET" && requestedMethod != "POST") ||
+                    (request.headers.count("Access-Control-Request-Headers") > 1) ||
+                    (request.headers.count("Access-Control-Request-Headers") == 1 &&
+                     (!hasSingleHeader(request, "Access-Control-Request-Headers", requestedHeaders) ||
+                      !isAllowedPreflightHeaderList(requestedHeaders)))) {
+                    setJsonError(response, 403, "INVALID_PREFLIGHT", "Preflight request is not allowed.");
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+                response.set_header("Access-Control-Allow-Origin", kAllowedGuiOrigin);
+                response.status = 204;
+                response.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                response.set_header("Access-Control-Allow-Headers", "Content-Type");
+                response.set_header("Access-Control-Max-Age", "600");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            if (hasOrigin) response.set_header("Access-Control-Allow-Origin", kAllowedGuiOrigin);
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+
         server_.set_payload_max_length(kMaxRequestBodyBytes);
-        server_.set_error_handler([](const httplib::Request&, httplib::Response& response) {
-            if (response.status == 413) {
+        server_.set_error_handler([](const httplib::Request& request, httplib::Response& response) {
+            if (!isApiPath(request.path)) return;
+            if (response.status == 413 && response.body.empty()) {
                 setJsonError(
                     response,
                     413,
                     "PAYLOAD_TOO_LARGE",
                     "Request body exceeds the 1 MiB limit."
                 );
+            } else if (response.body.empty() && response.status == 404) {
+                setJsonError(response, 404, "NOT_FOUND", "API endpoint was not found.");
+            } else if (response.body.empty() && response.status == 405) {
+                setJsonError(response, 405, "METHOD_NOT_ALLOWED", "HTTP method is not supported for this endpoint.");
+            } else if (response.body.empty() && response.status >= 400) {
+                setJsonError(response, response.status, "INVALID_HTTP_REQUEST", "The API request could not be processed.");
+            }
+        });
+        server_.set_exception_handler([](const httplib::Request& request,
+                                         httplib::Response& response,
+                                         std::exception_ptr) {
+            if (isApiPath(request.path)) {
+                setJsonError(response, 500, "INTERNAL_ERROR", "The API request could not be completed.");
             }
         });
 
@@ -1049,20 +1223,43 @@ public:
     }
 
 private:
-    enum class ProposalStatus {
-        Pending,
-        Approved,
-        Rejected,
-        Applied
-    };
+    // Count in-flight creation leases with stored proposals so parallel provider
+    // calls cannot claim the same final slot. A terminal candidate is pinned
+    // until commit or lease destruction; provider calls run without this mutex.
+    bool reserveProposalCapacity(ProposalCapacityReservation& reservation,
+                                 httplib::Response& response) {
+        std::lock_guard<std::mutex> lock(proposalMutex_);
+        std::optional<std::string> evictionId;
+        if (proposals_.size() + proposalReservations_ >= kMaximumRetainedProposals) {
+            auto oldestTerminal = proposals_.end();
+            for (auto proposal = proposals_.begin(); proposal != proposals_.end(); ++proposal) {
+                const bool terminal = proposal->second.status == ProposalStatus::Rejected ||
+                                      proposal->second.status == ProposalStatus::Applied;
+                if (terminal && reservedEvictions_.count(proposal->first) == 0 &&
+                    (oldestTerminal == proposals_.end() ||
+                     proposal->second.sequence < oldestTerminal->second.sequence)) {
+                    oldestTerminal = proposal;
+                }
+            }
+            if (oldestTerminal == proposals_.end()) {
+                setJsonError(response, 503, "PROPOSAL_CAPACITY", "Proposal capacity is full; resolve or save existing proposals before creating another.");
+                return false;
+            }
+            evictionId = oldestTerminal->first;
+        }
+        if (evictionId) reservedEvictions_.insert(*evictionId);
+        reservation.evictionId = std::move(evictionId);
+        ++proposalReservations_;
+        reservation.active = true;
+        return true;
+    }
 
-    struct PendingProposal {
-        std::string originalCode;
-        std::string proposedCode;
-        std::string editorRevision;
-        std::string baseEditorHash;
-        ProposalStatus status = ProposalStatus::Pending;
-    };
+    void releaseProposalCapacity(ProposalCapacityReservation& reservation) {
+        std::lock_guard<std::mutex> lock(proposalMutex_);
+        if (reservation.evictionId) reservedEvictions_.erase(*reservation.evictionId);
+        if (proposalReservations_ > 0) --proposalReservations_;
+        reservation.active = false;
+    }
 
     static std::filesystem::path resolveLaunchDirectory(
         std::filesystem::path launchWorkingDirectory
@@ -1091,7 +1288,9 @@ private:
     std::mutex configMutex_;
     std::mutex proposalMutex_;
     std::mutex saveMutex_;
-    std::unordered_map<std::string, PendingProposal> proposals_;
+    std::map<std::string, PendingProposal> proposals_;
+    std::unordered_set<std::string> reservedEvictions_;
+    std::size_t proposalReservations_ = 0;
     std::uint64_t nextProposalId_ = 1;
     std::atomic<int> boundPort_{0};
     State state_ = State::Ready;

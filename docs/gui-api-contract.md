@@ -2,7 +2,7 @@
 
 **Project:** C++ Coding Copilot  
 **Milestone:** B1 — GUI API contract  
-**Status:** Proposed contract for implementation  
+**Status:** Implemented API contract; see current verification and platform notes
 **Transport:** HTTP/JSON over loopback only
 
 ## Table of Contents
@@ -33,10 +33,14 @@ This is a logical design; class names and boundaries must be confirmed against t
 
 ## 2. Common Rules
 
-- Bind only to `127.0.0.1` or `::1`, never a public interface.
+- The backend binds to IPv4 loopback `127.0.0.1` and validates each `/api/` request's single `Host` header against `127.0.0.1:<actual backend port>` or `localhost:<actual backend port>`. Other hosts, ports, missing Host headers, and duplicate Host headers receive `400 INVALID_HOST`.
+- The supported browser GUI origin is exactly `http://127.0.0.1:5500`. Responses to that origin include `Access-Control-Allow-Origin` with that exact value; origins are never reflected and wildcard CORS is not used.
+- The server handles preflight `OPTIONS` for API paths only when the Origin is the configured GUI origin, the requested method is `GET` or `POST`, and requested headers are absent or limited to `Content-Type`. Accepted preflights advertise `GET, POST, OPTIONS` and `Content-Type`.
+- Any present Origin on an API request must be exactly `http://127.0.0.1:5500`. Foreign, `null`, malformed, or duplicate Origin headers receive `403 ORIGIN_NOT_ALLOWED` before route handlers run, including state-changing routes with empty bodies.
+- Requests with no Origin are accepted as non-browser local clients for CLI and automated-test compatibility. Host validation still applies. This is not client authentication: other local processes can make requests, and browser protection relies on browsers sending Origin for cross-origin requests. Do not expose the backend beyond loopback.
 - Use JSON request bodies (`Content-Type: application/json`) and JSON responses.
 - Capture the terminal's current working directory when `codeagent gui` starts. This is the immutable default output directory.
-- Save-directory precedence: explicit directory in the save request, then session-selected directory, then launch directory.
+- Save-directory precedence: session-selected directory, then launch directory. The save request does not accept a directory path.
 - The C++ backend performs filesystem reads/writes. The browser must not access arbitrary host paths directly.
 - Never expose API keys, `.env` contents, or stack traces.
 - Use a consistent error shape:
@@ -52,6 +56,8 @@ This is a logical design; class names and boundaries must be confirmed against t
 
 Typical status codes: `400` invalid request, `404` missing resource, `409` state/version conflict, `413` oversized request, `422` unsupported file/path, `500` internal or filesystem error, `502` AI provider error, `503` missing configuration/unavailable dialog, `504` AI timeout.
 
+All `/api/` errors use this JSON shape. Unknown API routes return `404 NOT_FOUND`; unsupported methods return a safe JSON error (currently `404 NOT_FOUND` when cpp-httplib cannot match a route). Unhandled API exceptions return `500 INTERNAL_ERROR`. Request bodies are limited to 1 MiB, provider response bodies to 2 MiB, and proposal retention to 128 entries per server process. Refactor capacity is reserved before provider invocation; reservations count against the same 128-entry limit and are released on every failed request path.
+
 ## 3. Endpoints
 
 | Method and path | Purpose |
@@ -66,7 +72,6 @@ Typical status codes: `400` invalid request, `404` missing resource, `409` state
 | `POST /api/files/open-dialog` | Open a native file picker, validate the selected C/C++ file, and return its path without reading its contents. |
 | `POST /api/output/select-directory` | Open a directory picker or set a validated session output directory. |
 | `POST /api/save` | Save generated code or an approved proposal to the requested output location. |
-| `POST /api/session/exit` | Request graceful backend shutdown. |
 
 ### B4 response schemas (agreed API contract)
 
@@ -192,11 +197,11 @@ Examples are illustrative, not actual model output.
 
 The request must use `Content-Type: application/json` and contain exactly four string fields: `sourceCode`, `instruction`, `language`, and `editorRevision`. Each field must contain non-whitespace text. Language labels are not restricted to an allow-list. Additional fields are rejected. The request body limit is 1 MiB.
 
-On success, return HTTP `200` with exactly the fields shown in the response example above. The returned proposal has status `PENDING`; creating it does not approve it and does not read or write files. A successful no-op refactor is still represented as a pending proposal; later review behavior is outside B7.
+On success, return HTTP `200` with the documented fields. The returned proposal has status `PENDING`; creating it does not approve it and does not read or write files. A no-op refactor is still represented as a pending proposal. The diff, decision, and save routes below operate on this proposal.
 
 `editorRevision` is an opaque, non-empty client revision token. The backend retains it with the pending proposal and does not reinterpret or return it in the B7 response. `baseEditorHash` is `fnv1a64:` followed by a 16-character, lowercase hexadecimal FNV-1a 64-bit hash of the exact UTF-8 bytes of `sourceCode`. This stable non-cryptographic hash is for accidental editor-content mismatch detection, not authentication or security. A later stale-editor check should compare both the revision token and source hash.
 
-Proposal IDs are sequential (`prop-1`, `prop-2`, and so on) within one server process. Pending proposal data is held in memory and is discarded when the server stops; it is not persisted. B7 stores proposal state for later review endpoints but does not implement retrieval, approval, rejection, deletion, or saving.
+Proposal IDs are sequential (`prop-1`, `prop-2`, and so on) within one server process. Proposals are held in memory and discarded when the server stops; they are not persisted. At most 128 proposals are retained, counting in-flight creation reservations. A refactor request reserves a free slot or pins the oldest unreserved `REJECTED` or `APPLIED` proposal for replacement before invoking the provider. If no slot or terminal proposal is available, the server returns `503 PROPOSAL_CAPACITY` without calling the provider. Pending, approved, saving, and reserved proposals are never evicted. Response serialization and proposal-node allocation are staged before replacement; the old terminal proposal remains stored if provider or preparation fails. Concurrent reservations cannot claim the same terminal entry or exceed the cap. Failed requests do not advance the proposal ID counter.
 
 Errors use the common JSON error object from Section 2:
 
@@ -212,6 +217,7 @@ Errors use the common JSON error object from Section 2:
 | `415` | `UNSUPPORTED_MEDIA_TYPE` | The request content type is not `application/json`. |
 | `502` | `REFACTOR_FAILED` | The handler failed, threw, returned empty output, or the result could not be serialized. No proposal is created. |
 | `503` | `REFACTOR_UNAVAILABLE` | No refactoring handler is configured. |
+| `503` | `PROPOSAL_CAPACITY` | No unreserved free slot or terminal proposal is available; the provider is not invoked. |
 
 The production handler builds the prompt with `PromptBuilder` and calls `LLMClient::generateCompleteContent()`, which validates the provider response through `ResponseParser`. Blocked, incomplete, malformed, empty, or failed provider responses therefore produce `REFACTOR_FAILED`; exception details and provider response text are not returned to the HTTP client.
 
@@ -238,6 +244,8 @@ Direct code buffers may be empty. Proposal-based diff uses the stored original a
 The proposal ID is supplied in the path and the request body must be empty. Success returns HTTP `200` with `{"proposalId":"prop-1","status":"APPROVED"}` or `{"proposalId":"prop-1","status":"REJECTED"}`. Only a `PENDING` proposal may transition. Repeating a transition or attempting the opposite transition returns HTTP `409`; an unknown ID returns HTTP `404`. These operations only change proposal state; neither operation saves or applies code.
 
 The backend retains `editorRevision` and `baseEditorHash` unchanged in proposal state. B8 does not perform a stale-editor check: the contract requires rejecting stale application, while B8 approval does not apply code and has no current-revision field to compare. The stale check belongs on a future apply/save operation.
+
+The current browser UI additionally compares the editor text with the proposal's original source and disables approval/save if it has changed. This is a client-side guard only; the backend cannot verify freshness across clients because decision/save requests do not include a current revision or content hash.
 
 B8 errors use the common JSON error object from Section 2:
 
@@ -297,7 +305,7 @@ B9 errors use the common JSON error object from Section 2:
 | `503` | `DIALOG_UNAVAILABLE` | The dialog utility or graphical display is unavailable. |
 | `504` | `DIALOG_TIMEOUT` | The native dialog exceeded its 30-second timeout. |
 
-On Ubuntu/Linux, the production provider invokes `zenity` directly with fixed argument vectors (no shell); it uses the graphical `DISPLAY` or `WAYLAND_DISPLAY` environment and a 30-second timeout. Windows currently reports the native dialog as unavailable. The provider is injectable so HTTP behavior can be tested offline.
+The POSIX provider invokes `zenity` with fixed argument vectors through `posix_spawn` (no shell), requires `DISPLAY` or `WAYLAND_DISPLAY`, caps returned path data, and enforces a 30-second timeout. Windows currently reports dialogs unavailable. On macOS, this POSIX implementation also requires a separately installed `zenity`; native macOS dialog support is not implemented. Automated tests use an injected provider and do not exercise a real desktop dialog.
 
 ### Example: save generated code
 
@@ -324,6 +332,8 @@ For a proposal save, the request uses `proposalId` and `fileName`, with optional
 
 Both forms require JSON and are limited to 1 MiB. Generated-code saves contain exactly `fileName`, `content`, and boolean `overwriteConfirmed`. Proposal saves contain `proposalId`, `fileName`, and optional `overwriteConfirmed`. Filenames must be single supported C/C++ source filenames; paths, separators, traversal, absolute names, symbolic links, and non-regular targets are rejected. The output directory must already exist. Success is HTTP `200` with `{"savedPath":"/absolute/path/name.cpp","status":"SAVED"}`. Errors use the common JSON shape: `400 INVALID_JSON`, `INVALID_REQUEST`, or `INVALID_FILENAME`; `404 PROPOSAL_NOT_FOUND`; `409 INVALID_PROPOSAL_STATE` or `OVERWRITE_CONFIRMATION_REQUIRED`; `413 PAYLOAD_TOO_LARGE`; `415 UNSUPPORTED_MEDIA_TYPE`; `422 INVALID_OUTPUT_DIRECTORY` or `INVALID_TARGET`; `500 SAVE_FAILED`.
 
+The browser UI currently saves approved proposals only. It first sends `overwriteConfirmed: false`; if the backend reports `OVERWRITE_CONFIRMATION_REQUIRED`, it asks the user and retries with `true` only after confirmation. Generated-code saving is supported by the backend route but is not offered by the current UI.
+
 ## 4. Proposal and Save Safety
 
 Proposal states:
@@ -343,9 +353,15 @@ PENDING ──approve──> APPROVED ──successful save──> APPLIED
 - Require explicit confirmation before overwriting an existing file.
 - Use a unique temporary file per write and safe platform-appropriate replacement. On failure, clean up the temporary file where possible, preserve the existing target where supported, and leave the proposal approved for retry.
 - A successful proposal save transitions `APPROVED` to `APPLIED`; a failed write leaves it approved and retryable.
+- The UI displays `APPLIED` and the saved path only after a valid save success response.
+- At the 128-proposal limit, only the oldest rejected or applied proposal is eligible for eviction. The proposal mutex is held across state changes and save I/O, so creation cannot evict a proposal while its save is in progress. If all entries are pending or approved, creation returns `503 PROPOSAL_CAPACITY`.
 - Inspect `FileManager` before GUI integration. An HTTP request must not hang waiting for terminal input.
 
 ## 5. Security and Error Handling
+
+For local development, serve the existing `frontend` directory at the fixed origin `http://127.0.0.1:5500` and start the backend with `./build/codeagent gui` (after building). For example, run `python3 -m http.server 5500 --bind 127.0.0.1 --directory frontend` in a second terminal, then open `http://127.0.0.1:5500`. The backend listens at `http://127.0.0.1:8080`. Other frontend origins require an intentional backend policy/configuration change; they are not implicitly trusted.
+
+Origin checks are server-side request checks; CORS response headers alone do not authorize state changes. Missing Origin remains permitted for non-browser loopback callers as described above.
 
 - Validate request fields, file extensions, filenames, and paths.
 - Reject path traversal outside the permitted output directory. Do not rely on string normalization alone where symlinks can affect the result.
@@ -370,6 +386,13 @@ Before calling the GUI backend complete, verify:
 - Existing-file conflicts and failed writes are handled safely.
 - Automated tests do not require live AI calls; use a test seam or fake where appropriate.
 - The frontend uses the same endpoint paths and JSON shapes.
+- Frontend checks run with `node frontend/tests/api.test.mjs`, `node frontend/tests/proposalWorkflow.test.mjs`, `node frontend/tests/appDomIntegration.test.mjs`, and `node --check` on the JavaScript modules. The DOM integration suite uses a small dependency-free test DOM and executes the actual app module; it is not a substitute for a browser smoke test.
 - Build, automated test results, and native-dialog manual checks are reported honestly.
 
 For assessment quality, keep HTTP handling, proposal state, AI orchestration, and file operations separately testable. Use RAII and clear ownership. Add interfaces, inheritance, templates, or operator overloads only when they solve a genuine design problem; document the actual implementation in UML rather than inventing classes for the diagram.
+
+The current browser editor is a plain text area, not Monaco. The source-file dialog returns a validated path but does not read file contents; users must paste source into the editor to refactor it. Files mode, settings, and copy controls remain disabled placeholders. There is no `/api/session/exit` route; stop the backend from its owning terminal with Ctrl+C. No browser automation is configured in this repository.
+
+Manual browser verification: build and start `./build/codeagent gui`, serve `frontend` with `python3 -m http.server 5500 --bind 127.0.0.1 --directory frontend`, and open `http://127.0.0.1:5500` (not `file://`). Confirm health/config, generate a response with a configured provider, enter source text and create a refactor proposal, request and inspect its diff, approve it, enter a supported filename, and save. Repeat with a second proposal and reject it; verify it cannot be saved. To verify overwrite handling, save an approved proposal to an existing file and confirm the prompt before replacement. Editing the source after proposal creation should disable approval and save until the original text is restored. The provider-backed steps can incur provider usage and require valid configuration.
+
+Manual native-dialog verification on Linux requires a graphical session and `zenity`: use both source and output-directory buttons, confirm selections return paths, cancel each dialog and confirm the active output directory remains unchanged, and test an unsupported file selection. The Windows implementation reports unavailable. macOS has no native dialog implementation and depends on the POSIX `zenity` path if installed. Automated dialog tests use a fake provider; they verify cancellation, failure, timeout, and path validation without opening a desktop dialog.

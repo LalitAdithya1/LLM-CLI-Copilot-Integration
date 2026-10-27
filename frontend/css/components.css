@@ -768,9 +768,65 @@
 
 .proposal-review__actions {
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: var(--space-3);
   margin-top: var(--space-4);
+}
+
+.proposal-diff {
+  min-width: 0;
+  margin-top: var(--space-3);
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+  border-radius: 0.6rem;
+  background: #101015;
+}
+
+.proposal-diff h3 {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.proposal-diff__content {
+  max-height: 22rem;
+  min-height: 5rem;
+  margin: 0;
+  padding: var(--space-3);
+  overflow: auto;
+  color: var(--color-text);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.75rem;
+  line-height: 1.6;
+  tab-size: 4;
+  white-space: pre;
+}
+
+.save-file-name {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--color-text-muted);
+  font-size: 0.75rem;
+}
+
+.save-file-name input {
+  width: min(14rem, 40vw);
+  min-height: 2.5rem;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: 0.55rem;
+  background: var(--color-card);
+  color: var(--color-text);
+  font: inherit;
+}
+
+.save-file-name input:disabled {
+  opacity: 0.65;
 }
 
 @media (max-width: 760px) {

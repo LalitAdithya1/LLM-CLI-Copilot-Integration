@@ -190,10 +190,39 @@ ai-assistant help
 ### Start the GUI backend
 
 ```bash
-./codeagent gui
+cmake -S . -B build
+cmake --build build -j2
+./build/codeagent gui
 ```
 
-It starts the loopback-only GUI backend, prints its local address, and runs until Ctrl+C.
+For local frontend development, serve the existing frontend from the exact allowed origin in a second terminal:
+
+```bash
+python3 -m http.server 5500 --bind 127.0.0.1 --directory frontend
+```
+
+Then open `http://127.0.0.1:5500`. The backend runs at `http://127.0.0.1:8080` until Ctrl+C. The API only permits browser requests from this exact frontend origin; other origins and `Origin: null` are rejected. Requests without an Origin are accepted for non-browser local clients, with Host validation still enforced.
+
+The frontend supports health/config display, code generation, refactoring from text in the editor, server-backed diff review, proposal approval/rejection, output-directory selection, and saving approved proposals. Save filenames must be supported C/C++ source filenames. Existing-file replacement requires a confirmation prompt. Generated output is not saved by the current UI. The source picker returns a path only; it does not load file contents. The editor is a plain text area. Files mode, settings, and copy controls are disabled placeholders.
+
+The backend retains at most 128 proposals and in-flight creation reservations combined. Refactor capacity is reserved before provider work begins. At capacity, the backend can replace only the oldest unreserved rejected or successfully applied proposal; pending, approved, saving, and actively reserved proposals remain protected. If no slot or terminal proposal is available, the request receives `503 PROPOSAL_CAPACITY` without invoking the provider. Failed provider or response-preparation work releases its reservation and preserves any proposal selected for replacement.
+
+On POSIX systems, native dialogs require `zenity` and a graphical `DISPLAY` or `WAYLAND_DISPLAY`, and time out after 30 seconds. Windows reports native dialogs unavailable. macOS uses the POSIX `zenity` path and has no native dialog integration. Automated tests cover dialog outcomes through an injected provider; no real desktop dialog was exercised here.
+
+There is no `/api/session/exit` route. Stop the backend with Ctrl+C in its terminal.
+
+Run lightweight frontend checks with:
+
+```bash
+node --check frontend/js/api.js
+node --check frontend/js/app.js
+node --check frontend/js/proposalWorkflow.js
+node frontend/tests/api.test.mjs
+node frontend/tests/proposalWorkflow.test.mjs
+node frontend/tests/appDomIntegration.test.mjs
+```
+
+The app DOM integration test runs the real frontend module with a small dependency-free test DOM. It verifies HTML selectors and the review, approve, reject, and save event handlers; it does not replace a browser smoke test. Run the full backend checks with `cmake -S . -B build`, `cmake --build build -j2`, and `ctest --test-dir build --output-on-failure`.
 
 The older CLI examples above illustrate intended usage; some commands and options may not yet be available.
 

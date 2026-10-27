@@ -227,6 +227,24 @@ TEST_F(LLMClientTest, RejectsMalformedJson) {
     EXPECT_TRUE(response.empty());
 }
 
+TEST_F(LLMClientTest, RejectsProviderResponsesOverTwoMiB) {
+    const std::string oversizedText(2 * 1024 * 1024 + 1, 'x');
+    const std::string oversizedResponse = json{
+        {"candidates", json::array({json{{"content", json{{"parts", json::array({json{{"text", oversizedText}}})}}}}})}
+    }.dump();
+    LLMClient client(
+        [oversizedResponse](const std::string&, const std::string&, const std::string&,
+                            std::string& responseBody, long& status) {
+            responseBody = oversizedResponse;
+            status = 200;
+            return true;
+        }
+    );
+
+    EXPECT_FALSE(client.generateContent("Generate code", response));
+    EXPECT_TRUE(response.empty());
+}
+
 TEST_F(LLMClientTest, RejectsResponseWithoutCandidates) {
     LLMClient client(
         [](

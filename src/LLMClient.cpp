@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cctype>
+#include <cstddef>
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
@@ -17,6 +18,12 @@
 namespace {
 
 using json = nlohmann::json;
+constexpr std::size_t kMaximumProviderResponseBytes = 2 * 1024 * 1024;
+
+struct ProviderResponseBuffer {
+    std::string body;
+    bool exceededLimit = false;
+};
 
 bool isWhitespaceOnly(const std::string& text) {
     for (unsigned char ch : text) {
@@ -34,10 +41,14 @@ size_t writeResponse(
     size_t count,
     void* userData
 ) {
+    if (size != 0 && count > static_cast<std::size_t>(-1) / size) return 0;
     const size_t totalBytes = size * count;
-
-    auto* response = static_cast<std::string*>(userData);
-    response->append(data, totalBytes);
+    auto* response = static_cast<ProviderResponseBuffer*>(userData);
+    if (totalBytes > kMaximumProviderResponseBytes - response->body.size()) {
+        response->exceededLimit = true;
+        return 0;
+    }
+    response->body.append(data, totalBytes);
 
     return totalBytes;
 }
@@ -99,6 +110,7 @@ bool performHttpRequest(
 
     responseBody.clear();
     httpStatus = 0;
+    ProviderResponseBuffer responseBuffer;
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -114,7 +126,7 @@ bool performHttpRequest(
         static_cast<long>(requestBody.size())
     );
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeResponse);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBody);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBuffer);
 
     // Bound request duration and verify TLS certificates.
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
@@ -123,6 +135,7 @@ bool performHttpRequest(
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
 
     const CURLcode result = curl_easy_perform(curl);
+    responseBody = std::move(responseBuffer.body);
 
     if (result == CURLE_OK) {
         curl_easy_getinfo(
@@ -140,7 +153,7 @@ bool performHttpRequest(
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 
-    return result == CURLE_OK;
+    return result == CURLE_OK && !responseBuffer.exceededLimit;
 }
 
 std::string buildGeminiUrl(const std::string& model) {
@@ -280,6 +293,11 @@ bool LLMClient::generateContentImpl(
         std::cerr
             << "Gemini request failed at the network or "
             << "transport layer.\n";
+        return false;
+    }
+
+    if (responseBody.size() > kMaximumProviderResponseBytes) {
+        std::cerr << "Error: Provider response exceeded the 2 MiB limit.\n";
         return false;
     }
 
