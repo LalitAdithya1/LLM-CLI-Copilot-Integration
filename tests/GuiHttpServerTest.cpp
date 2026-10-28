@@ -445,7 +445,8 @@ protected:
             std::filesystem::current_path(),
             [this](const std::string& instruction,
                    const std::string& language,
-                   std::string& generatedCode) {
+                   std::string& generatedCode,
+                   std::string& thoughts) {
                 generationCalls_.fetch_add(1);
                 if (instruction == "throw") {
                     throw std::runtime_error("provider detail with secret");
@@ -454,6 +455,7 @@ protected:
                     return false;
                 }
                 generatedCode = "generated: " + instruction + " (" + language + ")";
+                thoughts = "thinking about " + instruction;
                 return true;
             }
         );
@@ -494,9 +496,10 @@ TEST_F(GuiHttpServerGenerationTest, GeneratesCodeAndReturnsContractFields) {
     EXPECT_NE(response->get_header_value("Content-Type").find("application/json"),
               std::string::npos);
     const auto body = nlohmann::json::parse(response->body);
-    EXPECT_EQ(body.size(), 2u);
+    EXPECT_EQ(body.size(), 3u);
     EXPECT_EQ(body.at("generatedCode"), "generated: write a greeting (C++)");
     EXPECT_EQ(body.at("language"), "C++");
+    EXPECT_EQ(body.at("thoughts"), "thinking about write a greeting");
     EXPECT_FALSE(body.contains("savedPath"));
     EXPECT_EQ(generationCalls_.load(), 1);
 
@@ -667,7 +670,8 @@ protected:
             [this](const std::string& instruction,
                    const std::string&,
                    const std::string& sourceCode,
-                   std::string& refactoredCode) {
+                   std::string& refactoredCode,
+                   std::string&) {
                 handlerCalls_.fetch_add(1);
                 if (instruction == "wait") {
                     std::unique_lock<std::mutex> lock(providerWaitMutex_);
@@ -766,7 +770,8 @@ TEST_F(GuiHttpServerRefactoringTest, CreatesPendingProposalWithoutWritingFiles) 
     EXPECT_NE(response->get_header_value("Content-Type").find("application/json"),
               std::string::npos);
     const auto body = nlohmann::json::parse(response->body);
-    ASSERT_EQ(body.size(), 5u);
+    ASSERT_EQ(body.size(), 6u);
+    EXPECT_EQ(body.at("thoughts"), "");
     EXPECT_EQ(body.at("proposalId"), "prop-1");
     EXPECT_EQ(body.at("status"), "PENDING");
     EXPECT_EQ(body.at("originalCode"), "a");
@@ -1208,7 +1213,7 @@ protected:
         directory_ = std::filesystem::temp_directory_path() / ("codeagent-save-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         ASSERT_TRUE(std::filesystem::create_directory(directory_));
         server_ = std::make_unique<GuiHttpServer>(0, directory_, GuiHttpServer::GenerationHandler{},
-            [](const std::string&, const std::string&, const std::string& source, std::string& result) { result = "saved: " + source; return true; });
+            [](const std::string&, const std::string&, const std::string& source, std::string& result, std::string&) { result = "saved: " + source; return true; });
         ASSERT_TRUE(server_->start());
     }
     void TearDown() override { if (server_) server_->stop(); std::error_code e; std::filesystem::remove_all(directory_, e); }

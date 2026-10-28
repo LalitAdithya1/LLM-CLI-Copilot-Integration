@@ -432,3 +432,30 @@ TEST_F(ResponseParserTest, BlockedRejectedAndUnknownFencedResponsesReturnNoText)
         EXPECT_TRUE(response.generatedText.empty()) << reason;
     }
 }
+
+TEST_F(ResponseParserTest, SeparatesThoughtPartsFromGeneratedText) {
+    const ParsedResponse response = parser.parseResponse(R"({
+        "candidates": [{
+            "finishReason": "STOP",
+            "content": {
+                "parts": [
+                    {"text": "**Planning**\nAdd two ints.", "thought": true},
+                    {"text": "```cpp\nint add(int a, int b);\n```"},
+                    {"text": " Then return.", "thought": true}
+                ]
+            }
+        }]
+    })");
+
+    ASSERT_TRUE(response.succeeded());
+    EXPECT_EQ(response.generatedText, "int add(int a, int b);\n");
+    EXPECT_EQ(response.thoughts, "**Planning**\nAdd two ints. Then return.");
+}
+
+TEST_F(ResponseParserTest, ResponseWithOnlyThoughtsHasNoGeneratedText) {
+    const ParsedResponse response = parser.parseResponse(
+        R"({"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"thinking","thought":true}]}}]})"
+    );
+
+    EXPECT_EQ(response.error, ResponseParseError::EmptyGeneratedText);
+}

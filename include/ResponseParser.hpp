@@ -36,6 +36,10 @@ struct ParsedResponse {
     // Gemini's current response shape has no separate explanation field.
     std::optional<std::string> explanation;
 
+    // Thought-summary parts ("thought": true), combined in order. They are
+    // never part of generatedText. Empty unless thoughts were requested.
+    std::string thoughts;
+
     // Kept exactly as provided. An absent field stays empty; no reason is
     // inferred from the response text.
     std::optional<std::string> finishReason;

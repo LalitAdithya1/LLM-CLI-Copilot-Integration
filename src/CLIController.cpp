@@ -119,7 +119,8 @@ int runGuiCommand(std::ostream& output, std::ostream& error) {
     GuiHttpServer::GenerationHandler generationHandler =
         [](const std::string& instruction,
            const std::string& language,
-           std::string& generatedCode) {
+           std::string& generatedCode,
+           std::string& thoughts) {
             PromptBuilder promptBuilder;
             std::string prompt;
             if (!promptBuilder.buildGenerationPrompt(
@@ -130,13 +131,14 @@ int runGuiCommand(std::ostream& output, std::ostream& error) {
             }
 
             LLMClient client;
-            return client.generateContent(prompt, generatedCode);
+            return client.generateContent(prompt, generatedCode, thoughts);
         };
     GuiHttpServer::RefactoringHandler refactoringHandler =
         [](const std::string& instruction,
            const std::string& language,
            const std::string& sourceCode,
-           std::string& refactoredCode) {
+           std::string& refactoredCode,
+           std::string& thoughts) {
             PromptBuilder promptBuilder;
             std::string prompt;
             if (!promptBuilder.buildRefactoringPrompt(
@@ -148,7 +150,7 @@ int runGuiCommand(std::ostream& output, std::ostream& error) {
             }
 
             LLMClient client;
-            return client.generateCompleteContent(prompt, refactoredCode);
+            return client.generateCompleteContent(prompt, refactoredCode, thoughts);
         };
     GuiHttpServer server(
         port,

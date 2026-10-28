@@ -38,12 +38,27 @@ public:
         std::string& response
     ) const;
 
+    // Same as above, but also asks Gemini for a summary of its thinking and
+    // stores it in thoughts (empty when the model returns none).
+    bool generateContent(
+        const std::string& prompt,
+        std::string& response,
+        std::string& thoughts
+    ) const;
+    bool generateCompleteContent(
+        const std::string& prompt,
+        std::string& response,
+        std::string& thoughts
+    ) const;
+
 private:
     bool isValidPrompt(const std::string& prompt) const;
+    // thoughts is null when thought summaries are not requested.
     bool generateContentImpl(
         const std::string& prompt,
         std::string& response,
-        bool requireExplicitCompletion
+        bool requireExplicitCompletion,
+        std::string* thoughts
     ) const;
 
     HttpTransport transport_;

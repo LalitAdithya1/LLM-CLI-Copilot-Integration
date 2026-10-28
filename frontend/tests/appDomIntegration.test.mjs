@@ -7,6 +7,7 @@ const htmlSource = readFileSync(new URL('../index.html', import.meta.url), 'utf8
 const apiSource = readFileSync(new URL('../js/api.js', import.meta.url), 'utf8');
 const workflowSource = readFileSync(new URL('../js/proposalWorkflow.js', import.meta.url), 'utf8');
 const diffViewSource = readFileSync(new URL('../js/diffView.js', import.meta.url), 'utf8');
+const chatSource = readFileSync(new URL('../js/chatTranscript.js', import.meta.url), 'utf8');
 
 function dataUrl(source, suffix) {
   return `data:text/javascript;base64,${Buffer.from(source).toString('base64')}#${suffix}`;
@@ -39,7 +40,17 @@ class FakeElement {
   setAttribute(name, value) { this.attributes.set(name, value); }
   removeAttribute(name) { this.attributes.delete(name); }
   focus() { this.focused = true; }
-  replaceChildren(fragment) { this.children = fragment.children; }
+  replaceChildren(...nodes) {
+    this.children = nodes.length === 1 && Array.isArray(nodes[0]?.children) && nodes[0].selector === undefined
+      ? nodes[0].children
+      : nodes;
+  }
+  append(...nodes) { this.children = [...(this.children || []), ...nodes]; }
+}
+
+// Concatenated text of an element and its descendants.
+function textOf(node) {
+  return [node.textContent || '', ...(node.children || []).map(textOf)].join(' ');
 }
 
 function deferred() {
@@ -113,7 +124,8 @@ async function createApp(fetchOverride = null) {
   const rewrittenApp = appSource
     .replace("from './api.js'", `from '${apiUrl}'`)
     .replace("from './proposalWorkflow.js'", `from '${workflowUrl}'`)
-    .replace("from './diffView.js'", `from '${dataUrl(diffViewSource, Math.random())}'`);
+    .replace("from './diffView.js'", `from '${dataUrl(diffViewSource, Math.random())}'`)
+    .replace("from './chatTranscript.js'", `from '${dataUrl(chatSource, Math.random())}'`);
   await import(dataUrl(rewrittenApp, Math.random()));
   await new Promise((resolve) => setTimeout(resolve, 0));
   return { elements, modeButtons, requests };
@@ -949,4 +961,72 @@ test('Copy puts the current editor text on the clipboard and reports failures', 
   } finally {
     delete globalThis.navigator;
   }
+});
+
+test('the chat records the prompt, Gemini thoughts, output, and later decisions', async () => {
+  const app = await createApp((path, body, fallback) => {
+    if (path === '/api/generate') {
+      return jsonResponse({
+        generatedCode: 'int main() {}\n', language: body.language,
+        thoughts: '**Planning**\nA <b>minimal</b> main is enough.',
+      });
+    }
+    return fallback(`http://127.0.0.1:8080${path}`, { method: body ? 'POST' : 'GET', body: body && JSON.stringify(body) });
+  });
+  const { elements } = app;
+  const conversation = elements.get('#conversation');
+  elements.get('#prompt-input').value = 'Write main';
+  elements.get('#language-input').value = 'C++';
+  elements.get('#prompt-form').dispatch('submit');
+  assert.equal(elements.get('#conversation-empty').hidden, true);
+  assert.equal(conversation.children.length, 2);
+  assert.match(textOf(conversation.children[1]), /Thinking/);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const [user, reply] = conversation.children;
+  assert.match(textOf(user), /YOU · Generate · C\+\+/);
+  assert.match(textOf(user), /Write main/);
+  assert.equal(reply.dataset.state, 'done');
+  const thoughts = reply.children.find((child) => child.className === 'message-thoughts');
+  assert.ok(thoughts, 'thoughts are shown');
+  assert.match(textOf(thoughts), /Planning/);
+  assert.match(textOf(thoughts), /A <b>minimal<\/b> main is enough\./, 'thoughts stay plain text');
+  assert.match(textOf(reply), /Generated 1 line of C\+\+/);
+  assert.equal(reply.children.find((child) => child.className === 'message-code').textContent, 'int main() {}\n');
+  assert.equal(elements.get('#prompt-input').value, '', 'the prompt is cleared after a reply');
+
+  elements.get('#accept-proposal-button').dispatch('click');
+  assert.match(textOf(conversation.children.at(-1)), /accepted into the editor/);
+
+  elements.get('#clear-chat-button').dispatch('click');
+  assert.deepEqual(conversation.children, [elements.get('#conversation-empty')]);
+  assert.equal(elements.get('#conversation-empty').hidden, false);
+});
+
+test('a failed request is shown as an error reply in the chat', async () => {
+  const app = await createApp((path, body, fallback) => {
+    if (path === '/api/generate') {
+      return jsonResponse({ error: { code: 'GENERATION_FAILED', message: 'Code generation failed.' } }, 502);
+    }
+    return fallback(`http://127.0.0.1:8080${path}`, { method: body ? 'POST' : 'GET', body: body && JSON.stringify(body) });
+  });
+  const { elements } = app;
+  elements.get('#prompt-input').value = 'Write main';
+  elements.get('#language-input').value = 'C++';
+  elements.get('#prompt-form').dispatch('submit');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const reply = elements.get('#conversation').children.at(-1);
+  assert.equal(reply.dataset.state, 'error');
+  assert.match(textOf(reply), /GENERATION_FAILED/);
+  assert.equal(elements.get('#prompt-input').value, 'Write main', 'the prompt is kept for a retry');
+});
+
+test('Enter in the prompt sends it and Shift+Enter does not', async () => {
+  const { elements, requests } = await createApp();
+  elements.get('#prompt-input').value = 'Write main';
+  elements.get('#language-input').value = 'C++';
+  elements.get('#prompt-input').dispatch('keydown', { key: 'Enter', shiftKey: true });
+  assert.equal(requests.filter((request) => request.path === '/api/generate').length, 0);
+  elements.get('#prompt-input').dispatch('keydown', { key: 'Enter', shiftKey: false });
+  assert.equal(requests.filter((request) => request.path === '/api/generate').length, 1);
 });

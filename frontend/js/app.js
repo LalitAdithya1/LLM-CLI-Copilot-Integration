@@ -17,6 +17,7 @@ import {
 } from './api.js';
 import { createProposalWorkflow } from './proposalWorkflow.js';
 import { renderDiff } from './diffView.js';
+import { createChatTranscript } from './chatTranscript.js';
 
 const SAMPLE_ORIGINAL_CODE = `#include <iostream>
 
@@ -87,6 +88,9 @@ const REQUIRED_ELEMENTS = [
   '#save-document-as-button',
   '#reload-document-button',
   '#document-status',
+  '#conversation',
+  '#conversation-empty',
+  '#clear-chat-button',
 ];
 
 let appInitializationStarted = false;
@@ -153,6 +157,11 @@ function initializeApp() {
   const rejectProposalButton = document.querySelector('#reject-proposal-button');
   const saveFileButton = document.querySelector('#save-file-button');
   const saveFileName = document.querySelector('#save-file-name');
+  const clearChatButton = document.querySelector('#clear-chat-button');
+  const chat = createChatTranscript(
+    document.querySelector('#conversation'),
+    document.querySelector('#conversation-empty'),
+  );
   const submitButtons = [
     document.querySelector('#generate-submit-button'),
     document.querySelector('#generate-code-button'),
@@ -860,11 +869,13 @@ function initializeApp() {
       }
       output.decision = 'accepted';
       applyCodeToEditor(output.code);
+      chat.addNote('Generated code accepted into the editor · not saved', 'success');
       proposalReviewStatus.textContent = 'Accepted into the editor · not saved';
       proposalReviewAvailability.textContent = `The generated code replaced the editor contents of ${currentDocument.name}. Nothing was written to disk: edit it, then select Save (Ctrl+S) or Save As.`;
       renderStatus('Generated code accepted into the editor. It has not been saved.');
     } else {
       output.decision = 'rejected';
+      chat.addNote('Generated code rejected');
       proposalReviewStatus.textContent = 'Generated output rejected';
       proposalReviewAvailability.textContent = 'The generated code was discarded. The editor and files on disk are unchanged.';
       renderStatus('Generated code rejected. The editor is unchanged.');
@@ -894,6 +905,7 @@ function initializeApp() {
       return;
     }
     if (action === 'reject') {
+      chat.addNote('Proposal rejected');
       renderStatus('Proposal rejected by the backend. The editor and files on disk are unchanged.');
       return;
     }
@@ -906,6 +918,7 @@ function initializeApp() {
     }
     acceptedProposalId = proposal.id;
     applyCodeToEditor(current.proposal.proposedCode);
+    chat.addNote('Proposal accepted into the editor · not saved', 'success');
     renderStatus('Proposal accepted into the editor. It has not been saved: review or edit it, then Save (Ctrl+S) or Save As.');
     // Only now that the code is in the editor, let the backend release the
     // proposal. A failure here leaves the editor as is; the backend just keeps
@@ -954,6 +967,7 @@ function initializeApp() {
         result = await saveGeneratedCode({ fileName, content: output.code, overwriteConfirmed: true });
       }
       output.saved = true;
+      chat.addNote(`Generated code saved to ${result.savedPath}`, 'success');
       proposalReviewStatus.textContent = 'Generated code saved';
       proposalReviewAvailability.textContent = `The backend confirmed the saved file: ${result.savedPath}`;
       renderStatus(`The backend confirmed the save: ${result.savedPath}`);
@@ -1002,6 +1016,10 @@ function initializeApp() {
     }
 
     const requestMode = selectedMode;
+    chat.addUserMessage({ mode: requestMode, language, instruction });
+    const reply = chat.addPendingReply(requestMode === 'refactor'
+      ? 'Thinking about the refactoring…'
+      : 'Thinking about the code…');
     generatedOutput = null;
     proposalWorkflow.reset();
     setWorkflowInProgress(true, requestMode === 'refactor' ? 'Creating…' : 'Generating…');
@@ -1028,12 +1046,24 @@ function initializeApp() {
           editorRevision: `frontend-revision-${++editorRevisionSequence}`,
         });
         proposalWorkflow.setProposal(proposal);
+        reply.resolve({
+          text: `Proposed a refactoring (${describeLines(proposal.proposedCode)}). Review the diff below, then Accept or Reject it.`,
+          code: proposal.proposedCode,
+          thoughts: proposal.thoughts ?? '',
+        });
+        promptInput.value = '';
         renderStatus('Refactoring proposal is ready for review. It has not been approved or saved.');
       } else {
         const response = await generateCode({ instruction, language });
         proposalOriginalCode.textContent = originalSource;
         proposalProposedCode.textContent = response.generatedCode;
         generatedOutput = { code: response.generatedCode, saved: false, decision: null };
+        reply.resolve({
+          text: `Generated ${describeLines(response.generatedCode)} of ${response.language}. Accept it into the editor or Save output below.`,
+          code: response.generatedCode,
+          thoughts: response.thoughts ?? '',
+        });
+        promptInput.value = '';
         proposalReviewStatus.textContent = 'Generated output · not saved';
         proposalReviewAvailability.textContent = 'Accept puts the generated code into the editor for you to edit and Save. Save output instead writes it as-is to the output directory; existing files are replaced only after you confirm.';
         renderStatus('Generated code is displayed. It has not been saved.');
@@ -1054,12 +1084,18 @@ function initializeApp() {
       proposalReviewAvailability.textContent = requestMode === 'refactor'
         ? 'No confirmed proposal ID is available, so review decisions are disabled.'
         : 'Generation did not produce reviewable proposal state.';
+      reply.fail(message);
       promptFeedback.textContent = message;
       promptFeedback.hidden = false;
       renderStatus(message);
     } finally {
       setWorkflowInProgress(false);
     }
+  }
+
+  function describeLines(code) {
+    const lineCount = code.replace(/\n$/, '').split('\n').length;
+    return `${lineCount} line${lineCount === 1 ? '' : 's'}`;
   }
 
   function selectMode(selectedButton) {
@@ -1077,8 +1113,8 @@ function initializeApp() {
       button.textContent = selectedMode === 'refactor' ? 'Create proposal' : 'Generate code';
     });
     promptInput.placeholder = selectedMode === 'refactor'
-      ? 'Describe how to refactor the current code.'
-      : 'Describe the code to generate.';
+      ? 'Describe how to refactor the current code. Enter sends, Shift+Enter adds a line.'
+      : 'Describe the code to generate. Enter sends, Shift+Enter adds a line.';
   }
 
   modeButtons.forEach((button) => {
@@ -1152,6 +1188,17 @@ function initializeApp() {
   promptForm.addEventListener('submit', (event) => {
     event.preventDefault();
     void submitWorkflow();
+  });
+
+  promptInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      void submitWorkflow();
+    }
+  });
+
+  clearChatButton.addEventListener('click', () => {
+    chat.clear();
   });
 
   void refreshBackendInformation();

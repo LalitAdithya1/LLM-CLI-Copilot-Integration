@@ -232,22 +232,42 @@ bool LLMClient::generateContent(
     const std::string& prompt,
     std::string& response
 ) const {
-    return generateContentImpl(prompt, response, false);
+    return generateContentImpl(prompt, response, false, nullptr);
 }
 
 bool LLMClient::generateCompleteContent(
     const std::string& prompt,
     std::string& response
 ) const {
-    return generateContentImpl(prompt, response, true);
+    return generateContentImpl(prompt, response, true, nullptr);
+}
+
+bool LLMClient::generateContent(
+    const std::string& prompt,
+    std::string& response,
+    std::string& thoughts
+) const {
+    return generateContentImpl(prompt, response, false, &thoughts);
+}
+
+bool LLMClient::generateCompleteContent(
+    const std::string& prompt,
+    std::string& response,
+    std::string& thoughts
+) const {
+    return generateContentImpl(prompt, response, true, &thoughts);
 }
 
 bool LLMClient::generateContentImpl(
     const std::string& prompt,
     std::string& response,
-    bool requireExplicitCompletion
+    bool requireExplicitCompletion,
+    std::string* thoughts
 ) const {
     response.clear();
+    if (thoughts != nullptr) {
+        thoughts->clear();
+    }
 
     if (!isValidPrompt(prompt) || !transport_ || model_.empty()) {
         std::cerr
@@ -268,7 +288,7 @@ bool LLMClient::generateContentImpl(
 
     const std::string apiKey(apiKeyEnvironment);
 
-    const json requestBody = {
+    json requestBody = {
         {"contents", json::array({
             {
                 {"parts", json::array({
@@ -277,6 +297,11 @@ bool LLMClient::generateContentImpl(
             }
         })}
     };
+    if (thoughts != nullptr) {
+        requestBody["generationConfig"] = {
+            {"thinkingConfig", {{"includeThoughts", true}}}
+        };
+    }
 
     std::string responseBody;
     long httpStatus = 0;
@@ -325,5 +350,8 @@ bool LLMClient::generateContentImpl(
     }
 
     response = parsedResponse.generatedText;
+    if (thoughts != nullptr) {
+        *thoughts = parsedResponse.thoughts;
+    }
     return true;
 }

@@ -915,8 +915,9 @@ public:
             }
 
             std::string generatedCode;
+            std::string thoughts;
             try {
-                if (!generationHandler_(instruction, language, generatedCode) ||
+                if (!generationHandler_(instruction, language, generatedCode, thoughts) ||
                     isWhitespaceOnly(generatedCode)) {
                     setJsonError(
                         response,
@@ -940,7 +941,8 @@ public:
                 response.set_content(
                     Json{
                         {"generatedCode", generatedCode},
-                        {"language", language}
+                        {"language", language},
+                        {"thoughts", thoughts}
                     }.dump(),
                     kJsonContentType
                 );
@@ -1032,12 +1034,14 @@ public:
             if (!reserveProposalCapacity(reservation, response)) return;
 
             std::string proposedCode;
+            std::string thoughts;
             try {
                 if (!refactoringHandler_(
                         refactoringRequest.instruction,
                         refactoringRequest.language,
                         refactoringRequest.sourceCode,
-                        proposedCode) ||
+                        proposedCode,
+                        thoughts) ||
                     isWhitespaceOnly(proposedCode)) {
                     setJsonError(
                         response,
@@ -1082,7 +1086,8 @@ public:
                     {"status", "PENDING"},
                     {"originalCode", refactoringRequest.sourceCode},
                     {"proposedCode", proposedCode},
-                    {"baseEditorHash", baseEditorHash}
+                    {"baseEditorHash", baseEditorHash},
+                    {"thoughts", thoughts}
                 };
                 serializedResponse = result.dump();
                 std::map<std::string, PendingProposal> staged;

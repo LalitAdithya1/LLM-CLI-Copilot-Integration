@@ -141,9 +141,12 @@ Success response (`200`):
 ```json
 {
   "generatedCode": "#include <iostream>\\nint main() { return 0; }",
-  "language": "C++"
+  "language": "C++",
+  "thoughts": "The user wants a minimal program, so main can return 0."
 }
 ```
+
+`thoughts` is Gemini's thought summary for the request. It is an empty string when the model returned none. It is display text only and is never part of the code.
 
 Errors use the common JSON error object from Section 2. B6 returns:
 
@@ -190,9 +193,12 @@ Success response (`200`):
   "status": "PENDING",
   "originalCode": "void greet() {}",
   "proposedCode": "void greet() noexcept {}",
-  "baseEditorHash": "illustrative-hash"
+  "baseEditorHash": "illustrative-hash",
+  "thoughts": "greet cannot throw, so it can be marked noexcept."
 }
 ```
+
+`thoughts` has the same meaning as in the generation response.
 
 Examples are illustrative, not actual model output.
 

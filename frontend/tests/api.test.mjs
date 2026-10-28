@@ -199,3 +199,28 @@ test('generated-code save sends exactly the backend save fields', async () => {
     (error) => error.code === 'INVALID_REQUEST',
   );
 });
+
+test('generation and refactoring responses accept an optional thoughts string', async () => {
+  const respond = (payload) => createApiClient({ fetchImpl: async () => jsonResponse(payload) });
+  const generation = { generatedCode: 'int main() {}', language: 'C++' };
+  assert.deepEqual(await respond(generation).generateCode({ instruction: 'x', language: 'C++' }), generation);
+  assert.equal(
+    (await respond({ ...generation, thoughts: 'Plan' }).generateCode({ instruction: 'x', language: 'C++' })).thoughts,
+    'Plan',
+  );
+  await assert.rejects(
+    respond({ ...generation, thoughts: 7 }).generateCode({ instruction: 'x', language: 'C++' }),
+    (error) => error.code === 'INVALID_RESPONSE',
+  );
+  await assert.rejects(
+    respond({ ...generation, extra: '' }).generateCode({ instruction: 'x', language: 'C++' }),
+    (error) => error.code === 'INVALID_RESPONSE',
+  );
+
+  const proposal = {
+    proposalId: 'prop-1', status: 'PENDING', originalCode: 'a', proposedCode: 'b',
+    baseEditorHash: 'fnv1a64:0123456789abcdef', thoughts: 'Rename it.',
+  };
+  const request = { sourceCode: 'a', instruction: 'x', language: 'C++', editorRevision: 'r1' };
+  assert.equal((await respond(proposal).refactorCode(request)).thoughts, 'Rename it.');
+});

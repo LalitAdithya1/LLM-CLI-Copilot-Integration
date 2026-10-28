@@ -23,10 +23,13 @@ function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function expectFields(payload, fields, endpointName) {
+// optionalFields may be absent; no other fields are allowed.
+function expectFields(payload, fields, endpointName, optionalFields = []) {
   const hasExactFields = isObject(payload)
-    && Object.keys(payload).length === fields.length
-    && fields.every((field) => Object.hasOwn(payload, field));
+    && fields.every((field) => Object.hasOwn(payload, field))
+    && Object.keys(payload).every(
+      (field) => fields.includes(field) || optionalFields.includes(field),
+    );
 
   if (!hasExactFields) {
     throw new ApiError(
@@ -34,6 +37,10 @@ function expectFields(payload, fields, endpointName) {
       `The backend returned an invalid ${endpointName} response.`,
     );
   }
+}
+
+function isOptionalString(value) {
+  return value === undefined || typeof value === 'string';
 }
 
 function validateHealth(payload) {
@@ -68,8 +75,12 @@ function validateConfig(payload) {
 }
 
 function validateGeneration(payload) {
-  expectFields(payload, ['generatedCode', 'language'], 'generation');
-  if (typeof payload.generatedCode !== 'string' || typeof payload.language !== 'string') {
+  expectFields(payload, ['generatedCode', 'language'], 'generation', ['thoughts']);
+  if (
+    typeof payload.generatedCode !== 'string'
+    || typeof payload.language !== 'string'
+    || !isOptionalString(payload.thoughts)
+  ) {
     throw new ApiError(
       'INVALID_RESPONSE',
       'The backend returned an invalid generation response.',
@@ -83,6 +94,7 @@ function validateRefactor(payload, expectedSourceCode) {
     payload,
     ['proposalId', 'status', 'originalCode', 'proposedCode', 'baseEditorHash'],
     'refactoring proposal',
+    ['thoughts'],
   );
   if (
     typeof payload.proposalId !== 'string'
@@ -93,6 +105,7 @@ function validateRefactor(payload, expectedSourceCode) {
     || payload.proposedCode.trim().length === 0
     || typeof payload.baseEditorHash !== 'string'
     || !/^fnv1a64:[0-9a-f]{16}$/.test(payload.baseEditorHash)
+    || !isOptionalString(payload.thoughts)
   ) {
     throw new ApiError(
       'INVALID_RESPONSE',

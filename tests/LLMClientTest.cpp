@@ -6,6 +6,7 @@
 
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 using json = nlohmann::json;
 
@@ -430,4 +431,35 @@ TEST_F(LLMClientTest, SupportsCustomModel) {
 
     ASSERT_TRUE(client.generateContent("Generate code", response));
     EXPECT_FALSE(response.empty());
+}
+
+TEST_F(LLMClientTest, RequestsAndReturnsThoughtsOnlyWhenAsked) {
+    std::vector<json> requests;
+    LLMClient client(
+        [&requests](
+            const std::string&,
+            const std::string&,
+            const std::string& requestBody,
+            std::string& responseBody,
+            long& httpStatus
+        ) {
+            requests.push_back(json::parse(requestBody));
+            responseBody = R"({"candidates":[{"finishReason":"STOP","content":{"parts":[)"
+                           R"({"text":"Plan it.","thought":true},{"text":"int x;"}]}}]})";
+            httpStatus = 200;
+            return true;
+        }
+    );
+
+    std::string thoughts = "stale";
+    ASSERT_TRUE(client.generateCompleteContent("Declare x", response, thoughts));
+    EXPECT_EQ(response, "int x;");
+    EXPECT_EQ(thoughts, "Plan it.");
+
+    ASSERT_TRUE(client.generateContent("Declare x", response));
+    EXPECT_EQ(response, "int x;");
+
+    ASSERT_EQ(requests.size(), 2u);
+    EXPECT_EQ(requests[0]["generationConfig"]["thinkingConfig"]["includeThoughts"], true);
+    EXPECT_FALSE(requests[1].contains("generationConfig"));
 }

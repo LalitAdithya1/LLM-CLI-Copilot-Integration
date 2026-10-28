@@ -309,6 +309,7 @@ ParsedResponse ResponseParser::parseResponse(
     }
 
     std::string generatedText;
+    std::string thoughts;
 
     for (const auto& part : content["parts"]) {
         if (!part.is_object()) {
@@ -326,7 +327,11 @@ ParsedResponse ResponseParser::parseResponse(
                 );
             }
 
-            generatedText += part["text"].get<std::string>();
+            const bool isThought = part.contains("thought") &&
+                                   part["thought"].is_boolean() &&
+                                   part["thought"].get<bool>();
+            (isThought ? thoughts : generatedText) +=
+                part["text"].get<std::string>();
         }
     }
 
@@ -354,6 +359,7 @@ ParsedResponse ResponseParser::parseResponse(
 
     ParsedResponse response;
     response.generatedText = std::move(generatedText);
+    response.thoughts = std::move(thoughts);
     response.finishReason = std::move(finishReason);
     response.completionStatus = finishResult.status;
 

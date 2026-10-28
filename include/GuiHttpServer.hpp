@@ -10,17 +10,21 @@
 
 class GuiHttpServer {
 public:
+    // thoughts may be left empty; when set it is shown in the chat as the
+    // model's reasoning and is never treated as code.
     using GenerationHandler = std::function<bool(
         const std::string& instruction,
         const std::string& language,
-        std::string& generatedCode
+        std::string& generatedCode,
+        std::string& thoughts
     )>;
     // Return true only when refactoredCode contains a valid, complete result.
     using RefactoringHandler = std::function<bool(
         const std::string& instruction,
         const std::string& language,
         const std::string& sourceCode,
-        std::string& refactoredCode
+        std::string& refactoredCode,
+        std::string& thoughts
     )>;
 
     // A port of 0 asks the operating system to select an available port.
