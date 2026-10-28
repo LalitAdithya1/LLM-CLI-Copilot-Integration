@@ -370,3 +370,79 @@ ParsedResponse ResponseParser::parseResponse(
 
     return response;
 }
+
+namespace {
+
+bool matchesCharacters(const std::string& text, bool allowLowercase, bool allowDash) {
+    if (text.empty() || text.size() > 128) return false;
+    for (unsigned char ch : text) {
+        const bool allowed = std::isupper(ch) || std::isdigit(ch) || ch == '_' ||
+                             (allowLowercase && std::islower(ch)) ||
+                             (allowDash && ch == '-');
+        if (!allowed) return false;
+    }
+    return true;
+}
+
+bool isRetryDelay(const std::string& text) {
+    // Duration strings such as "30s" or "1.5s".
+    if (text.size() < 2 || text.size() > 16 || text.back() != 's') return false;
+    bool sawDigit = false;
+    bool sawPoint = false;
+    for (std::size_t i = 0; i + 1 < text.size(); ++i) {
+        const unsigned char ch = static_cast<unsigned char>(text[i]);
+        if (std::isdigit(ch)) {
+            sawDigit = true;
+        } else if (ch == '.' && !sawPoint && sawDigit) {
+            sawPoint = true;
+        } else {
+            return false;
+        }
+    }
+    return sawDigit;
+}
+
+std::string stringField(const json& object, const char* name) {
+    const auto field = object.find(name);
+    return field != object.end() && field->is_string() ? field->get<std::string>() : "";
+}
+
+} // namespace
+
+std::optional<ProviderErrorDetails> ResponseParser::parseProviderError(
+    const std::string& responseBody
+) const {
+    const json result = json::parse(responseBody, nullptr, false);
+    if (result.is_discarded() || !result.is_object()) return std::nullopt;
+    const auto error = result.find("error");
+    if (error == result.end() || !error->is_object()) return std::nullopt;
+
+    ProviderErrorDetails details;
+    const auto code = error->find("code");
+    if (code != error->end() && code->is_number_integer()) details.code = code->get<long>();
+    const std::string status = stringField(*error, "status");
+    if (matchesCharacters(status, false, false)) details.status = status;
+
+    const auto entries = error->find("details");
+    if (entries == error->end() || !entries->is_array()) return details;
+    for (const json& entry : *entries) {
+        if (!entry.is_object()) continue;
+        const std::string type = stringField(entry, "@type");
+        if (type == "type.googleapis.com/google.rpc.ErrorInfo") {
+            const std::string reason = stringField(entry, "reason");
+            if (matchesCharacters(reason, false, false)) details.reason = reason;
+        } else if (type == "type.googleapis.com/google.rpc.QuotaFailure") {
+            const auto violations = entry.find("violations");
+            if (violations == entry.end() || !violations->is_array()) continue;
+            for (const json& violation : *violations) {
+                if (!violation.is_object()) continue;
+                const std::string quotaId = stringField(violation, "quotaId");
+                if (matchesCharacters(quotaId, true, true)) details.quotaIds.push_back(quotaId);
+            }
+        } else if (type == "type.googleapis.com/google.rpc.RetryInfo") {
+            const std::string delay = stringField(entry, "retryDelay");
+            if (isRetryDelay(delay)) details.retryDelay = delay;
+        }
+    }
+    return details;
+}

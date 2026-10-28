@@ -1,6 +1,8 @@
 
 #include "EnvLoader.hpp"
 
+#include "CodeAgentError.hpp"
+
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
@@ -67,4 +69,12 @@ bool loadEnvFile(const std::string& filePath) {
     }
 
     return true;
+}
+
+std::string requireEnvironmentVariable(const std::string& name) {
+    const char* value = std::getenv(name.c_str());
+    if (value == nullptr || trim(value).empty()) {
+        throw ConfigurationError::missingSetting(name);
+    }
+    return value;
 }

@@ -1,6 +1,8 @@
 #include "GuiHttpServer.hpp"
+#include "CodeAgentError.hpp"
 #include "UnifiedDiff.hpp"
 
+#include <iostream>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -155,6 +157,14 @@ void setJsonError(
     );
 }
 
+// Reports a CodeAgentError through its virtual code() and httpStatus(), so
+// one handler covers every error type. The safe message goes to the browser;
+// the sanitized diagnostic only to the terminal.
+void respondWithError(httplib::Response& response, const CodeAgentError& error) {
+    logError(std::cerr, error);
+    setJsonError(response, error.httpStatus(), error.code(), error.what());
+}
+
 bool hasSingleHeader(const httplib::Request& request, const std::string& name,
                      std::string& value) {
     auto range = request.headers.equal_range(name);
@@ -252,8 +262,10 @@ bool validSaveFileName(const std::string& name) {
     return std::find(extensions.begin(), extensions.end(), std::filesystem::path(name).extension().string()) != extensions.end();
 }
 
-bool writeFileSafely(const std::filesystem::path& target, const std::string& content,
-                     bool overwrite, std::error_code& error) {
+// Writes through a temporary file and an atomic rename. The system calls
+// report failures as error codes; writeFileSafely turns them into exceptions.
+bool tryWriteFileAtomically(const std::filesystem::path& target, const std::string& content,
+                            bool overwrite, std::error_code& error) {
     error.clear();
     std::error_code statusError;
     const auto status = std::filesystem::symlink_status(target, statusError);
@@ -316,6 +328,17 @@ bool writeFileSafely(const std::filesystem::path& target, const std::string& con
     }
     if (error) { std::error_code ignored; std::filesystem::remove(temp, ignored); return false; }
     return true;
+}
+
+// Throws FilePermissionError, FileNotFoundError, or FileError when the file
+// cannot be written. errorCode() is std::errc::file_exists when the target
+// appeared although overwrite is false.
+void writeFileSafely(const std::filesystem::path& target, const std::string& content,
+                     bool overwrite) {
+    std::error_code error;
+    if (!tryWriteFileAtomically(target, content, overwrite, error)) {
+        throwFileSystemError(FileOperation::Write, target, error);
+    }
 }
 
 bool parseGenerationRequest(
@@ -592,45 +615,80 @@ enum class ReadResult { Ok, Failed, TooLarge };
 // reading, so a file that grows after an earlier size check cannot make the
 // read unbounded, and a path swapped for a FIFO or device is refused without
 // blocking.
+#ifndef _WIN32
+// Owns a POSIX file descriptor and closes it when it goes out of scope, also
+// when reading throws (for example std::bad_alloc while appending).
+class FileDescriptor {
+public:
+    explicit FileDescriptor(int fd) noexcept : fd_(fd) {}
+    ~FileDescriptor() {
+        if (fd_ >= 0) ::close(fd_);
+    }
+    FileDescriptor(const FileDescriptor&) = delete;
+    FileDescriptor& operator=(const FileDescriptor&) = delete;
+
+    int get() const noexcept { return fd_; }
+    bool valid() const noexcept { return fd_ >= 0; }
+
+private:
+    int fd_;
+};
+#endif
+
+// Reads at most maximumBytes from a regular file. The size is enforced while
+// reading, so a file that grows after an earlier size check cannot make the
+// read unbounded, and a path swapped for a FIFO or device is refused without
+// blocking. On Failed, error (when given) holds the operating-system cause.
 ReadResult readRegularFile(const std::filesystem::path& path, std::uintmax_t maximumBytes,
-                           std::string& content) {
+                           std::string& content, std::error_code* error = nullptr) {
     content.clear();
+    std::error_code ignored;
+    std::error_code& failure = error != nullptr ? *error : ignored;
+    failure.clear();
 #ifdef _WIN32
     std::ifstream input(path, std::ios::binary);
-    if (!input) return ReadResult::Failed;
+    if (!input) {
+        failure = std::make_error_code(std::errc::permission_denied);
+        return ReadResult::Failed;
+    }
     char buffer[64 * 1024];
     while (input) {
         input.read(buffer, sizeof buffer);
         content.append(buffer, static_cast<std::size_t>(input.gcount()));
         if (content.size() > maximumBytes) return ReadResult::TooLarge;
     }
-    return input.bad() ? ReadResult::Failed : ReadResult::Ok;
+    if (input.bad()) {
+        failure = std::make_error_code(std::errc::io_error);
+        return ReadResult::Failed;
+    }
+    return ReadResult::Ok;
 #else
-    const int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) return ReadResult::Failed;
+    const FileDescriptor fd(::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC));
+    if (!fd.valid()) {
+        failure = std::error_code(errno, std::generic_category());
+        return ReadResult::Failed;
+    }
     struct stat info {};
-    if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode)) {
-        ::close(fd);
+    if (::fstat(fd.get(), &info) != 0) {
+        failure = std::error_code(errno, std::generic_category());
+        return ReadResult::Failed;
+    }
+    if (!S_ISREG(info.st_mode)) {
+        failure = std::make_error_code(std::errc::invalid_argument);
         return ReadResult::Failed;
     }
     char buffer[64 * 1024];
-    ReadResult result = ReadResult::Ok;
     for (;;) {
-        const auto count = ::read(fd, buffer, sizeof buffer);
+        const auto count = ::read(fd.get(), buffer, sizeof buffer);
         if (count < 0) {
             if (errno == EINTR) continue;
-            result = ReadResult::Failed;
-            break;
+            failure = std::error_code(errno, std::generic_category());
+            return ReadResult::Failed;
         }
-        if (count == 0) break;
+        if (count == 0) return ReadResult::Ok;
         content.append(buffer, static_cast<std::size_t>(count));
-        if (content.size() > maximumBytes) {
-            result = ReadResult::TooLarge;
-            break;
-        }
+        if (content.size() > maximumBytes) return ReadResult::TooLarge;
     }
-    ::close(fd);
-    return result;
 #endif
 }
 
@@ -785,6 +843,7 @@ public:
             try {
                 result = dialogProvider_->choose(NativeDialogKind::SourceFile);
             } catch (...) {
+                logUnexpectedException(std::cerr, "the native file dialog");
                 setDialogError(response, NativeDialogStatus::Failed, "Native file dialog failed.");
                 return;
             }
@@ -855,13 +914,19 @@ public:
                 return;
             }
             std::string content;
-            const ReadResult read = readRegularFile(canonicalPath, kMaximumEditorFileBytes, content);
-            if (read == ReadResult::TooLarge) {
-                setJsonError(response, 413, "FILE_TOO_LARGE", "Source files larger than 512 KiB cannot be opened in the editor.");
-                return;
-            }
-            if (read != ReadResult::Ok) {
-                setJsonError(response, 403, "READ_FAILED", "The file could not be read; check its permissions.");
+            try {
+                std::error_code readError;
+                const ReadResult read =
+                    readRegularFile(canonicalPath, kMaximumEditorFileBytes, content, &readError);
+                if (read == ReadResult::TooLarge) {
+                    setJsonError(response, 413, "FILE_TOO_LARGE", "Source files larger than 512 KiB cannot be opened in the editor.");
+                    return;
+                }
+                if (read != ReadResult::Ok) {
+                    throwFileSystemError(FileOperation::Read, canonicalPath, readError);
+                }
+            } catch (const FileError& error) {
+                respondWithError(response, error);
                 return;
             }
             std::string serializedResponse;
@@ -935,19 +1000,15 @@ public:
             const bool unchanged = exists &&
                 readRegularFile(target, kMaximumEditorFileBytes, current) == ReadResult::Ok &&
                 hashEditorContent(current) == baseRevision;
-            if (!unchanged && !overwriteConfirmed) {
-                setJsonError(response, 409, "FILE_CHANGED_ON_DISK", exists
-                    ? "The file changed on disk since it was opened, for example in another editor. Reload it, or confirm to overwrite it."
-                    : "The file no longer exists on disk. Confirm to create it again.");
-                return;
-            }
-            if (!writeFileSafely(target, content, true, error)) {
-                const bool denied = error == std::errc::permission_denied ||
-                                    error == std::errc::operation_not_permitted ||
-                                    error == std::errc::read_only_file_system;
-                setJsonError(response, denied ? 403 : 500,
-                    denied ? "PERMISSION_DENIED" : "SAVE_FAILED",
-                    denied ? "Permission denied while writing the file." : "File could not be saved.");
+            try {
+                if (!unchanged && !overwriteConfirmed) {
+                    throw FileConflictError(target, exists);
+                }
+                writeFileSafely(target, content, true);
+            } catch (const FileError& error) {
+                // FileConflictError (409), FilePermissionError (403),
+                // FileNotFoundError (404), or another FileError (500).
+                respondWithError(response, error);
                 return;
             }
             rememberOpenedDocument(path);
@@ -996,6 +1057,7 @@ public:
                 try {
                     result = dialogProvider_->choose(NativeDialogKind::OutputDirectory);
                 } catch (...) {
+                    logUnexpectedException(std::cerr, "the native directory dialog");
                     setDialogError(response, NativeDialogStatus::Failed, "Native directory dialog failed.");
                     return;
                 }
@@ -1077,7 +1139,11 @@ public:
                     );
                     return;
                 }
+            } catch (const CodeAgentError& error) {
+                respondWithError(response, error);
+                return;
             } catch (...) {
+                logUnexpectedException(std::cerr, "code generation");
                 setJsonError(
                     response,
                     502,
@@ -1097,6 +1163,7 @@ public:
                     kJsonContentType
                 );
             } catch (...) {
+                logUnexpectedException(std::cerr, "serializing generated code");
                 setJsonError(
                     response,
                     502,
@@ -1145,11 +1212,16 @@ public:
                 setJsonError(response, 422, "INVALID_TARGET", "Target must be a regular file and cannot be a symbolic link."); return;
             }
             if (exists && !save.overwriteConfirmed) { setJsonError(response, 409, "OVERWRITE_CONFIRMATION_REQUIRED", "Set overwriteConfirmed to true to replace the existing file."); return; }
-            if (!writeFileSafely(target, code, save.overwriteConfirmed, error)) {
-                const bool confirmation = error == std::errc::file_exists;
-                setJsonError(response, confirmation ? 409 : 500,
-                    confirmation ? "OVERWRITE_CONFIRMATION_REQUIRED" : "SAVE_FAILED",
-                    confirmation ? "Set overwriteConfirmed to true to replace the existing file." : "File could not be saved."); return;
+            try {
+                writeFileSafely(target, code, save.overwriteConfirmed);
+            } catch (const FileError& failure) {
+                // The file appeared after the existence check above.
+                if (failure.errorCode() == std::errc::file_exists) {
+                    setJsonError(response, 409, "OVERWRITE_CONFIRMATION_REQUIRED", "Set overwriteConfirmed to true to replace the existing file.");
+                } else {
+                    respondWithError(response, failure);
+                }
+                return;
             }
             if (save.proposal) proposals_.at(save.proposalId).status = ProposalStatus::Applied;
             response.set_content(Json{{"savedPath", target.string()}, {"status", "SAVED"}}.dump(), kJsonContentType);
@@ -1204,7 +1276,11 @@ public:
                     );
                     return;
                 }
+            } catch (const CodeAgentError& error) {
+                respondWithError(response, error);
+                return;
             } catch (...) {
+                logUnexpectedException(std::cerr, "code refactoring");
                 setJsonError(
                     response,
                     502,
@@ -1284,6 +1360,7 @@ public:
                 }
                 ++nextProposalId_;
             } catch (...) {
+                logUnexpectedException(std::cerr, "storing a refactoring proposal");
                 setJsonError(
                     response,
                     502,
@@ -1337,6 +1414,7 @@ public:
                     kJsonContentType
                 );
             } catch (...) {
+                logUnexpectedException(std::cerr, "diff generation");
                 setJsonError(
                     response,
                     500,
@@ -1408,6 +1486,7 @@ public:
                             {"status", statusText}
                         }.dump();
                     } catch (...) {
+                        logUnexpectedException(std::cerr, "updating proposal state");
                         setJsonError(
                             response,
                             500,
@@ -1520,9 +1599,22 @@ public:
                 setJsonError(response, response.status, "INVALID_HTTP_REQUEST", "The API request could not be processed.");
             }
         });
+        // Last line of defence for exceptions that escape a route handler: the
+        // server keeps running, and the request gets a JSON error.
         server_.set_exception_handler([](const httplib::Request& request,
                                          httplib::Response& response,
-                                         std::exception_ptr) {
+                                         std::exception_ptr exception) {
+            try {
+                if (exception) std::rethrow_exception(exception);
+            } catch (const CodeAgentError& error) {
+                if (isApiPath(request.path)) {
+                    respondWithError(response, error);
+                    return;
+                }
+                logError(std::cerr, error);
+            } catch (...) {
+                logUnexpectedException(std::cerr, "an API request");
+            }
             if (isApiPath(request.path)) {
                 setJsonError(response, 500, "INTERNAL_ERROR", "The API request could not be completed.");
             }

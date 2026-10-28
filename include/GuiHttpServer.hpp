@@ -13,6 +13,11 @@ class GuiHttpServer {
 public:
     // thoughts may be left empty; when set it is shown in the chat as the
     // model's reasoning and is never treated as code.
+    //
+    // Both handlers may throw CodeAgentError (see CodeAgentError.hpp): the
+    // server answers with its httpStatus(), code(), and what(), so the user
+    // learns why the request failed. Any other exception is logged and
+    // reported as a generic failure without its message.
     using GenerationHandler = std::function<bool(
         const std::string& instruction,
         const std::string& language,

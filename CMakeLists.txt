@@ -51,6 +51,16 @@ enable_testing()
 # --------------------------------------------------
 # GUI HTTP server component
 # --------------------------------------------------
+# Exception hierarchy shared by the CLI, the LLM client, and the GUI server.
+add_library(CodeAgentError
+    src/CodeAgentError.cpp
+)
+
+target_include_directories(CodeAgentError
+    PUBLIC
+        ${PROJECT_SOURCE_DIR}/include
+)
+
 add_library(UnifiedDiff
     src/UnifiedDiff.cpp
 )
@@ -75,6 +85,7 @@ target_link_libraries(GuiHttpServer
         httplib::httplib
         nlohmann_json::nlohmann_json
         UnifiedDiff
+        CodeAgentError
 )
 
 # --------------------------------------------------
@@ -169,6 +180,7 @@ target_include_directories(LLMClientTest
 target_link_libraries(LLMClientTest
     PRIVATE
         GTest::gtest_main
+        CodeAgentError
         CURL::libcurl
         nlohmann_json::nlohmann_json
 )
@@ -239,6 +251,7 @@ target_include_directories(EnvLoaderTest
 target_link_libraries(EnvLoaderTest
     PRIVATE
         GTest::gtest_main
+        CodeAgentError
 )
 
 # --------------------------------------------------
@@ -268,6 +281,19 @@ target_link_libraries(CLIControllerTest
 )
 
 # --------------------------------------------------
+# Exception hierarchy tests
+# --------------------------------------------------
+add_executable(CodeAgentErrorTest
+    tests/CodeAgentErrorTest.cpp
+)
+
+target_link_libraries(CodeAgentErrorTest
+    PRIVATE
+        GTest::gtest_main
+        CodeAgentError
+)
+
+# --------------------------------------------------
 # Test discovery
 # --------------------------------------------------
 include(GoogleTest)
@@ -280,6 +306,7 @@ gtest_discover_tests(UnifiedDiffTest)
 gtest_discover_tests(EnvLoaderTest)
 gtest_discover_tests(CLIControllerTest)
 gtest_discover_tests(GuiHttpServerTest)
+gtest_discover_tests(CodeAgentErrorTest)
 
 # --------------------------------------------------
 # Compiler warnings

@@ -173,7 +173,16 @@ Errors use the common JSON error object from Section 2. B6 returns:
 | `400` | `INVALID_LANGUAGE` | `language` is empty or whitespace-only. |
 | `413` | `PAYLOAD_TOO_LARGE` | The request body exceeds 1 MiB. |
 | `415` | `UNSUPPORTED_MEDIA_TYPE` | The request content type is not `application/json`. |
-| `502` | `GENERATION_FAILED` | Prompt generation or the provider call failed. |
+| `429` | `PROVIDER_RATE_LIMITED` | Gemini rate-limited the request (HTTP 429 / `RESOURCE_EXHAUSTED` without a daily-quota violation). The message includes Gemini's suggested retry delay when it sends one. |
+| `429` | `PROVIDER_QUOTA_EXHAUSTED` | Gemini's `QuotaFailure` details name a per-day quota. |
+| `502` | `PROVIDER_AUTH_FAILED` | Gemini rejected the API key (HTTP 401/403, or 400 with reason `API_KEY_INVALID`). |
+| `502` | `PROVIDER_UNREACHABLE` | The request did not reach Gemini (DNS, connection, or TLS failure). |
+| `502` | `PROVIDER_RESPONSE_INVALID` / `PROVIDER_RESPONSE_BLOCKED` / `PROVIDER_RESPONSE_INCOMPLETE` | Gemini answered, but the response was malformed, blocked for safety or policy reasons, or incomplete. |
+| `502` | `PROVIDER_ERROR` | Gemini rejected the request for another reason, such as an unknown model. |
+| `503` | `CONFIGURATION_ERROR` | `GEMINI_API_KEY` is not configured. |
+| `503` | `PROVIDER_UNAVAILABLE` | Gemini answered with a 5xx status. |
+| `504` | `PROVIDER_TIMEOUT` | The request to Gemini timed out. |
+| `502` | `GENERATION_FAILED` | Prompt building failed, the handler returned no code, or it threw an exception that is not a `CodeAgentError`. |
 | `503` | `GENERATION_UNAVAILABLE` | No generation handler is configured. |
 
 For example, an invalid instruction returns HTTP `400`:
@@ -239,11 +248,12 @@ Errors use the common JSON error object from Section 2:
 | `400` | `INVALID_EDITOR_REVISION` | `editorRevision` is empty or whitespace-only. |
 | `413` | `PAYLOAD_TOO_LARGE` | The request body exceeds 1 MiB. |
 | `415` | `UNSUPPORTED_MEDIA_TYPE` | The request content type is not `application/json`. |
-| `502` | `REFACTOR_FAILED` | The handler failed, threw, returned empty output, or the result could not be serialized. No proposal is created. |
+| `429`–`504` | `PROVIDER_*`, `CONFIGURATION_ERROR` | The same provider and configuration errors as `/api/generate`. No proposal is created. |
+| `502` | `REFACTOR_FAILED` | The handler returned no code, threw an exception that is not a `CodeAgentError`, or the result could not be serialized. No proposal is created. |
 | `503` | `REFACTOR_UNAVAILABLE` | No refactoring handler is configured. |
 | `503` | `PROPOSAL_CAPACITY` | No unreserved free slot or terminal proposal is available; the provider is not invoked. |
 
-The production handler builds the prompt with `PromptBuilder` and calls `LLMClient::generateCompleteContent()`, which validates the provider response through `ResponseParser`. Blocked, incomplete, malformed, empty, or failed provider responses therefore produce `REFACTOR_FAILED`; exception details and provider response text are not returned to the HTTP client.
+The production handler builds the prompt with `PromptBuilder` and calls `LLMClient::generate()` with explicit completion required; the provider response is validated through `ResponseParser`. Failures are thrown as `CodeAgentError` subclasses (see `include/CodeAgentError.hpp`), and the server answers with the exception's status, code, and safe message. Diagnostics go only to the terminal, redacted; provider response text, API keys, and the messages of other exceptions are never returned to the HTTP client.
 
 ### B8: Diff and proposal review
 
@@ -348,11 +358,11 @@ Request: exactly `{"path": "<absolute or Windows path>"}`. The path is translate
 {"path":"/canonical/path/insertion_sort.cpp","content":"...","revision":"fnv1a64:0123456789abcdef"}
 ```
 
-The canonical path is remembered for this server session as an in-place save target. Errors: `400 INVALID_REQUEST`/`INVALID_JSON`, `413 FILE_TOO_LARGE`, `403 READ_FAILED`, `422 INVALID_SOURCE_FILE`, `422 UNSUPPORTED_ENCODING`.
+The canonical path is remembered for this server session as an in-place save target. Errors: `400 INVALID_REQUEST`/`INVALID_JSON`, `413 FILE_TOO_LARGE`, `403 PERMISSION_DENIED` (no read permission), `500 READ_FAILED` (other read failures), `422 INVALID_SOURCE_FILE`, `422 UNSUPPORTED_ENCODING`.
 
 #### `POST /api/files/write`
 
-Request: exactly `{"path": string, "content": string, "baseRevision": string, "overwriteConfirmed": boolean}`. `path` must be a canonical path previously returned by `/api/files/read` in this session; any other path is refused with `403 FILE_NOT_OPENED`. If the file on disk no longer matches `baseRevision` (it was edited elsewhere or deleted) and `overwriteConfirmed` is false, the response is `409 FILE_CHANGED_ON_DISK` and nothing is written. The write is atomic, preserves the file's read/write/execute permission bits (setuid, setgid, and sticky bits are cleared), and refuses symlinks and non-regular files (`422 INVALID_TARGET`). The server can save in place to the 256 most recently opened or saved files; beyond that the least recently used path is forgotten and returns `403 FILE_NOT_OPENED` until it is opened again. Reads enforce the 512 KiB limit while reading and refuse FIFOs and devices without blocking. Permission failures return `403 PERMISSION_DENIED`. Success returns HTTP `200`:
+Request: exactly `{"path": string, "content": string, "baseRevision": string, "overwriteConfirmed": boolean}`. `path` must be a canonical path previously returned by `/api/files/read` in this session; any other path is refused with `403 FILE_NOT_OPENED`. If the file on disk no longer matches `baseRevision` (it was edited elsewhere or deleted) and `overwriteConfirmed` is false, the response is `409 FILE_CHANGED_ON_DISK` and nothing is written. The write is atomic, preserves the file's read/write/execute permission bits (setuid, setgid, and sticky bits are cleared), and refuses symlinks and non-regular files (`422 INVALID_TARGET`). The server can save in place to the 256 most recently opened or saved files; beyond that the least recently used path is forgotten and returns `403 FILE_NOT_OPENED` until it is opened again. Reads enforce the 512 KiB limit while reading and refuse FIFOs and devices without blocking. Permission failures return `403 PERMISSION_DENIED`, a missing folder `404 FILE_NOT_FOUND`, and other write failures `500 SAVE_FAILED`. Success returns HTTP `200`:
 
 ```json
 {"savedPath":"/canonical/path/insertion_sort.cpp","status":"SAVED","revision":"fnv1a64:fedcba9876543210"}

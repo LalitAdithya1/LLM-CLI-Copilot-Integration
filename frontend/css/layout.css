@@ -34,7 +34,7 @@
   contain: size;
   overflow-y: auto;
   overscroll-behavior: contain;
-  scrollbar-color: #45434f var(--color-panel);
+  scrollbar-color: var(--color-scrollbar) var(--color-surface-sunken);
   scrollbar-width: thin;
 }
 

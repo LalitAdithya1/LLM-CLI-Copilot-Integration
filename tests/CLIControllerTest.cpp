@@ -1,4 +1,5 @@
 #include "CLIController.hpp"
+#include "CodeAgentError.hpp"
 #include "GuiHttpServer.hpp"
 #include "LLMClient.hpp"
 
@@ -10,6 +11,7 @@
 #include <fstream>
 #include <iterator>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -408,6 +410,99 @@ TEST_F(CLIControllerTest, GuiCommandRejectsExtraArguments) {
     EXPECT_EQ(controller.run(static_cast<int>(argv.size()), argv.data()), 1);
     EXPECT_FALSE(commandCalled);
     EXPECT_NE(error.str().find("does not accept arguments"), std::string::npos);
+}
+
+// --------------------------------------------------------------------------
+// Application-level error boundary
+// --------------------------------------------------------------------------
+
+int runWithArguments(CLIController& controller, std::vector<std::string> arguments) {
+    std::vector<char*> argv;
+    for (std::string& argument : arguments) {
+        argv.push_back(argument.data());
+    }
+    return controller.run(static_cast<int>(argv.size()), argv.data());
+}
+
+TEST_F(CLIControllerTest, ProviderExceptionsAreReportedWithTheirActionableMessage) {
+    const std::string original = "int value() { return 1; }\n";
+    std::ofstream("source.cpp", std::ios::binary) << original;
+    std::istringstream input("y\n");
+    std::ostringstream output;
+    std::ostringstream error;
+    CLIController controller(
+        [](const std::string&, std::string&, bool) -> bool {
+            throw RateLimitError(false, std::nullopt, "Gemini HTTP 429; provider error");
+        },
+        input, output, error);
+
+    EXPECT_EQ(runWithArguments(controller, {"codeagent", "refactor", "source.cpp", "improve it"}), 1);
+    EXPECT_NE(error.str().find("Request rate limited. Wait briefly before retrying."),
+              std::string::npos);
+    EXPECT_NE(error.str().find("Details: Gemini HTTP 429"), std::string::npos);
+    EXPECT_EQ(output.str().find("Apply these changes?"), std::string::npos);
+    EXPECT_EQ(readFile("source.cpp"), original);
+}
+
+TEST_F(CLIControllerTest, MissingApiKeyIsReportedAsAConfigurationError) {
+    const char* existing = std::getenv("GEMINI_API_KEY");
+    const std::string previous = existing != nullptr ? existing : "";
+    unsetenv("GEMINI_API_KEY");
+    std::istringstream input;
+    std::ostringstream output;
+    std::ostringstream error;
+    // The default LLM call uses the real client, which fails before any
+    // network request because the key is missing.
+    CLIController controller(
+        [](const std::string& prompt, std::string& response, bool) {
+            response = LLMClient([](const std::string&, const std::string&, const std::string&,
+                                    std::string&, long&) -> bool {
+                ADD_FAILURE() << "no request may be sent without a key";
+                return false;
+            }).generate(prompt, {}).text;
+            return true;
+        },
+        input, output, error);
+
+    EXPECT_EQ(runWithArguments(controller, {"codeagent", "generate", "write main"}), 1);
+    EXPECT_NE(error.str().find(
+        "Configuration error: GEMINI_API_KEY is not configured. Set it in your environment or .env file."),
+        std::string::npos);
+    if (existing != nullptr) setenv("GEMINI_API_KEY", previous.c_str(), 1);
+}
+
+TEST_F(CLIControllerTest, UnexpectedExceptionsEndTheCommandInsteadOfTheProgram) {
+    std::istringstream input;
+    std::ostringstream output;
+    std::ostringstream error;
+    CLIController controller(
+        [](const std::string&, std::string&, bool) -> bool {
+            throw std::runtime_error("internal invariant broken");
+        },
+        input, output, error);
+
+    EXPECT_EQ(runWithArguments(controller, {"codeagent", "generate", "write main"}), 1);
+    EXPECT_NE(error.str().find("An unexpected internal error occurred (internal invariant broken)"),
+              std::string::npos);
+}
+
+TEST_F(CLIControllerTest, InvalidGuiPortIsAConfigurationError) {
+    setenv("CODEAGENT_GUI_PORT", "99999", 1);
+    std::istringstream input;
+    std::ostringstream output;
+    std::ostringstream error;
+    // No GUI command is injected, so the real one runs and rejects the port
+    // before starting a server.
+    CLIController controller(
+        [](const std::string&, std::string&, bool) { return false; },
+        input, output, error);
+
+    EXPECT_EQ(runWithArguments(controller, {"codeagent", "gui"}), 1);
+    unsetenv("CODEAGENT_GUI_PORT");
+    EXPECT_NE(error.str().find(
+        "Configuration error: CODEAGENT_GUI_PORT must be a port number from 1 to 65535."),
+        std::string::npos);
+    EXPECT_EQ(output.str().find("GUI running"), std::string::npos);
 }
 
 } // namespace

@@ -1,4 +1,3 @@
-
 #include "LLMClient.hpp"
 
 #include <curl/curl.h>
@@ -6,12 +5,15 @@
 
 #include <cctype>
 #include <cstddef>
-#include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <mutex>
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
+#include "CodeAgentError.hpp"
 #include "EnvLoader.hpp"
 #include "ResponseParser.hpp"
 
@@ -25,14 +27,22 @@ struct ProviderResponseBuffer {
     bool exceededLimit = false;
 };
 
-bool isWhitespaceOnly(const std::string& text) {
-    for (unsigned char ch : text) {
-        if (!std::isspace(ch)) {
-            return false;
-        }
-    }
+// RAII owners for libcurl handles: they are released on every path out of
+// performHttpRequest, including the exceptions it throws.
+struct CurlEasyDeleter {
+    void operator()(CURL* handle) const noexcept { curl_easy_cleanup(handle); }
+};
+struct CurlHeaderListDeleter {
+    void operator()(curl_slist* list) const noexcept { curl_slist_free_all(list); }
+};
+using CurlHandle = std::unique_ptr<CURL, CurlEasyDeleter>;
+using CurlHeaderList = std::unique_ptr<curl_slist, CurlHeaderListDeleter>;
 
-    return true;
+void appendHeader(CurlHeaderList& headers, const std::string& header) {
+    curl_slist* updated = curl_slist_append(headers.get(), header.c_str());
+    if (updated == nullptr) throw std::bad_alloc();
+    // The list head only changes when the list was empty.
+    if (!headers) headers.reset(updated);
 }
 
 size_t writeResponse(
@@ -53,6 +63,17 @@ size_t writeResponse(
     return totalBytes;
 }
 
+[[noreturn]] void throwTransportError(CURLcode result) {
+    const std::string diagnostic =
+        std::string("libcurl error ") + std::to_string(static_cast<int>(result)) +
+        ": " + curl_easy_strerror(result);
+    if (result == CURLE_OPERATION_TIMEDOUT) throw TimeoutError(diagnostic);
+    throw NetworkError(diagnostic);
+}
+
+// Throws NetworkError, TimeoutError, or ProviderResponseError when no usable
+// HTTP response arrives. The API key is only placed in a request header and
+// never appears in an exception.
 bool performHttpRequest(
     const std::string& url,
     const std::string& apiKey,
@@ -68,92 +89,54 @@ bool performHttpRequest(
     });
 
     if (curlInitResult != CURLE_OK) {
-        std::cerr << "Error: Failed to initialize libcurl.\n";
-        return false;
+        throw NetworkError("libcurl global initialization failed");
     }
 
-    CURL* curl = curl_easy_init();
-
-    if (curl == nullptr) {
-        std::cerr << "Error: Failed to create HTTP request.\n";
-        return false;
+    const CurlHandle curl(curl_easy_init());
+    if (!curl) {
+        throw NetworkError("libcurl could not create a request handle");
     }
 
-    struct curl_slist* headers = nullptr;
-
-    headers = curl_slist_append(
-        headers,
-        "Content-Type: application/json"
-    );
-
-    if (headers == nullptr) {
-        std::cerr << "Error: Failed to create HTTP headers.\n";
-        curl_easy_cleanup(curl);
-        return false;
-    }
-
-    const std::string apiKeyHeader = "x-goog-api-key: " + apiKey;
-
-    struct curl_slist* updatedHeaders = curl_slist_append(
-        headers,
-        apiKeyHeader.c_str()
-    );
-
-    if (updatedHeaders == nullptr) {
-        std::cerr << "Error: Failed to add API key header.\n";
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-        return false;
-    }
-
-    headers = updatedHeaders;
+    CurlHeaderList headers;
+    appendHeader(headers, "Content-Type: application/json");
+    appendHeader(headers, "x-goog-api-key: " + apiKey);
 
     responseBody.clear();
     httpStatus = 0;
     ProviderResponseBuffer responseBuffer;
 
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, headers.get());
+    curl_easy_setopt(curl.get(), CURLOPT_POST, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS, requestBody.c_str());
     curl_easy_setopt(
-        curl,
-        CURLOPT_POSTFIELDS,
-        requestBody.c_str()
-    );
-    curl_easy_setopt(
-        curl,
+        curl.get(),
         CURLOPT_POSTFIELDSIZE,
         static_cast<long>(requestBody.size())
     );
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeResponse);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBuffer);
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, writeResponse);
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &responseBuffer);
 
     // Bound request duration and verify TLS certificates.
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYHOST, 2L);
 
-    const CURLcode result = curl_easy_perform(curl);
-    responseBody = std::move(responseBuffer.body);
-
-    if (result == CURLE_OK) {
-        curl_easy_getinfo(
-            curl,
-            CURLINFO_RESPONSE_CODE,
-            &httpStatus
+    const CURLcode result = curl_easy_perform(curl.get());
+    if (responseBuffer.exceededLimit) {
+        throw ProviderResponseError(
+            ProviderResponseError::Kind::Invalid,
+            "provider response exceeded the 2 MiB limit"
         );
-    } else {
-        std::cerr
-            << "Network/HTTP transport error: "
-            << curl_easy_strerror(result)
-            << '\n';
+    }
+    if (result != CURLE_OK) {
+        throwTransportError(result);
     }
 
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-
-    return result == CURLE_OK && !responseBuffer.exceededLimit;
+    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &httpStatus);
+    responseBody = std::move(responseBuffer.body);
+    return true;
 }
 
 std::string buildGeminiUrl(const std::string& model) {
@@ -197,6 +180,73 @@ std::string safeResponseDiagnostic(const ParsedResponse& response) {
     return "Gemini returned an unsuccessful response.";
 }
 
+// Summarizes an error response for the log from its structured fields only.
+std::string describeProviderError(long httpStatus,
+                                  const std::optional<ProviderErrorDetails>& details) {
+    std::string text = "Gemini HTTP " + std::to_string(httpStatus) + "; provider error";
+    if (!details) return text + " body was not a structured error";
+    if (!details->status.empty()) text += " status " + details->status;
+    if (!details->reason.empty()) text += ", reason " + details->reason;
+    for (const auto& quotaId : details->quotaIds) text += ", quota " + quotaId;
+    if (details->retryDelay) text += ", retry after " + *details->retryDelay;
+    return text;
+}
+
+bool hasDailyQuotaViolation(const ProviderErrorDetails& details) {
+    for (const auto& quotaId : details.quotaIds) {
+        if (quotaId.find("PerDay") != std::string::npos) return true;
+    }
+    return false;
+}
+
+// Turns a non-2xx response into the matching exception, using Gemini's
+// structured status and details rather than the HTTP status alone.
+[[noreturn]] void throwHttpError(long httpStatus, const std::string& responseBody,
+                                 const std::string& model) {
+    const auto details = ResponseParser().parseProviderError(responseBody);
+    const std::string diagnostic = describeProviderError(httpStatus, details);
+    const std::string status = details ? details->status : "";
+    const std::string reason = details ? details->reason : "";
+
+    // Gemini reports an invalid key as HTTP 400 INVALID_ARGUMENT with the
+    // API_KEY_INVALID reason, so the reason is checked before the status.
+    if (httpStatus == 401 || httpStatus == 403 || status == "UNAUTHENTICATED" ||
+        status == "PERMISSION_DENIED" || reason == "API_KEY_INVALID") {
+        throw AuthenticationError(diagnostic);
+    }
+    if (httpStatus == 429 || status == "RESOURCE_EXHAUSTED") {
+        const bool quotaExhausted = details && hasDailyQuotaViolation(*details);
+        throw RateLimitError(quotaExhausted, details ? details->retryDelay : std::nullopt,
+                             diagnostic);
+    }
+    if (httpStatus == 408 || httpStatus == 504 || status == "DEADLINE_EXCEEDED") {
+        throw TimeoutError(diagnostic);
+    }
+    if (httpStatus >= 500) {
+        throw ProviderUnavailableError(diagnostic);
+    }
+    if (httpStatus == 404) {
+        throw ProviderError(
+            "Gemini did not find the model '" + model + "'. Check the configured model name.",
+            diagnostic);
+    }
+    throw ProviderError(
+        "Gemini rejected the request (HTTP " + std::to_string(httpStatus) +
+            "). Shorten or rephrase the instruction and try again.",
+        diagnostic);
+}
+
+ProviderResponseError::Kind responseErrorKind(ResponseParseError error) {
+    switch (error) {
+    case ResponseParseError::BlockedResponse:
+        return ProviderResponseError::Kind::Blocked;
+    case ResponseParseError::IncompleteResponse:
+        return ProviderResponseError::Kind::Incomplete;
+    default:
+        return ProviderResponseError::Kind::Invalid;
+    }
+}
+
 } // namespace
 
 LLMClient::LLMClient()
@@ -235,68 +285,23 @@ LLMClient::LLMClient(
 bool LLMClient::isValidPrompt(
     const std::string& prompt
 ) const {
-    return !isWhitespaceOnly(prompt);
-}
-
-bool LLMClient::generateContent(
-    const std::string& prompt,
-    std::string& response
-) const {
-    return generateContentImpl(prompt, response, false, nullptr);
-}
-
-bool LLMClient::generateCompleteContent(
-    const std::string& prompt,
-    std::string& response
-) const {
-    return generateContentImpl(prompt, response, true, nullptr);
-}
-
-bool LLMClient::generateContent(
-    const std::string& prompt,
-    std::string& response,
-    std::string& thoughts
-) const {
-    return generateContentImpl(prompt, response, false, &thoughts);
-}
-
-bool LLMClient::generateCompleteContent(
-    const std::string& prompt,
-    std::string& response,
-    std::string& thoughts
-) const {
-    return generateContentImpl(prompt, response, true, &thoughts);
-}
-
-bool LLMClient::generateContentImpl(
-    const std::string& prompt,
-    std::string& response,
-    bool requireExplicitCompletion,
-    std::string* thoughts
-) const {
-    response.clear();
-    if (thoughts != nullptr) {
-        thoughts->clear();
+    for (unsigned char ch : prompt) {
+        if (!std::isspace(ch)) {
+            return true;
+        }
     }
+    return false;
+}
 
+LLMClient::GenerationResult LLMClient::generate(
+    const std::string& prompt,
+    GenerationOptions options
+) const {
     if (!isValidPrompt(prompt) || !transport_ || model_.empty()) {
-        std::cerr
-            << "Error: Invalid prompt, transport, or model.\n";
-        return false;
+        throw std::invalid_argument("Invalid prompt, transport, or model.");
     }
 
-    const char* apiKeyEnvironment =
-        std::getenv("GEMINI_API_KEY");
-
-    if (apiKeyEnvironment == nullptr ||
-        isWhitespaceOnly(apiKeyEnvironment)) {
-        std::cerr
-            << "Error: GEMINI_API_KEY is missing or empty. "
-            << "Check your .env file and working directory.\n";
-        return false;
-    }
-
-    const std::string apiKey(apiKeyEnvironment);
+    const std::string apiKey = requireEnvironmentVariable("GEMINI_API_KEY");
 
     json requestBody = {
         {"contents", json::array({
@@ -307,7 +312,7 @@ bool LLMClient::generateContentImpl(
             }
         })}
     };
-    if (thoughts != nullptr) {
+    if (options.includeThoughts) {
         requestBody["generationConfig"] = {
             {"thinkingConfig", {{"includeThoughts", true}}}
         };
@@ -316,52 +321,105 @@ bool LLMClient::generateContentImpl(
     std::string responseBody;
     long httpStatus = 0;
 
-    const bool requestSucceeded = transport_(
-        buildGeminiUrl(model_),
-        apiKey,
-        requestBody.dump(),
-        responseBody,
-        httpStatus
-    );
-
-    if (!requestSucceeded) {
-        std::cerr
-            << "Gemini request failed at the network or "
-            << "transport layer.\n";
-        return false;
+    if (!transport_(
+            buildGeminiUrl(model_),
+            apiKey,
+            requestBody.dump(),
+            responseBody,
+            httpStatus)) {
+        throw NetworkError("transport reported a failure without a response");
     }
 
     if (responseBody.size() > kMaximumProviderResponseBytes) {
-        std::cerr << "Error: Provider response exceeded the 2 MiB limit.\n";
-        return false;
+        throw ProviderResponseError(
+            ProviderResponseError::Kind::Invalid,
+            "provider response exceeded the 2 MiB limit"
+        );
     }
-
-    ResponseParser parser;
-    const ParsedResponse parsedResponse =
-        parser.parseResponse(responseBody);
 
     if (httpStatus < 200 || httpStatus >= 300) {
-        std::cerr
-            << "Gemini HTTP status: "
-            << httpStatus << '\n';
-        std::cerr << safeResponseDiagnostic(parsedResponse) << '\n';
-        return false;
+        throwHttpError(httpStatus, responseBody, model_);
     }
 
-    if (!parsedResponse.succeeded() ||
-        (requireExplicitCompletion && !parsedResponse.isComplete())) {
-        std::cerr << "Error: ";
-        if (parsedResponse.succeeded() && requireExplicitCompletion) {
-            std::cerr << "Gemini did not confirm that the response is complete.\n";
-        } else {
-            std::cerr << safeResponseDiagnostic(parsedResponse) << '\n';
-        }
-        return false;
+    const ParsedResponse parsedResponse =
+        ResponseParser().parseResponse(responseBody);
+
+    if (!parsedResponse.succeeded()) {
+        throw ProviderResponseError(
+            responseErrorKind(parsedResponse.error),
+            safeResponseDiagnostic(parsedResponse)
+        );
+    }
+    if (options.requireExplicitCompletion && !parsedResponse.isComplete()) {
+        throw ProviderResponseError(
+            ProviderResponseError::Kind::Incomplete,
+            "Gemini did not confirm that the response is complete."
+        );
     }
 
-    response = parsedResponse.generatedText;
+    GenerationResult result;
+    result.text = parsedResponse.generatedText;
+    if (options.includeThoughts) {
+        result.thoughts = parsedResponse.thoughts;
+    }
+    return result;
+}
+
+bool LLMClient::generateContent(
+    const std::string& prompt,
+    std::string& response
+) const {
+    return generateContentReportingErrors(prompt, response, false, nullptr);
+}
+
+bool LLMClient::generateCompleteContent(
+    const std::string& prompt,
+    std::string& response
+) const {
+    return generateContentReportingErrors(prompt, response, true, nullptr);
+}
+
+bool LLMClient::generateContent(
+    const std::string& prompt,
+    std::string& response,
+    std::string& thoughts
+) const {
+    return generateContentReportingErrors(prompt, response, false, &thoughts);
+}
+
+bool LLMClient::generateCompleteContent(
+    const std::string& prompt,
+    std::string& response,
+    std::string& thoughts
+) const {
+    return generateContentReportingErrors(prompt, response, true, &thoughts);
+}
+
+bool LLMClient::generateContentReportingErrors(
+    const std::string& prompt,
+    std::string& response,
+    bool requireExplicitCompletion,
+    std::string* thoughts
+) const {
+    response.clear();
     if (thoughts != nullptr) {
-        *thoughts = parsedResponse.thoughts;
+        thoughts->clear();
     }
-    return true;
+
+    try {
+        GenerationResult result = generate(
+            prompt,
+            GenerationOptions{requireExplicitCompletion, thoughts != nullptr}
+        );
+        response = std::move(result.text);
+        if (thoughts != nullptr) {
+            *thoughts = std::move(result.thoughts);
+        }
+        return true;
+    } catch (const CodeAgentError& error) {
+        logError(std::cerr, error);
+    } catch (const std::invalid_argument& error) {
+        std::cerr << "Error: " << error.what() << '\n';
+    }
+    return false;
 }

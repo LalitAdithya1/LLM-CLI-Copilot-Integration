@@ -114,7 +114,8 @@ Save writes the file on disk. It does not talk to VS Code. VS Code watches files
 
 | Symptom | Fix |
 | --- | --- |
-| Terminal: `Warning: GEMINI_API_KEY is not set`; browser: `GENERATION_FAILED` / `REFACTOR_FAILED` | Add the key to `.env` in the launch directory or export it, then restart. The terminal running `codeagent` prints the specific cause (missing key, HTTP status, network error); the browser intentionally shows only a generic message. |
+| Terminal: `Warning: GEMINI_API_KEY is not set`; browser: `Configuration error: GEMINI_API_KEY is not configured` | Add the key to `.env` in the launch directory or export it, then restart. |
+| Browser or CLI: `Authentication failed`, `Request rate limited`, `Network error`, `Request timed out` | The message names the cause and the next step. The terminal running `codeagent` also logs a redacted diagnostic, such as the HTTP status and Gemini's error reason; API keys are never printed. |
 | `Could not start the GUI server on 127.0.0.1:8080` | Another program (often another `codeagent gui`) is using the port. Stop it, or run with `CODEAGENT_GUI_PORT=8081`. |
 | `Could not open a browser automatically` | Open the printed one-time link (`http://127.0.0.1:<port>/#bootstrap=…`) within 5 minutes. The server keeps running. |
 | The page says *Not connected* / `SESSION_REQUIRED` or `INVALID_BOOTSTRAP` | The page was opened without a valid one-time link (typed address, other browser, link used twice or older than 5 minutes), or the server was restarted. Restart `codeagent gui` and use the link it opens or prints. |

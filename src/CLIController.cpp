@@ -1,6 +1,7 @@
 
 #include "CLIController.hpp"
 
+#include "CodeAgentError.hpp"
 #include "FileManager.hpp"
 #include "GuiHttpServer.hpp"
 #include "PromptBuilder.hpp"
@@ -13,7 +14,9 @@
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
+#include <exception>
 #include <iostream>
+#include <new>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -42,23 +45,25 @@ bool isSetEnvironmentValue(const char* value) {
 }
 
 // CODEAGENT_GUI_PORT overrides the default port, e.g. when 8080 is taken.
-bool resolveGuiPort(int& port, std::ostream& error) {
+// Throws ConfigurationError for a value that is not a valid port.
+int resolveGuiPort() {
     const char* value = std::getenv("CODEAGENT_GUI_PORT");
     if (!isSetEnvironmentValue(value)) {
-        port = kDefaultGuiPort;
-        return true;
+        return kDefaultGuiPort;
     }
     const std::string text(value);
     const bool digitsOnly = text.size() <= 5 && std::all_of(
         text.begin(), text.end(),
         [](unsigned char character) { return std::isdigit(character) != 0; }
     );
-    port = digitsOnly ? std::stoi(text) : 0;
+    const int port = digitsOnly ? std::stoi(text) : 0;
     if (port < 1 || port > 65535) {
-        error << "Error: CODEAGENT_GUI_PORT must be a port number from 1 to 65535.\n";
-        return false;
+        throw ConfigurationError(
+            "Configuration error: CODEAGENT_GUI_PORT must be a port number from 1 to 65535. "
+            "Change it, or unset it to use port 8080."
+        );
     }
-    return true;
+    return port;
 }
 
 bool containsFrontend(const std::filesystem::path& directory) {
@@ -101,10 +106,7 @@ std::filesystem::path findFrontendDirectory(std::ostream& error) {
 }
 
 int runGuiCommand(std::ostream& output, std::ostream& error) {
-    int port = kDefaultGuiPort;
-    if (!resolveGuiPort(port, error)) {
-        return 1;
-    }
+    const int port = resolveGuiPort();
 
     // Report a missing key at startup instead of only on the first request.
     // The key itself is never printed or sent to the browser. .env is loaded
@@ -130,8 +132,12 @@ int runGuiCommand(std::ostream& output, std::ostream& error) {
                 return false;
             }
 
-            LLMClient client;
-            return client.generateContent(prompt, generatedCode, thoughts);
+            // Failures propagate as exceptions, so the GUI server can tell
+            // the user why generation failed.
+            auto result = LLMClient().generate(prompt, {false, true});
+            generatedCode = std::move(result.text);
+            thoughts = std::move(result.thoughts);
+            return true;
         };
     GuiHttpServer::RefactoringHandler refactoringHandler =
         [](const std::string& instruction,
@@ -149,8 +155,10 @@ int runGuiCommand(std::ostream& output, std::ostream& error) {
                 return false;
             }
 
-            LLMClient client;
-            return client.generateCompleteContent(prompt, refactoredCode, thoughts);
+            auto result = LLMClient().generate(prompt, {true, true});
+            refactoredCode = std::move(result.text);
+            thoughts = std::move(result.thoughts);
+            return true;
         };
     GuiHttpServer server(
         port,
@@ -163,9 +171,10 @@ int runGuiCommand(std::ostream& output, std::ostream& error) {
     const char* developmentOrigin = std::getenv("CODEAGENT_DEV_ORIGIN");
     if (isSetEnvironmentValue(developmentOrigin) &&
         !server.allowDevelopmentOrigin(developmentOrigin)) {
-        error << "Error: CODEAGENT_DEV_ORIGIN must be exactly http://127.0.0.1:<port> "
-              << "or http://localhost:<port>.\n";
-        return 1;
+        throw ConfigurationError(
+            "Configuration error: CODEAGENT_DEV_ORIGIN must be exactly "
+            "http://127.0.0.1:<port> or http://localhost:<port>. Fix or unset it."
+        );
     }
     const auto frontendDirectory = findFrontendDirectory(error);
     const bool servingFrontend =
@@ -323,10 +332,10 @@ CLIController::CLIController()
           [](const std::string& prompt,
              std::string& response,
              bool requireExplicitCompletion) {
-              LLMClient client;
-              return requireExplicitCompletion
-                  ? client.generateCompleteContent(prompt, response)
-                  : client.generateContent(prompt, response);
+              // Throws CodeAgentError on failure; run() reports it.
+              response = LLMClient().generate(
+                  prompt, {requireExplicitCompletion, false}).text;
+              return true;
           },
           std::cin,
           std::cout,
@@ -350,7 +359,27 @@ CLIController::CLIController(
     }
 }
 
+// The application-level error boundary: a failure anywhere below is reported
+// as a message and exit code 1 instead of terminating the program.
 int CLIController::run(int argc, char* argv[]) {
+    try {
+        return dispatch(argc, argv);
+    } catch (const CodeAgentError& failure) {
+        error_ << failure.what() << '\n';
+        if (!failure.diagnostic().empty()) {
+            error_ << "Details: " << failure.diagnostic() << '\n';
+        }
+    } catch (const std::bad_alloc&) {
+        error_ << "Error: CodeAgent ran out of memory. Close other programs "
+               << "or use a smaller file, then retry.\n";
+    } catch (const std::exception& failure) {
+        error_ << "Error: An unexpected internal error occurred ("
+               << redactSecrets(failure.what()) << "). Please retry.\n";
+    }
+    return 1;
+}
+
+int CLIController::dispatch(int argc, char* argv[]) {
     if (argc < 2) {
         displayUsageError(error_, "No command provided.");
         return 1;

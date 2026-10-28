@@ -24,9 +24,14 @@ public:
         GuiCommand guiCommand = {}
     );
 
+    // Runs one command. Never throws: failures are reported on the error
+    // stream and as exit code 1.
     int run(int argc, char* argv[]);
 
 private:
+    // Runs the command; may throw CodeAgentError or other exceptions.
+    int dispatch(int argc, char* argv[]);
+
     LLMCall llmCall_;
     std::istream& input_;
     std::ostream& output_;

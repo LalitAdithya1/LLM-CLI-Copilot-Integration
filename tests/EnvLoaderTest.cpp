@@ -1,4 +1,5 @@
 #include "EnvLoader.hpp"
+#include "CodeAgentError.hpp"
 
 #include <gtest/gtest.h>
 
@@ -68,6 +69,25 @@ TEST_F(EnvLoaderTest, KeepsVariablesAlreadyInTheEnvironment) {
 
 TEST_F(EnvLoaderTest, ReportsAMissingFile) {
     EXPECT_FALSE(loadEnvFile((path_ / "missing").string()));
+}
+
+TEST_F(EnvLoaderTest, RequiredVariablesAreReturnedOrReportedAsConfigurationErrors) {
+    ::setenv("CODEAGENT_TEST_PLAIN", "configured", 1);
+    EXPECT_EQ(requireEnvironmentVariable("CODEAGENT_TEST_PLAIN"), "configured");
+
+    for (const char* missing : {"", " 	"}) {
+        ::setenv("CODEAGENT_TEST_PLAIN", missing, 1);
+        try {
+            requireEnvironmentVariable("CODEAGENT_TEST_PLAIN");
+            ADD_FAILURE() << "expected ConfigurationError";
+        } catch (const ConfigurationError& error) {
+            EXPECT_STREQ(error.what(),
+                "Configuration error: CODEAGENT_TEST_PLAIN is not configured. "
+                "Set it in your environment or .env file.");
+        }
+    }
+    ::unsetenv("CODEAGENT_TEST_PLAIN");
+    EXPECT_THROW(requireEnvironmentVariable("CODEAGENT_TEST_PLAIN"), ConfigurationError);
 }
 
 } // namespace

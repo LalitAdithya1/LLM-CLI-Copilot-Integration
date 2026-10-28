@@ -1,4 +1,5 @@
 #include "GuiHttpServer.hpp"
+#include "CodeAgentError.hpp"
 #include "UnifiedDiff.hpp"
 
 #include <httplib.h>
@@ -2380,4 +2381,138 @@ TEST_F(GuiHttpServerDocumentTest, ReadRefusesFifosWithoutBlocking) {
     ASSERT_TRUE(response);
     EXPECT_EQ(response->status, 422);
     EXPECT_EQ(nlohmann::json::parse(response->body).at("error").at("code"), "INVALID_SOURCE_FILE");
+}
+
+// --------------------------------------------------------------------------
+// Typed errors at the HTTP boundary
+// --------------------------------------------------------------------------
+
+namespace {
+struct ThrownError {
+    std::function<void()> raise;
+    int status;
+    const char* code;
+    const char* message;
+    const char* diagnostic;
+};
+
+const std::vector<ThrownError>& providerFailures() {
+    static const std::vector<ThrownError> failures = {
+        {[] { throw ConfigurationError::missingSetting("GEMINI_API_KEY"); }, 503,
+         "CONFIGURATION_ERROR",
+         "Configuration error: GEMINI_API_KEY is not configured. Set it in your environment or .env file.",
+         "GEMINI_API_KEY is unset or empty"},
+        {[] { throw AuthenticationError("Gemini HTTP 400; provider error reason API_KEY_INVALID"); },
+         502, "PROVIDER_AUTH_FAILED",
+         "Authentication failed: Gemini rejected the configured credentials. Verify the API key.",
+         "API_KEY_INVALID"},
+        {[] { throw RateLimitError(false, std::nullopt, "Gemini HTTP 429; provider error"); }, 429,
+         "PROVIDER_RATE_LIMITED", "Request rate limited. Wait briefly before retrying.", "HTTP 429"},
+        {[] { throw NetworkError("libcurl error 7: Couldn't connect to server"); }, 502,
+         "PROVIDER_UNREACHABLE", "Network error: Unable to connect to Gemini. Check your connection.",
+         "libcurl"},
+        {[] { throw TimeoutError("libcurl error 28: Timeout was reached"); }, 504,
+         "PROVIDER_TIMEOUT", "Request timed out. Retry when the service is reachable.", "libcurl"},
+        {[] { throw ProviderResponseError(ProviderResponseError::Kind::Invalid, "malformed JSON"); },
+         502, "PROVIDER_RESPONSE_INVALID",
+         "Gemini returned a response CodeAgent could not use. Retry the request.", "malformed"},
+    };
+    return failures;
+}
+} // namespace
+
+TEST(GuiHttpServerErrorTest, GenerationErrorsReachTheBrowserAsStatusCodeAndSafeMessage) {
+    for (const auto& failure : providerFailures()) {
+        SCOPED_TRACE(failure.code);
+        GuiHttpServer server(0, std::filesystem::current_path(),
+            [&failure](const std::string&, const std::string&, std::string&, std::string&) -> bool {
+                failure.raise();
+                return true;
+            });
+        ASSERT_TRUE(server.start());
+        auto http = apiClient(server);
+        const auto response = http.Post("/api/generate",
+            R"({"instruction":"Write main","language":"C++"})", "application/json");
+        ASSERT_TRUE(response);
+        EXPECT_EQ(response->status, failure.status);
+        const auto error = nlohmann::json::parse(response->body).at("error");
+        EXPECT_EQ(error.at("code"), failure.code);
+        EXPECT_EQ(error.at("message"), failure.message);
+        // Diagnostics stay in the terminal log.
+        EXPECT_EQ(response->body.find(failure.diagnostic), std::string::npos);
+        server.stop();
+    }
+}
+
+TEST(GuiHttpServerErrorTest, RefactoringErrorsAreReportedAndCreateNoProposal) {
+    std::atomic<bool> fail{true};
+    GuiHttpServer server(0, std::filesystem::current_path(), {},
+        [&fail](const std::string&, const std::string&, const std::string&,
+                std::string& refactored, std::string&) {
+            if (fail.load()) throw TimeoutError("libcurl error 28");
+            refactored = "int refactored;\n";
+            return true;
+        });
+    ASSERT_TRUE(server.start());
+    auto http = apiClient(server);
+    const std::string body =
+        R"({"sourceCode":"int x;\n","instruction":"Rename","language":"C++","editorRevision":"r1"})";
+
+    const auto failed = http.Post("/api/refactor", body, "application/json");
+    ASSERT_TRUE(failed);
+    EXPECT_EQ(failed->status, 504);
+    EXPECT_EQ(nlohmann::json::parse(failed->body).at("error").at("code"), "PROVIDER_TIMEOUT");
+
+    // The failure consumed no proposal ID: a retry gets the first one.
+    fail = false;
+    const auto retried = http.Post("/api/refactor", body, "application/json");
+    ASSERT_TRUE(retried);
+    ASSERT_EQ(retried->status, 200);
+    EXPECT_EQ(nlohmann::json::parse(retried->body).at("proposalId"), "prop-1");
+    server.stop();
+}
+
+TEST_F(GuiHttpServerDocumentTest, SaveConflictMessageTellsTheUserWhatToDo) {
+    const auto opened = post("/api/files/read", {{"path", source_.string()}});
+    ASSERT_TRUE(opened);
+    const auto document = nlohmann::json::parse(opened->body);
+    write(source_, "int changedElsewhere;\n");
+    const auto conflict = post("/api/files/write", {
+        {"path", document.at("path")}, {"content", "int mine;\n"},
+        {"baseRevision", document.at("revision")}, {"overwriteConfirmed", false}});
+    ASSERT_TRUE(conflict);
+    EXPECT_EQ(conflict->status, 409);
+    EXPECT_EQ(nlohmann::json::parse(conflict->body).at("error").at("message"),
+              "The file changed externally. Reload it or save to another path.");
+}
+
+TEST_F(GuiHttpServerDocumentTest, PermissionErrorsAreReportedAsPermissionDenied) {
+    if (::geteuid() == 0) GTEST_SKIP() << "root ignores file permissions";
+    const auto opened = post("/api/files/read", {{"path", source_.string()}});
+    ASSERT_TRUE(opened);
+    const auto document = nlohmann::json::parse(opened->body);
+
+    // Without write permission on the folder, the temporary file for the
+    // atomic save cannot be created.
+    std::filesystem::permissions(directory_, std::filesystem::perms::owner_read |
+                                             std::filesystem::perms::owner_exec);
+    const auto saved = post("/api/files/write", {
+        {"path", document.at("path")}, {"content", "int edited;\n"},
+        {"baseRevision", document.at("revision")}, {"overwriteConfirmed", false}});
+    std::filesystem::permissions(directory_, std::filesystem::perms::owner_all);
+    ASSERT_TRUE(saved);
+    EXPECT_EQ(saved->status, 403);
+    const auto error = nlohmann::json::parse(saved->body).at("error");
+    EXPECT_EQ(error.at("code"), "PERMISSION_DENIED");
+    EXPECT_EQ(error.at("message").get<std::string>().rfind(
+        "Permission denied: CodeAgent cannot access this file.", 0), 0u);
+    EXPECT_EQ(read(source_), "int original;\n");
+
+    std::filesystem::permissions(source_, std::filesystem::perms::none);
+    const auto unreadable = post("/api/files/read", {{"path", source_.string()}});
+    std::filesystem::permissions(source_, std::filesystem::perms::owner_read |
+                                          std::filesystem::perms::owner_write);
+    ASSERT_TRUE(unreadable);
+    EXPECT_EQ(unreadable->status, 403);
+    EXPECT_EQ(nlohmann::json::parse(unreadable->body).at("error").at("code"), "PERMISSION_DENIED");
 }

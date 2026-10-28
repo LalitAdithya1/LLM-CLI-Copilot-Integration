@@ -1,15 +1,65 @@
 :root {
-  color-scheme: dark;
+  color-scheme: light;
 
-  --color-page: #0b0b0e;
-  --color-app: #111116;
-  --color-panel: #15151b;
-  --color-card: #1b1b23;
-  --color-accent: #8b5cf6;
-  --color-status: #22c55e;
-  --color-text: #f4f3f8;
-  --color-text-muted: #9694a3;
-  --color-border: #292832;
+  /* Neutral Elegance palette */
+  --palette-beige: #ffdbbb;
+  --palette-stone: #ccbeb1;
+  --palette-brown: #997e67;
+  --palette-deep-brown: #664930;
+  --palette-espresso: #2b1f16;
+
+  /* Surfaces, from the page backdrop up to raised cards */
+  --color-page: #ebe1d6;
+  --color-app: #faf6f1;
+  --color-panel: #f4ece3;
+  --color-card: #fffcf8;
+  --color-surface-sunken: #efe5da;
+  --color-input: #fffcf8;
+  --color-hover: #efe3d6;
+  --color-active: #e6d7c8;
+  --color-disabled: #efe9e2;
+
+  /* Text */
+  --color-text: var(--palette-espresso);
+  --color-text-muted: #6b5443;
+  --color-placeholder: #8a7461;
+
+  /* Borders */
+  --color-border: #ddd0c3;
+  --color-border-strong: var(--palette-stone);
+  --color-border-hover: var(--palette-brown);
+  --color-input-border: var(--palette-brown);
+
+  /* Accent */
+  --color-accent: var(--palette-deep-brown);
+  --color-accent-hover: #553c27;
+  --color-accent-active: #47321f;
+  --color-accent-text: var(--palette-deep-brown);
+  --color-on-accent: #fff8f1;
+  --color-accent-soft: #ffeedf;
+  --color-accent-selected: var(--palette-beige);
+  --color-accent-border: var(--palette-brown);
+  --color-focus-ring: rgb(102 73 48 / 18%);
+
+  /* Status */
+  --color-status: #3f8f4e;
+  --color-success: #2f6b3a;
+  --color-warning: #8a5300;
+  --color-warning-dot: #c98a2b;
+  --color-danger: #a33a2e;
+  --color-danger-dot: #c0473a;
+  --color-danger-border: rgb(163 58 46 / 40%);
+
+  /* Code surfaces stay dark so code and diff colors read clearly. */
+  --color-code-bg: #2a1f17;
+  --color-code-border: #3e2f23;
+  --color-code-text: #f5ebe0;
+  --color-code-muted: #a08b78;
+  --color-code-selection: rgb(255 219 187 / 26%);
+  --color-scrollbar: var(--palette-stone);
+
+  --shadow-sm: 0 1px 2px rgb(60 40 25 / 8%);
+  --shadow-md: 0 6px 20px rgb(60 40 25 / 8%);
 
   --space-1: 0.25rem;
   --space-2: 0.5rem;
@@ -63,6 +113,7 @@ select {
   border: 1px solid var(--color-border);
   border-radius: var(--radius-panel);
   background: var(--color-app);
+  box-shadow: var(--shadow-md);
 }
 
 /* `hidden` always wins over component display rules. */
