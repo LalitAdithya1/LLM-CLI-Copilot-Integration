@@ -144,7 +144,7 @@
 /* Assistant mode selector */
 .mode-cards {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-3);
   margin-block: var(--space-6) var(--space-4);
 }
@@ -388,7 +388,8 @@
 }
 
 .message-thoughts__body {
-  max-height: 14rem;
+  /* 14rem showed about 12 lines; five more lines of this text are added. */
+  max-height: calc(14rem + 5 * 1.55em);
   padding: 0 var(--space-3) var(--space-2);
   overflow-y: auto;
   color: var(--color-text-muted);
@@ -740,13 +741,16 @@
 }
 
 .code-preview {
-  /* The editor grows with its content up to this many lines, then scrolls. */
-  --editor-max-lines: 100;
+  /* Side by side, the code viewport is always exactly 45 editor lines tall
+     (plus padding and room for the horizontal scrollbar, which sits inside
+     the editor), and longer files scroll. The AI Assistant card stretches
+     to the same height in the shared grid row. */
+  --editor-max-lines: 45;
   --editor-min-lines: 12;
+  --editor-scrollbar-allowance: 1rem;
   display: grid;
-  min-height: calc(var(--editor-min-lines) * 1.6em + 2 * var(--space-4));
-  max-height: calc(var(--editor-max-lines) * 1.6em + 2 * var(--space-4));
-  flex: 1 1 auto;
+  height: calc(var(--editor-max-lines) * 1.6em + 2 * var(--space-4) + var(--editor-scrollbar-allowance));
+  flex: 0 0 auto;
   grid-template-columns: 2.75rem minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
   overflow: hidden;
@@ -755,6 +759,16 @@
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 0.8125rem;
   line-height: 1.6;
+}
+
+/* Stacked on narrow screens, the editor fits its content between 12 and 45
+   lines instead of always taking 45. */
+@media (max-width: 760px) {
+  .code-preview {
+    height: auto;
+    min-height: calc(var(--editor-min-lines) * 1.6em + 2 * var(--space-4));
+    max-height: calc(var(--editor-max-lines) * 1.6em + 2 * var(--space-4) + var(--editor-scrollbar-allowance));
+  }
 }
 
 .line-numbers {
@@ -969,29 +983,6 @@
   font-style: italic;
 }
 
-.save-file-name {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  color: var(--color-text-muted);
-  font-size: 0.75rem;
-}
-
-.save-file-name input {
-  width: min(14rem, 40vw);
-  min-height: 2.5rem;
-  padding: 0 var(--space-3);
-  border: 1px solid var(--color-border);
-  border-radius: 0.55rem;
-  background: var(--color-card);
-  color: var(--color-text);
-  font: inherit;
-}
-
-.save-file-name input:disabled {
-  opacity: 0.65;
-}
-
 @media (max-width: 760px) {
   .proposal-review__code-panes {
     grid-template-columns: minmax(0, 1fr);
@@ -1011,14 +1002,6 @@
   .proposal-review__availability {
     text-align: left;
   }
-}
-
-.bottom-actions {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: var(--space-3);
-  margin-top: var(--space-4);
 }
 
 .action-button {
@@ -1114,11 +1097,6 @@
   .preview-header,
   .preview-footer {
     padding-inline: var(--space-3);
-  }
-
-  .bottom-actions {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
   }
 
   .app-footer {

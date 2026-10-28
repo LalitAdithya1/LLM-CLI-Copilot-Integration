@@ -73,7 +73,9 @@ Reloading the page or opening the address again in a new tab of the same browser
 
 ### Using the browser editor
 
-* **Open a file to edit it in place.**
+The top of the page switches between two modes, **Generate** and **Refactor**. The *Source file* controls appear only in Refactor mode; switching modes keeps the editor contents and the source path. The AI Assistant and the editor sit side by side with matching heights (stacked on narrow windows). The editor shows up to 45 lines and scrolls for longer files; the chat scrolls inside its card.
+
+* **Open a file to edit it in place** (in Refactor mode).
   * Type its path in *Source file* and select *Open path* (or press Enter). Both WSL paths (`/mnt/d/project/insertion_sort.cpp`) and Windows paths (`D:\project\insertion_sort.cpp`, `\\wsl.localhost\Ubuntu\home\me\x.cpp`) work; under WSL the backend translates Windows paths.
   * Alternatively, select *Choose source path* to pick the file in a native dialog. It uses zenity when installed; under WSL without zenity it opens a Windows file dialog through `powershell.exe`, which may appear behind the browser. If no dialog is available, the page says so and focuses the path field.
   * The editor heading shows the file name. A `●` and *Unsaved changes* mark edits that are not yet on disk. A new document is shown as `untitled.cpp`.
@@ -85,19 +87,18 @@ Reloading the page or opening the address again in a new tab of the same browser
 * *Copy* copies the current editor text. The button shows *Copied!* with a check mark for about 2 seconds once the copy succeeded. It uses the Clipboard API and falls back to the browser's copy command; if both fail, the button keeps saying *Copy* and the failure is reported next to the editor.
 * **Generate:** enter a language and an instruction, then select *Generate code*. Gemini's output is shown for review.
   * *Accept* puts it into the editor (replacing the editor contents) to edit and save with Save or Save As.
-  * *Save output* instead writes it as-is to the output directory.
   * *Reject* discards it.
 * **Refactor:** with code in the editor, switch to *Refactor* and describe the change. The backend creates a **proposal**. Select *Review changes* to load the unified diff, colored like `git diff`: removed lines red, added lines green, headers blue.
   * *Accept* replaces the editor contents with the proposed code. Nothing is written to disk: the document is marked unsaved, you can keep editing, and Save (Ctrl+S) or Save As writes the final editor contents.
   * If the editor has unsaved changes, Accept asks first. A proposal is applied only if it is still pending and the editor still contains the code it was created from.
   * *Reject* leaves the editor and the files on disk unchanged.
-* **Saving output** writes `<active output directory>/<filename>`.
+* **Save As** writes `<active output directory>/<filename>`.
   * The output directory defaults to the launch directory. Type a WSL or Windows path and select *Set directory*, or use *Choose output directory* for a native dialog. The backend accepts only existing, writable directories, and the active directory is always displayed.
   * Filenames must be plain names with a supported extension (see [Supported files](#supported-files)). Paths and `..` are rejected.
   * Replacing an existing file always asks for confirmation.
   * Writes are atomic: the content goes to a temporary file that is then renamed into place.
   * Buttons are disabled while a request is in flight, so double clicks cannot approve or save twice.
-* Nothing is saved without an explicit Save, Save As, or Save output. AI-generated code is **never executed**.
+* Nothing is saved without an explicit Save or Save As. AI-generated code is **never executed**.
 * The prompts ask Gemini for raw code. If a complete response is nevertheless one Markdown code block (`` ```cpp `` … `` ``` ``), the CLI and GUI receive only the code inside it. Any other response, including partial output or text around a code block, is shown exactly as returned.
 
 #### Supported files
@@ -275,7 +276,7 @@ Every API request must also carry a `Host` of `127.0.0.1:<port>` or `localhost:<
 
 **Limits of this protection.** The token stops other websites and other local users' processes from using the API, as long as they cannot read your files or memory. It does not protect against malicious software running as your own user. Such software can read the browser's memory or profile, the terminal output, or attach to the server process. The bootstrap code is passed to the browser launcher on its command line, where other local users can briefly see it in the process list until the page uses it. It is also printed when no browser can be opened. Both cases are limited by the code being single-use and expiring after 5 minutes.
 
-The backend reads a file only when the user explicitly opens it by path or through the dialog (`POST /api/files/read`). Only regular files with a supported source extension, up to 512 KiB of UTF-8 text, are accepted. Symbolic links must resolve to a supported source file. The size limit is enforced while reading, so a file that grows after the check cannot be read beyond it, and FIFOs and devices are refused without blocking. The 256 most recently opened or saved files can be saved in place; beyond that, the least recently used one must be opened again. It writes back in place only to files opened that way in the current session (`POST /api/files/write`), checking that the file has not changed since; every other write goes through the output-directory rules above. Files mode and settings are disabled placeholders.
+The backend reads a file only when the user explicitly opens it by path or through the dialog (`POST /api/files/read`). Only regular files with a supported source extension, up to 512 KiB of UTF-8 text, are accepted. Symbolic links must resolve to a supported source file. The size limit is enforced while reading, so a file that grows after the check cannot be read beyond it, and FIFOs and devices are refused without blocking. The 256 most recently opened or saved files can be saved in place; beyond that, the least recently used one must be opened again. It writes back in place only to files opened that way in the current session (`POST /api/files/write`), checking that the file has not changed since; every other write goes through the output-directory rules above. Settings is a disabled placeholder.
 
 The backend retains at most 128 proposals and in-flight creation reservations combined. Refactor capacity is reserved before provider work begins. Proposals are only removed when a new one needs the slot. The backend then picks one in this order:
 

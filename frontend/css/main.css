@@ -64,3 +64,21 @@ select {
   border-radius: var(--radius-panel);
   background: var(--color-app);
 }
+
+/* `hidden` always wins over component display rules. */
+[hidden] {
+  display: none !important;
+}
+
+/* Text for screen readers only. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}

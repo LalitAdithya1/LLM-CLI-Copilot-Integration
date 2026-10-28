@@ -66,7 +66,6 @@ const REQUIRED_ELEMENTS = [
   '#select-output-directory-button',
   '#backend-config-error',
   '#generate-submit-button',
-  '#generate-code-button',
   '#proposal-review-status',
   '#proposal-review-availability',
   '#proposal-original-code',
@@ -75,14 +74,13 @@ const REQUIRED_ELEMENTS = [
   '#review-changes-button',
   '#accept-proposal-button',
   '#reject-proposal-button',
-  '#save-file-button',
-  '#save-file-name',
   '#preview-heading',
   '#code-language',
   '#select-source-file-button',
   '#load-source-file-button',
   '#load-source-file-input',
   '#source-path-input',
+  '#source-file-controls',
   '#open-source-path-button',
   '#output-directory-input',
   '#set-output-directory-button',
@@ -160,17 +158,13 @@ function initializeApp() {
   const reviewChangesButton = document.querySelector('#review-changes-button');
   const acceptProposalButton = document.querySelector('#accept-proposal-button');
   const rejectProposalButton = document.querySelector('#reject-proposal-button');
-  const saveFileButton = document.querySelector('#save-file-button');
-  const saveFileName = document.querySelector('#save-file-name');
   const clearChatButton = document.querySelector('#clear-chat-button');
   const chat = createChatTranscript(
     document.querySelector('#conversation'),
     document.querySelector('#conversation-empty'),
   );
-  const submitButtons = [
-    document.querySelector('#generate-submit-button'),
-    document.querySelector('#generate-code-button'),
-  ];
+  const submitButton = document.querySelector('#generate-submit-button');
+  const sourceFileControls = document.querySelector('#source-file-controls');
   let workflowInProgress = false;
   let selectionInProgress = false;
   let outputDirectorySelectionVersion = 0;
@@ -192,9 +186,8 @@ function initializeApp() {
   };
   let draftCode = currentDocument.savedContent;
   let documentOperationInProgress = false;
-  // Latest generated (non-proposal) output: { code, saved }.
+  // Latest generated (non-proposal) output: { code, decision }.
   let generatedOutput = null;
-  let generatedSaveInProgress = false;
   // ID of the proposal whose code was accepted into the editor.
   let acceptedProposalId = null;
 
@@ -208,8 +201,7 @@ function initializeApp() {
   function renderDecisionControls() {
     const state = proposalWorkflow.getState();
     const hasPendingProposal = state.proposal?.status === 'PENDING';
-    const operationInProgress = Boolean(state.operation) || generatedSaveInProgress
-      || Boolean(documentOperationInProgress);
+    const operationInProgress = Boolean(state.operation) || Boolean(documentOperationInProgress);
     const actionLocked = workflowInProgress || operationInProgress;
     promptInput.disabled = actionLocked;
     languageInput.disabled = actionLocked;
@@ -222,11 +214,9 @@ function initializeApp() {
     reloadDocumentButton.disabled = actionLocked || !currentDocument.path;
     saveDocumentButton.textContent = documentOperationInProgress === 'save' ? 'Saving…' : 'Save';
     modeButtons.forEach((button) => {
-      button.disabled = actionLocked || button.dataset.mode === 'files';
-    });
-    submitButtons.forEach((button) => {
       button.disabled = actionLocked;
     });
+    submitButton.disabled = actionLocked;
     const canDecideProposal = hasPendingProposal && state.proposal.reviewed
       && state.proposal.sourceMatches && !state.decisionBlocked;
     const canDecideGenerated = !state.proposal && generatedOutput !== null
@@ -238,15 +228,6 @@ function initializeApp() {
       : state.proposal?.reviewed ? 'Refresh diff' : 'Review changes';
     acceptProposalButton.disabled = !canDecide;
     rejectProposalButton.disabled = !canDecide;
-    // Accepted proposals are saved from the editor (Save / Save As); only
-    // generated output is written to the output directory from here.
-    const canSaveGenerated = !state.proposal && generatedOutput !== null
-      && !generatedOutput.saved && generatedOutput.decision !== 'rejected';
-    saveFileButton.disabled = !canSaveGenerated || actionLocked;
-    saveFileName.disabled = !canSaveGenerated || actionLocked;
-    saveFileButton.textContent = state.operation === 'save' || generatedSaveInProgress
-      ? 'Saving…'
-      : 'Save output';
   }
 
   function renderProposalState(state = proposalWorkflow.getState()) {
@@ -314,14 +295,12 @@ function initializeApp() {
     promptInput.disabled = isInProgress;
     languageInput.disabled = isInProgress;
     modeButtons.forEach((button) => {
-      button.disabled = isInProgress || button.dataset.mode === 'files';
-    });
-    submitButtons.forEach((button) => {
       button.disabled = isInProgress;
-      button.textContent = isInProgress
-        ? actionLabel
-        : selectedMode === 'refactor' ? 'Create proposal' : 'Generate code';
     });
+    submitButton.disabled = isInProgress;
+    submitButton.textContent = isInProgress
+      ? actionLabel
+      : selectedMode === 'refactor' ? 'Create proposal' : 'Generate code';
     renderDecisionControls();
   }
 
@@ -379,7 +358,7 @@ function initializeApp() {
   }
 
   function editorIsBusy() {
-    return workflowInProgress || generatedSaveInProgress || documentOperationInProgress
+    return workflowInProgress || documentOperationInProgress
       || Boolean(proposalWorkflow.getState().operation);
   }
 
@@ -402,7 +381,6 @@ function initializeApp() {
     draftCode = nextDocument.savedContent;
     codeEditor.value = draftCode;
     proposalWorkflow.setCurrentSourceCode(draftCode);
-    saveFileName.value = nextDocument.name;
     renderEditorState();
   }
 
@@ -771,7 +749,6 @@ function initializeApp() {
         };
         renderMessage(documentStatus, `Saved ${result.savedPath}, but it could not be reopened for in-place saving (${apiErrorMessage(reopenError, 'request failed')}). Open it by path to keep editing it.`, 'error');
       }
-      saveFileName.value = currentDocument.name;
       return true;
     } catch (error) {
       renderMessage(documentStatus, `Save As failed: ${apiErrorMessage(error, 'the file could not be saved.')}`, 'error');
@@ -1005,45 +982,6 @@ function initializeApp() {
       : `Diff review failed. ${state.error}`);
   }
 
-  async function saveGeneratedOutput() {
-    const output = generatedOutput;
-    if (workflowInProgress || generatedSaveInProgress || !output || output.saved) return;
-    const fileName = saveFileName.value.trim();
-    if (!fileName) {
-      saveFileName.setAttribute('aria-invalid', 'true');
-      renderStatus('Enter a filename for the generated code.');
-      saveFileName.focus();
-      return;
-    }
-    saveFileName.removeAttribute('aria-invalid');
-    generatedSaveInProgress = true;
-    renderDecisionControls();
-    renderStatus('Saving the generated code through the backend…');
-    try {
-      let result;
-      try {
-        result = await saveGeneratedCode({ fileName, content: output.code, overwriteConfirmed: false });
-      } catch (error) {
-        if (!(error instanceof ApiError) || error.code !== 'OVERWRITE_CONFIRMATION_REQUIRED') throw error;
-        if (!window.confirm(`${fileName} already exists in the output directory. Replace it with the generated code?`)) {
-          renderStatus('Overwrite was not confirmed. The existing file was not changed.');
-          return;
-        }
-        result = await saveGeneratedCode({ fileName, content: output.code, overwriteConfirmed: true });
-      }
-      output.saved = true;
-      chat.addNote(`Generated code saved to ${result.savedPath}`, 'success');
-      proposalReviewStatus.textContent = 'Generated code saved';
-      proposalReviewAvailability.textContent = `The backend confirmed the saved file: ${result.savedPath}`;
-      renderStatus(`The backend confirmed the save: ${result.savedPath}`);
-    } catch (error) {
-      renderStatus(`Save failed: ${apiErrorMessage(error, 'The generated code could not be saved.')}`);
-    } finally {
-      generatedSaveInProgress = false;
-      renderDecisionControls();
-    }
-  }
-
   async function submitWorkflow() {
     if (editorIsBusy()) {
       return;
@@ -1122,15 +1060,15 @@ function initializeApp() {
         const response = await generateCode({ instruction, language });
         proposalOriginalCode.textContent = originalSource;
         proposalProposedCode.textContent = response.generatedCode;
-        generatedOutput = { code: response.generatedCode, saved: false, decision: null };
+        generatedOutput = { code: response.generatedCode, decision: null };
         reply.resolve({
-          text: `Generated ${describeLines(response.generatedCode)} of ${response.language}. Accept it into the editor or Save output below.`,
+          text: `Generated ${describeLines(response.generatedCode)} of ${response.language}. Accept it into the editor below, then Save As to write it to a file.`,
           code: response.generatedCode,
           thoughts: response.thoughts ?? '',
         });
         promptInput.value = '';
         proposalReviewStatus.textContent = 'Generated output · not saved';
-        proposalReviewAvailability.textContent = 'Accept puts the generated code into the editor for you to edit and Save. Save output instead writes it as-is to the output directory; existing files are replaced only after you confirm.';
+        proposalReviewAvailability.textContent = 'Accept puts the generated code into the editor; edit it there, then Save As writes it to the output directory. Nothing is written until you save.';
         renderStatus('Generated code is displayed. It has not been saved.');
       }
     } catch (error) {
@@ -1158,6 +1096,13 @@ function initializeApp() {
     }
   }
 
+  // Only refactoring works from a source file, so its controls are shown
+  // only in Refactor mode. The selected path and the editor are kept.
+  function renderMode() {
+    submitButton.textContent = selectedMode === 'refactor' ? 'Create proposal' : 'Generate code';
+    sourceFileControls.hidden = selectedMode !== 'refactor';
+  }
+
   function describeLines(code) {
     const lineCount = code.replace(/\n$/, '').split('\n').length;
     return `${lineCount} line${lineCount === 1 ? '' : 's'}`;
@@ -1174,9 +1119,7 @@ function initializeApp() {
         String(button === selectedButton),
       );
     });
-    submitButtons.forEach((button) => {
-      button.textContent = selectedMode === 'refactor' ? 'Create proposal' : 'Generate code';
-    });
+    renderMode();
     promptInput.placeholder = selectedMode === 'refactor'
       ? 'Describe how to refactor the current code. Enter sends, Shift+Enter adds a line.'
       : 'Describe the code to generate. Enter sends, Shift+Enter adds a line.';
@@ -1185,6 +1128,7 @@ function initializeApp() {
   modeButtons.forEach((button) => {
     button.addEventListener('click', () => selectMode(button));
   });
+  renderMode();
 
   acceptProposalButton.addEventListener('click', () => {
     void submitProposalDecision('approve');
@@ -1194,9 +1138,6 @@ function initializeApp() {
   });
   reviewChangesButton.addEventListener('click', () => {
     void reviewProposalChanges();
-  });
-  saveFileButton.addEventListener('click', () => {
-    void saveGeneratedOutput();
   });
 
   selectSourceFileButton.addEventListener('click', () => {

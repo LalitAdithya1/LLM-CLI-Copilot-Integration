@@ -26,9 +26,12 @@
 }
 
 .conversation {
+  /* Side by side, the conversation fills whatever height the editor card
+     sets and scrolls. Size containment keeps its messages from making the
+     row, and so the editor card, any taller. */
   min-height: 12rem;
-  max-height: 27rem;
-  flex: 1 1 auto;
+  flex: 1 1 0;
+  contain: size;
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-color: #45434f var(--color-panel);
@@ -44,7 +47,10 @@
     grid-template-columns: minmax(0, 1fr);
   }
 
+  /* Stacked, each card sizes to its own content. */
   .conversation {
+    flex-basis: auto;
     max-height: 24rem;
+    contain: none;
   }
 }

@@ -74,7 +74,7 @@ async function createApp(fetchOverride = null, { window: windowOverrides = {} } 
     .map((match) => match[1])
     .filter((selector) => selector.startsWith('#') || selector.startsWith('[data-app'));
   for (const selector of appRequiredSelectors) elements.set(selector, new FakeElement(selector));
-  const modeButtons = ['generate', 'refactor', 'files'].map((mode) => {
+  const modeButtons = ['generate', 'refactor'].map((mode) => {
     const button = new FakeElement(`mode-${mode}`);
     button.dataset.mode = mode;
     return button;
@@ -150,7 +150,7 @@ test('HTML provides every required app selector and proposal control', () => {
     if (selector.startsWith('#')) assert.ok(ids.has(selector.slice(1)), `missing ${selector} in index.html`);
     else assert.match(htmlSource, /data-app="codeagent"/);
   }
-  for (const id of ['review-changes-button', 'accept-proposal-button', 'reject-proposal-button', 'save-file-button']) {
+  for (const id of ['review-changes-button', 'accept-proposal-button', 'reject-proposal-button']) {
     assert.ok(ids.has(id));
   }
 });
@@ -169,9 +169,7 @@ test('actual review, approve, and save handlers gate state and suppress duplicat
   const { elements, requests } = app;
   const reviewButton = elements.get('#review-changes-button');
   const approveButton = elements.get('#accept-proposal-button');
-  const saveButton = elements.get('#save-file-button');
   assert.equal(approveButton.disabled, true);
-  assert.equal(saveButton.disabled, true);
 
   reviewButton.dispatch('click');
   assert.equal(reviewButton.disabled, true);
@@ -190,12 +188,10 @@ test('actual review, approve, and save handlers gate state and suppress duplicat
   approval.resolve(jsonResponse({ proposalId: 'prop-1', status: 'APPROVED' }));
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(requests.find((request) => request.path.endsWith('/approve')).body, null);
-  // Accept puts the proposal into the editor; nothing is written and the
-  // proposal is not routed through Save output.
+  // Accept puts the proposal into the editor; nothing is written.
   assert.equal(elements.get('#code-editor').value, 'refactored <script>unsafe()</script>');
   assert.equal(elements.get('#code-status').textContent, 'Unsaved changes');
   assert.match(elements.get('#proposal-review-status').textContent, /Accepted into the editor · not saved/);
-  assert.equal(saveButton.disabled, true);
   assert.equal(requests.filter((request) => request.path === '/api/save').length, 0);
 
   globalThis.window.prompt = () => 'main.cpp';
@@ -228,7 +224,8 @@ test('failed decisions remain pending, surface backend errors, and do not enable
   app.elements.get('#accept-proposal-button').dispatch('click');
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(app.elements.get('#proposal-review-status').textContent, 'Proposal pending review');
-  assert.equal(app.elements.get('#save-file-button').disabled, true);
+  assert.notEqual(app.elements.get('#code-editor').value, 'refactored <script>unsafe()</script>',
+    'an unconfirmed approval does not change the editor');
   assert.equal(app.elements.get('#proposal-review-availability').textContent, 'The API request could not be completed.');
 });
 
@@ -252,7 +249,8 @@ test('actual reject control sends one request and reports only the confirmed res
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(app.elements.get('#proposal-review-status').textContent, 'Rejected');
   assert.match(app.elements.get('#notification-area').textContent, /rejected by the backend/);
-  assert.equal(app.elements.get('#save-file-button').disabled, true);
+  assert.equal(app.elements.get('#accept-proposal-button').disabled, true);
+  assert.equal(app.requests.filter((request) => request.path === '/api/save').length, 0);
 });
 
 test('a failed save after Accept keeps the accepted code in the editor as unsaved', async () => {
@@ -297,7 +295,6 @@ test('stale editor content blocks approval and save; rejected API state is confi
   assert.equal(app.elements.get('#accept-proposal-button').disabled, true);
   app.elements.get('#accept-proposal-button').dispatch('click');
   assert.equal(approvalCalls, 0);
-  assert.equal(app.elements.get('#save-file-button').disabled, true);
   assert.equal(app.requests.filter((request) => request.path === '/api/save').length, 0);
 
   const approvedApp = await createApp((path, body, fallback) => {
@@ -313,9 +310,7 @@ test('stale editor content blocks approval and save; rejected API state is confi
   const approvedEditor = approvedApp.elements.get('#code-editor');
   approvedEditor.value += '// stale';
   approvedEditor.dispatch('input');
-  assert.equal(approvedApp.elements.get('#save-file-button').disabled, true);
-  approvedApp.elements.get('#save-file-name').value = 'main.cpp';
-  approvedApp.elements.get('#save-file-button').dispatch('click');
+  assert.equal(approvedApp.elements.get('#accept-proposal-button').disabled, true);
   assert.equal(approvedApp.requests.filter((request) => request.path === '/api/save').length, 0);
 });
 
@@ -343,7 +338,7 @@ test('generated code and API errors are assigned as text content', async () => {
   assert.match(failing.elements.get('#notification-area').textContent, /<script>bad<\/script>/);
 });
 
-test('generated code saves once and replaces an existing file only after confirmation', async () => {
+test('accepted generated code is saved with Save As, replacing a file only after confirmation', async () => {
   const saveBodies = [];
   const app = await createApp((path, body, fallback) => {
     if (path === '/api/generate') return jsonResponse({ generatedCode: 'int main() {}\n', language: body.language });
@@ -356,27 +351,26 @@ test('generated code saves once and replaces an existing file only after confirm
     return fallback(`http://127.0.0.1:8080${path}`, { method: body ? 'POST' : 'GET', body: body && JSON.stringify(body) });
   });
   const { elements } = app;
-  const saveButton = elements.get('#save-file-button');
-  assert.equal(saveButton.disabled, true);
   elements.get('#prompt-input').value = 'Write main';
   elements.get('#language-input').value = 'C++';
   elements.get('#prompt-form').dispatch('submit');
   await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.equal(saveButton.disabled, false);
+  assert.equal(saveBodies.length, 0, 'generating writes nothing');
+  elements.get('#accept-proposal-button').dispatch('click');
 
   let confirmations = 0;
   globalThis.window.confirm = () => { confirmations += 1; return true; };
-  elements.get('#save-file-name').value = 'gen.cpp';
-  saveButton.dispatch('click');
-  saveButton.dispatch('click');
+  globalThis.window.prompt = () => 'gen.cpp';
+  const saveAsButton = elements.get('#save-document-as-button');
+  saveAsButton.dispatch('click');
+  saveAsButton.dispatch('click');
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(confirmations, 1);
   assert.deepEqual(saveBodies, [
     { fileName: 'gen.cpp', content: 'int main() {}\n', overwriteConfirmed: false },
     { fileName: 'gen.cpp', content: 'int main() {}\n', overwriteConfirmed: true },
   ]);
-  assert.match(elements.get('#notification-area').textContent, /confirmed the save: \/tmp\/gen\.cpp/);
-  assert.equal(saveButton.disabled, true);
+  assert.match(elements.get('#document-status').textContent, /Saved \/tmp\/gen\.cpp/);
 });
 
 test('declined overwrite of generated code does not send a confirmed save', async () => {
@@ -389,18 +383,20 @@ test('declined overwrite of generated code does not send a confirmed save', asyn
     }
     return fallback(`http://127.0.0.1:8080${path}`, { method: body ? 'POST' : 'GET', body: body && JSON.stringify(body) });
   });
-  globalThis.window.confirm = () => false;
   app.elements.get('#prompt-input').value = 'Write x';
   app.elements.get('#language-input').value = 'C++';
   app.elements.get('#prompt-form').dispatch('submit');
   await new Promise((resolve) => setTimeout(resolve, 0));
-  app.elements.get('#save-file-name').value = 'x.cpp';
-  app.elements.get('#save-file-button').dispatch('click');
+  globalThis.window.confirm = () => true;
+  app.elements.get('#accept-proposal-button').dispatch('click');
+  globalThis.window.confirm = () => false;
+  globalThis.window.prompt = () => 'x.cpp';
+  app.elements.get('#save-document-as-button').dispatch('click');
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(saveBodies.length, 1);
   assert.equal(saveBodies[0].overwriteConfirmed, false);
-  assert.match(app.elements.get('#notification-area').textContent, /not confirmed/);
-  assert.equal(app.elements.get('#save-file-button').disabled, false);
+  assert.match(app.elements.get('#document-status').textContent, /Save As cancelled\. The existing file was not changed/);
+  assert.equal(app.elements.get('#save-document-as-button').disabled, false);
 });
 
 test('opening a local file loads it into the editor and refactors that content', async () => {
@@ -413,7 +409,6 @@ test('opening a local file loads it into the editor and refactors that content',
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(elements.get('#code-editor').value, source);
   assert.equal(elements.get('#preview-heading').textContent, 'math.hpp');
-  assert.equal(elements.get('#save-file-name').value, 'math.hpp');
   assert.equal(elements.get('#code-status').textContent, 'Not saved to disk');
   assert.match(elements.get('#code-language').textContent, /location unknown/);
   assert.equal(elements.get('#save-document-button').disabled, true);
@@ -779,7 +774,6 @@ test('Accept puts the proposal into the editor unsaved, and Save writes the edit
   assert.equal(elements.get('#code-status').textContent, 'Unsaved changes');
   assert.equal(elements.get('#save-document-button').disabled, false);
   assert.equal(acceptButton.disabled, true, 'an accepted proposal cannot be applied again');
-  assert.equal(elements.get('#save-file-button').disabled, true, 'not routed through Save output');
   assert.equal(backend.writes.length, 0, 'Accept does not write to disk');
   assert.equal(requests.filter((request) => request.path === '/api/save').length, 0);
 
@@ -931,8 +925,7 @@ test('generated code can be accepted into the editor or rejected without touchin
   assert.equal(elements.get('#accept-proposal-button').disabled, false);
   elements.get('#reject-proposal-button').dispatch('click');
   assert.equal(elements.get('#code-editor').value, sample);
-  assert.equal(elements.get('#save-file-button').disabled, true, 'rejected output cannot be saved');
-  assert.equal(elements.get('#accept-proposal-button').disabled, true);
+  assert.equal(elements.get('#accept-proposal-button').disabled, true, 'rejected output cannot be accepted');
 
   await generate();
   elements.get('#accept-proposal-button').dispatch('click');
@@ -940,7 +933,7 @@ test('generated code can be accepted into the editor or rejected without touchin
   assert.equal(elements.get('#preview-heading').textContent, 'untitled.cpp ●');
   assert.equal(elements.get('#code-status').textContent, 'Unsaved changes');
   assert.equal(elements.get('#accept-proposal-button').disabled, true);
-  assert.equal(elements.get('#save-file-button').disabled, false, 'Save output still writes the generated code as-is');
+  assert.equal(elements.get('#save-document-as-button').disabled, false, 'Save As writes the accepted code');
 });
 
 test('Copy puts the current editor text on the clipboard and reports failures', async () => {
@@ -1122,7 +1115,6 @@ test('after Save As the editor is the new file: name, path, Save and Reload all 
   assert.equal(elements.get('#preview-heading').title, '/out/renamed.cpp');
   assert.equal(elements.get('#code-language').textContent, '/out/renamed.cpp');
   assert.equal(elements.get('#source-path-input').value, '/out/renamed.cpp');
-  assert.equal(elements.get('#save-file-name').value, 'renamed.cpp');
   assert.equal(elements.get('#code-status').textContent, 'Saved to disk');
   assert.match(elements.get('#document-status').textContent, /Saved \/out\/renamed\.cpp/);
   assert.equal(backend.writes.length, 0, 'the original file is not written');
@@ -1278,4 +1270,87 @@ test('a failed copy never shows Copied! and clears an earlier success', async (t
     delete globalThis.navigator;
     delete globalThis.document.execCommand;
   }
+});
+
+const readCss = (name) => readFileSync(new URL(`../css/${name}`, import.meta.url), 'utf8');
+
+test('the mode selector offers only Generate and Refactor, sharing the width equally', () => {
+  const modes = [...htmlSource.matchAll(/data-mode="([^"]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(modes, ['generate', 'refactor']);
+  assert.equal(htmlSource.includes('mode-files'), false);
+  assert.match(readCss('components.css'), /\.mode-cards \{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/);
+  assert.equal(appSource.includes("'files'"), false);
+});
+
+test('source-file controls are shown only in Refactor mode, without losing state', async () => {
+  assert.match(htmlSource, /<div class="path-row" id="source-file-controls" hidden>/,
+    'hidden before the script runs, so Generate never flashes them');
+  const backend = documentBackend();
+  const { elements, modeButtons, requests } = await createApp(backend.handler);
+  const controls = elements.get('#source-file-controls');
+  const [generate, refactor] = modeButtons;
+  assert.equal(controls.hidden, true, 'Generate is the initial mode');
+
+  refactor.dispatch('click');
+  assert.equal(controls.hidden, false);
+  assert.equal(refactor.attributes.get('aria-pressed'), 'true');
+  assert.equal(generate.attributes.get('aria-pressed'), 'false');
+  assert.equal(elements.get('#generate-submit-button').textContent, 'Create proposal');
+  elements.get('#source-path-input').value = '/work/a.cpp';
+  elements.get('#open-source-path-button').dispatch('click');
+  await settle();
+  typeInEditor(elements, 'int edited;\n');
+
+  generate.dispatch('click');
+  assert.equal(controls.hidden, true);
+  assert.equal(generate.attributes.get('aria-pressed'), 'true');
+  assert.equal(elements.get('#generate-submit-button').textContent, 'Generate code');
+  assert.equal(elements.get('#source-path-input').value, '/work/a.cpp', 'the path is kept');
+  assert.equal(elements.get('#code-editor').value, 'int edited;\n', 'the editor is kept');
+  assert.equal(elements.get('#output-directory-input').disabled, false, 'output controls stay usable');
+  assert.equal(elements.get('#set-output-directory-button').disabled, false);
+
+  // Generate needs no source file and sends only the instruction and language.
+  elements.get('#prompt-input').value = 'Write main';
+  elements.get('#language-input').value = 'C++';
+  elements.get('#prompt-form').dispatch('submit');
+  await settle();
+  assert.deepEqual(requests.find((request) => request.path === '/api/generate').body,
+    { instruction: 'Write main', language: 'C++' });
+
+  refactor.dispatch('click');
+  assert.equal(controls.hidden, false);
+  assert.equal(elements.get('#source-path-input').value, '/work/a.cpp');
+});
+
+test('the bottom action row and Save output are gone', () => {
+  for (const removed of ['bottom-actions', 'save-file-name', 'save-file-button', 'generate-code-button', 'Save output']) {
+    assert.equal(htmlSource.includes(removed), false, `${removed} is still in index.html`);
+  }
+  assert.equal(readCss('components.css').includes('.bottom-actions'), false);
+  assert.equal(readCss('components.css').includes('.save-file-name'), false);
+  assert.equal(/form="prompt-form"/.test(htmlSource), false, 'the form has a single submit button');
+});
+
+test('layout rules: aligned cards, a 45-line editor viewport, and screen-reader-only text', () => {
+  const layout = readCss('layout.css');
+  const components = readCss('components.css');
+  const main = readCss('main.css');
+  assert.match(layout, /\.workspace-panels \{[^}]*display: grid;[^}]*align-items: stretch;/);
+  assert.match(layout, /\.conversation \{[^}]*flex: 1 1 0;[^}]*contain: size;[^}]*overflow-y: auto;/,
+    'chat messages scroll inside the card instead of stretching the row');
+  assert.match(components, /--editor-max-lines: 45;/);
+  assert.match(components,
+    /\.code-preview \{[^}]*\n  height: calc\(var\(--editor-max-lines\) \* 1\.6em \+ 2 \* var\(--space-4\) \+ var\(--editor-scrollbar-allowance\)\);/,
+    'side by side, the viewport is exactly 45 editor line-heights plus padding and the scrollbar');
+  assert.match(components, /\.code-preview \{[^}]*line-height: 1\.6;/, 'the 1.6em line unit matches the editor line-height');
+  assert.match(components,
+    /@media \(max-width: 760px\) \{\s*\.code-preview \{\s*height: auto;/,
+    'stacked, the editor fits its content');
+  assert.match(components,
+    /\.message-thoughts__body \{\s*[^}]*max-height: calc\(14rem \+ 5 \* 1\.55em\);[^}]*overflow-y: auto;[^}]*line-height: 1\.55;/,
+    'expanded thoughts show five more of their own lines and still scroll');
+  assert.match(components, /\.code-editor \{[^}]*overflow: auto;[^}]*line-height: inherit;/);
+  assert.match(main, /\.visually-hidden \{[^}]*position: absolute;[^}]*clip: rect\(0 0 0 0\);/);
+  assert.match(main, /\[hidden\] \{\s*display: none !important;/);
 });
