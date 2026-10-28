@@ -34,10 +34,11 @@ This is a logical design; class names and boundaries must be confirmed against t
 ## 2. Common Rules
 
 - The backend binds to IPv4 loopback `127.0.0.1` and validates each `/api/` request's single `Host` header against `127.0.0.1:<actual backend port>` or `localhost:<actual backend port>`. Other hosts, ports, missing Host headers, and duplicate Host headers receive `400 INVALID_HOST`.
-- The supported browser GUI origins are exactly the server's own origins `http://127.0.0.1:<port>` and `http://localhost:<port>` (where `codeagent gui` serves the bundled frontend) plus the development origins `http://127.0.0.1:5500` and `http://localhost:5500`. Responses to an allowed origin include `Access-Control-Allow-Origin` matching that origin; wildcard CORS is not used.
-- The server handles preflight `OPTIONS` for API paths only when the Origin is a configured GUI origin, the requested method is `GET` or `POST`, and requested headers are absent or limited to `Content-Type`. Accepted preflights advertise `GET, POST, OPTIONS` and `Content-Type`.
-- Any present Origin on an API request must be exactly one of those supported origins. Foreign, `null`, malformed, or duplicate Origin headers receive `403 ORIGIN_NOT_ALLOWED` before route handlers run, including state-changing routes with empty bodies.
-- Requests with no Origin are accepted as non-browser local clients for CLI and automated-test compatibility. Host validation still applies. This is not client authentication: other local processes can make requests, and browser protection relies on browsers sending Origin for cross-origin requests. Do not expose the backend beyond loopback.
+- **Authentication.** Every `/api/` request except `POST /api/session` and CORS preflights must carry exactly one `X-CodeAgent-Token` header equal to the server's session token. Otherwise the server returns `401 UNAUTHORIZED` before any route handler runs, so nothing is read, written, opened, changed, or sent to the provider. The token is 64 lowercase hex characters (256 random bits from the OS cryptographic source), is generated per server instance, lives only in memory, and is compared in constant time. It is never logged, printed, or included in any response other than `POST /api/session`. See [Session](#session-post-apisession).
+- The supported browser GUI origins are exactly the server's own origins `http://127.0.0.1:<port>` and `http://localhost:<port>`, where `codeagent gui` serves the bundled frontend. One additional development origin is accepted only when configured explicitly: `CODEAGENT_DEV_ORIGIN` for `codeagent gui`, or `GuiHttpServer::allowDevelopmentOrigin`. It must be exactly `http://127.0.0.1:<port>` or `http://localhost:<port>`. No development origin is allowed by default. Responses to an allowed origin include `Access-Control-Allow-Origin` matching that origin and `Access-Control-Allow-Credentials: true`; wildcard CORS is never used.
+- The server answers preflight `OPTIONS` for API paths only when the Origin is an allowed origin, the requested method is `GET` or `POST`, and requested headers are absent or limited to `Content-Type` and `X-CodeAgent-Token` (each at most once). Accepted preflights return `204` with no body and advertise `GET, POST, OPTIONS` and `Content-Type, X-CodeAgent-Token`. Browsers never send custom headers on a preflight, so preflights cannot be authenticated. They never reach a route handler; the actual request still needs the token.
+- Any present Origin on an API request must be exactly one of the allowed origins. Foreign, `null`, malformed, or duplicate Origin headers receive `403 ORIGIN_NOT_ALLOWED` before route handlers run, including state-changing routes with empty bodies.
+- Requests with no Origin header (non-browser local clients such as tests) are accepted if they carry the token. `POST /api/session` always requires an allowed Origin. Do not expose the backend beyond loopback.
 - Use JSON request bodies (`Content-Type: application/json`) and JSON responses.
 - Capture the terminal's current working directory when `codeagent gui` starts. This is the immutable default output directory.
 - Save-directory precedence: session-selected directory, then launch directory. The save request does not accept a directory path.
@@ -62,8 +63,9 @@ All `/api/` errors use this JSON shape. Unknown API routes return `404 NOT_FOUND
 
 | Method and path | Purpose |
 |---|---|
+| `POST /api/session` | Exchange a one-time bootstrap code, or the session cookie, for the session token. The only route that works without the token. |
 | `GET /api/health` | Check that the backend is responding. |
-| `GET /api/config` | Return safe configuration, supported extensions, and launch/active output directories. Never return secrets. |
+| `GET /api/config` | Return the launch and active output directories. Never return secrets. |
 | `POST /api/generate` | Generate code from an instruction and language. Does not save automatically. |
 | `POST /api/refactor` | Accept editor source and instruction; return a pending proposal. Does not modify files. |
 | `POST /api/diff` | Return a diff for two code buffers or an existing proposal ID. |
@@ -75,6 +77,34 @@ All `/api/` errors use this JSON shape. Unknown API routes return `404 NOT_FOUND
 | `POST /api/files/write` | Save editor content back to a file opened with `/api/files/read`, detecting changes made on disk since. |
 | `POST /api/output/select-directory` | Open a directory picker or set a validated session output directory. |
 | `POST /api/save` | Save generated code or an approved proposal to the requested output location. |
+
+### Session: `POST /api/session`
+
+`codeagent gui` opens the page at `http://127.0.0.1:<port>/#bootstrap=<code>`, where `<code>` comes from `GuiHttpServer::issueBootstrapCode()`. A bootstrap code is 64 hex characters, valid for 5 minutes, and single use; at most 8 unused codes are kept. It travels in the URL fragment, so the browser never sends it in a request line, `Referer`, or server log. The page removes it from the address bar with `history.replaceState` and posts:
+
+```json
+{"bootstrap": "<64 hex characters>"}
+```
+
+or, without a code (for example after a reload), an empty object `{}`. The request needs `Content-Type: application/json` and an allowed `Origin` (`403 ORIGIN_REQUIRED` without one, `403 ORIGIN_NOT_ALLOWED` for others). Success returns `200` with `Cache-Control: no-store`:
+
+```json
+{"token": "<64 hex characters>"}
+```
+
+A successful code exchange also sets `codeagent_session_<port>=<secret>; Path=/api/session; HttpOnly; SameSite=Strict`. The secret is random, separate from the token, and only accepted by this route. Posting `{}` with that cookie returns the token again, so a reload stays connected. The cookie never authorizes any other route.
+
+| Status | Error code | Meaning |
+|---|---|---|
+| `400` | `INVALID_JSON` / `INVALID_REQUEST` | The body is not `{}` or `{"bootstrap": string}`. |
+| `401` | `INVALID_BOOTSTRAP` | The code is unknown, expired, or already used. |
+| `401` | `SESSION_REQUIRED` | No code and no valid session cookie. |
+| `403` | `ORIGIN_REQUIRED` / `ORIGIN_NOT_ALLOWED` | Missing or disallowed Origin. |
+| `415` | `UNSUPPORTED_MEDIA_TYPE` | The content type is not `application/json`. |
+
+The frontend keeps the token in a JavaScript variable only (never `localStorage`, `sessionStorage`, or a URL) and sends it as `X-CodeAgent-Token` on every other API request. If a request returns `401 UNAUTHORIZED` (for example after a server restart), the page drops the token.
+
+Security limits: this protects against other websites and against local processes that cannot read the user's files or memory. It does not protect against software running as the same user, which can read the browser profile or memory, the terminal, or the server process. The bootstrap code appears briefly on the browser launcher's command line, and is printed when no browser can be opened. Both exposures are bounded by single use and the 5-minute lifetime.
 
 ### B4 response schemas (agreed API contract)
 
@@ -94,30 +124,15 @@ On success, return HTTP `200` with a JSON response:
 
 On success, return HTTP `200` with a JSON object containing exactly these fields:
 
-- `supportedExtensions`: an array of supported source-file extension strings.
 - `launchDirectory`: the absolute path captured when the GUI session is initialized.
 - `activeOutputDirectory`: the absolute path currently selected for output. Initially, it is equal to `launchDirectory`.
 
-The current supported extension list is:
-
-```json
-[
-  ".c",
-  ".cc",
-  ".cpp",
-  ".cxx",
-  ".h",
-  ".hh",
-  ".hpp",
-  ".hxx"
-]
-```
+The response no longer includes `supportedExtensions`; its only consumer was a display in the page, which was removed. The restriction itself is unchanged: every file route accepts only `.c .cc .cpp .cxx .h .hh .hpp .hxx` and validates this on the server.
 
 Example successful response:
 
 ```json
 {
-  "supportedExtensions": [".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"],
   "launchDirectory": "/absolute/path/to/launch/directory",
   "activeOutputDirectory": "/absolute/path/to/launch/directory"
 }
@@ -210,7 +225,7 @@ On success, return HTTP `200` with the documented fields. The returned proposal 
 
 `editorRevision` is an opaque, non-empty client revision token. The backend retains it with the pending proposal and does not reinterpret or return it in the B7 response. `baseEditorHash` is `fnv1a64:` followed by a 16-character, lowercase hexadecimal FNV-1a 64-bit hash of the exact UTF-8 bytes of `sourceCode`. This stable non-cryptographic hash is for accidental editor-content mismatch detection, not authentication or security. A later stale-editor check should compare both the revision token and source hash.
 
-Proposal IDs are sequential (`prop-1`, `prop-2`, and so on) within one server process. Proposals are held in memory and discarded when the server stops; they are not persisted. At most 128 proposals are retained, counting in-flight creation reservations. A refactor request reserves a free slot or pins the oldest unreserved `REJECTED` or `APPLIED` proposal for replacement before invoking the provider. If no slot or terminal proposal is available, the server returns `503 PROPOSAL_CAPACITY` without calling the provider. Pending, approved, saving, and reserved proposals are never evicted. Response serialization and proposal-node allocation are staged before replacement; the old terminal proposal remains stored if provider or preparation fails. Concurrent reservations cannot claim the same terminal entry or exceed the cap. Failed requests do not advance the proposal ID counter.
+Proposal IDs are sequential (`prop-1`, `prop-2`, and so on) within one server process. Proposals are held in memory and discarded when the server stops; they are not persisted. At most 128 proposals are retained, counting in-flight creation reservations. A refactor request reserves a free slot, or pins an evictable proposal for replacement, before invoking the provider. Evictable proposals are, in order of preference: the oldest unreserved `REJECTED` or `APPLIED` proposal; then the longest-idle `PENDING` or `APPROVED` proposal that no request (diff, approve, reject, mark-applied, save) has used for at least 30 minutes. If none is available, the server returns `503 PROPOSAL_CAPACITY` without calling the provider. When the new proposal is stored, the pinned proposal is checked again under the proposal mutex. If it was used meanwhile, another evictable proposal is replaced instead, or the request returns `503 PROPOSAL_CAPACITY`. Proposals that are saving or reserved by another request are never evicted. Expiry only makes a proposal eligible for replacement; it stays usable until replaced. Response serialization and proposal-node allocation are staged before replacement; the old terminal proposal remains stored if provider or preparation fails. Concurrent reservations cannot claim the same terminal entry or exceed the cap. Failed requests do not advance the proposal ID counter.
 
 Errors use the common JSON error object from Section 2:
 
@@ -337,7 +352,7 @@ The canonical path is remembered for this server session as an in-place save tar
 
 #### `POST /api/files/write`
 
-Request: exactly `{"path": string, "content": string, "baseRevision": string, "overwriteConfirmed": boolean}`. `path` must be a canonical path previously returned by `/api/files/read` in this session; any other path is refused with `403 FILE_NOT_OPENED`. If the file on disk no longer matches `baseRevision` (it was edited elsewhere or deleted) and `overwriteConfirmed` is false, the response is `409 FILE_CHANGED_ON_DISK` and nothing is written. The write is atomic, preserves the file's permission bits, and refuses symlinks and non-regular files (`422 INVALID_TARGET`). Permission failures return `403 PERMISSION_DENIED`. Success returns HTTP `200`:
+Request: exactly `{"path": string, "content": string, "baseRevision": string, "overwriteConfirmed": boolean}`. `path` must be a canonical path previously returned by `/api/files/read` in this session; any other path is refused with `403 FILE_NOT_OPENED`. If the file on disk no longer matches `baseRevision` (it was edited elsewhere or deleted) and `overwriteConfirmed` is false, the response is `409 FILE_CHANGED_ON_DISK` and nothing is written. The write is atomic, preserves the file's read/write/execute permission bits (setuid, setgid, and sticky bits are cleared), and refuses symlinks and non-regular files (`422 INVALID_TARGET`). The server can save in place to the 256 most recently opened or saved files; beyond that the least recently used path is forgotten and returns `403 FILE_NOT_OPENED` until it is opened again. Reads enforce the 512 KiB limit while reading and refuse FIFOs and devices without blocking. Permission failures return `403 PERMISSION_DENIED`. Success returns HTTP `200`:
 
 ```json
 {"savedPath":"/canonical/path/insertion_sort.cpp","status":"SAVED","revision":"fnv1a64:fedcba9876543210"}
@@ -390,14 +405,14 @@ PENDING ──approve──> APPROVED ──successful save──> APPLIED
 - Use a unique temporary file per write and safe platform-appropriate replacement. On failure, clean up the temporary file where possible, preserve the existing target where supported, and leave the proposal approved for retry.
 - A successful proposal save transitions `APPROVED` to `APPLIED`; a failed write leaves it approved and retryable.
 - The UI displays `APPLIED` and the saved path only after a valid save success response.
-- At the 128-proposal limit, only the oldest rejected or applied proposal is eligible for eviction. The proposal mutex is held across state changes and save I/O, so creation cannot evict a proposal while its save is in progress. If all entries are pending or approved, creation returns `503 PROPOSAL_CAPACITY`.
+- At the 128-proposal limit, rejected or applied proposals are evicted first (oldest first), then pending or approved proposals idle for at least 30 minutes (longest idle first). The proposal mutex is held across state changes and save I/O, and eviction decisions are made under it, so creation cannot evict a proposal while its save is in progress. If nothing is evictable, creation returns `503 PROPOSAL_CAPACITY`.
 - Inspect `FileManager` before GUI integration. An HTTP request must not hang waiting for terminal input.
 
 ## 5. Security and Error Handling
 
-`./build/codeagent gui` serves the `frontend` directory and the API from the same loopback origin (default `http://127.0.0.1:8080`, override with `CODEAGENT_GUI_PORT`) and opens it in the default browser. For frontend-only development, the directory can still be served separately at `http://127.0.0.1:5500`; the page then calls the API on port 8080. Other frontend origins require an intentional backend policy change; they are not implicitly trusted.
+`./build/codeagent gui` serves the `frontend` directory and the API from the same loopback origin (default `http://127.0.0.1:8080`, override with `CODEAGENT_GUI_PORT`) and opens it in the default browser with a one-time bootstrap code. For frontend-only development, start it with `CODEAGENT_DEV_ORIGIN=http://127.0.0.1:5500` and serve the directory there. The page then calls the API on port 8080, and the server prints a one-time link for that origin. Without that variable, port 5500 and every other origin are rejected.
 
-Origin checks are server-side request checks; CORS response headers alone do not authorize state changes. Missing Origin remains permitted for non-browser loopback callers as described above.
+Origin checks are server-side request checks; CORS response headers alone do not authorize anything. The session token is required in addition to the Host and Origin checks, not instead of them.
 
 - Validate request fields, file extensions, filenames, and paths.
 - Reject path traversal outside the permitted output directory. Do not rely on string normalization alone where symlinks can affect the result.
@@ -422,13 +437,13 @@ Before calling the GUI backend complete, verify:
 - Existing-file conflicts and failed writes are handled safely.
 - Automated tests do not require live AI calls; use a test seam or fake where appropriate.
 - The frontend uses the same endpoint paths and JSON shapes.
-- Frontend checks run with `node frontend/tests/api.test.mjs`, `node frontend/tests/proposalWorkflow.test.mjs`, `node frontend/tests/appDomIntegration.test.mjs`, and `node --check` on the JavaScript modules. The DOM integration suite uses a small dependency-free test DOM and executes the actual app module; it is not a substitute for a browser smoke test.
+- Frontend checks run with `node --test frontend/tests/*.test.mjs` and `node --check` on the JavaScript modules. The DOM integration suite uses a small dependency-free test DOM and executes the actual app module; it is not a substitute for a browser smoke test.
 - Build, automated test results, and native-dialog manual checks are reported honestly.
 
 For assessment quality, keep HTTP handling, proposal state, AI orchestration, and file operations separately testable. Use RAII and clear ownership. Add interfaces, inheritance, templates, or operator overloads only when they solve a genuine design problem; document the actual implementation in UML rather than inventing classes for the diagram.
 
-The current browser editor is a plain text area, not Monaco. The source-file dialog returns a validated path but does not read file contents; users must paste source into the editor to refactor it. Files mode, settings, and copy controls remain disabled placeholders. There is no `/api/session/exit` route; stop the backend from its owning terminal with Ctrl+C. No browser automation is configured in this repository.
+The current browser editor is a plain text area, not Monaco. The source-file dialog returns a validated path but does not read file contents; users must paste source into the editor to refactor it. Files mode and settings remain disabled placeholders. There is no route to stop the server; stop the backend from its owning terminal with Ctrl+C. No browser automation is configured in this repository.
 
-Manual browser verification: build and start `./build/codeagent gui` and use the page it opens at `http://127.0.0.1:8080/` (not `file://`). Confirm health/config, generate a response with a configured provider, enter source text and create a refactor proposal, request and inspect its diff, approve it, enter a supported filename, and save. Repeat with a second proposal and reject it; verify it cannot be saved. To verify overwrite handling, save an approved proposal to an existing file and confirm the prompt before replacement. Editing the source after proposal creation should disable approval and save until the original text is restored. The provider-backed steps can incur provider usage and require valid configuration.
+Manual browser verification: build and start `./build/codeagent gui` and use the page it opens (`http://127.0.0.1:8080/#bootstrap=…`, not `file://`). Confirm health/config, generate a response with a configured provider, enter source text and create a refactor proposal, request and inspect its diff, approve it, enter a supported filename, and save. Repeat with a second proposal and reject it; verify it cannot be saved. To verify overwrite handling, save an approved proposal to an existing file and confirm the prompt before replacement. Editing the source after proposal creation should disable approval and save until the original text is restored. The provider-backed steps can incur provider usage and require valid configuration.
 
 Manual native-dialog verification on Linux requires a graphical session and `zenity`: use both source and output-directory buttons, confirm selections return paths, cancel each dialog and confirm the active output directory remains unchanged, and test an unsupported file selection. The Windows implementation reports unavailable. macOS has no native dialog implementation and depends on the POSIX `zenity` path if installed. Automated dialog tests use a fake provider; they verify cancellation, failure, timeout, and path validation without opening a desktop dialog.

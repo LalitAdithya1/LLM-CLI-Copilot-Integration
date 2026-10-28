@@ -1,7 +1,6 @@
 
 #include "CLIController.hpp"
 
-#include "EnvLoader.hpp"
 #include "FileManager.hpp"
 #include "GuiHttpServer.hpp"
 #include "PromptBuilder.hpp"
@@ -108,8 +107,9 @@ int runGuiCommand(std::ostream& output, std::ostream& error) {
     }
 
     // Report a missing key at startup instead of only on the first request.
-    // The key itself is never printed or sent to the browser.
-    loadEnvFile(".env");
+    // The key itself is never printed or sent to the browser. .env is loaded
+    // here, once, before any request thread exists.
+    LLMClient::loadDotEnvOnce();
     if (!isSetEnvironmentValue(std::getenv("GEMINI_API_KEY"))) {
         error << "Warning: GEMINI_API_KEY is not set. Add it to a .env file in "
               << "the launch directory or export it; generation and "
@@ -158,6 +158,15 @@ int runGuiCommand(std::ostream& output, std::ostream& error) {
         std::move(generationHandler),
         std::move(refactoringHandler)
     );
+    // A frontend on another origin, such as a live-reload server, is only
+    // accepted when explicitly configured.
+    const char* developmentOrigin = std::getenv("CODEAGENT_DEV_ORIGIN");
+    if (isSetEnvironmentValue(developmentOrigin) &&
+        !server.allowDevelopmentOrigin(developmentOrigin)) {
+        error << "Error: CODEAGENT_DEV_ORIGIN must be exactly http://127.0.0.1:<port> "
+              << "or http://localhost:<port>.\n";
+        return 1;
+    }
     const auto frontendDirectory = findFrontendDirectory(error);
     const bool servingFrontend =
         !frontendDirectory.empty() && server.serveFrontend(frontendDirectory);
@@ -196,18 +205,24 @@ int runGuiCommand(std::ostream& output, std::ostream& error) {
 
     const std::string url =
         "http://127.0.0.1:" + std::to_string(server.port()) + "/";
-    output << "CodeAgent GUI running at " << url << "\n"
-           << "Health endpoint: " << url << "api/health\n";
+    output << "CodeAgent GUI running at " << url << "\n";
+    // The page needs a one-time code to obtain the API session token. It is
+    // put in the URL fragment, which browsers do not send to the server. The
+    // session token itself is never printed.
     if (servingFrontend) {
         output << "Serving frontend from " << frontendDirectory.string() << "\n";
-        if (isSetEnvironmentValue(std::getenv("CODEAGENT_NO_BROWSER"))) {
-            output << "Open " << url << " in your browser.\n";
-        } else if (launchDefaultBrowser(url)) {
+        const bool openBrowser = !isSetEnvironmentValue(std::getenv("CODEAGENT_NO_BROWSER"));
+        if (openBrowser && launchDefaultBrowser(url + "#bootstrap=" + server.issueBootstrapCode())) {
             output << "Opening your default browser...\n";
         } else {
-            output << "Could not open a browser automatically. Open "
-                   << url << " in your browser.\n";
+            if (openBrowser) output << "Could not open a browser automatically.\n";
+            output << "Open this one-time link within 5 minutes:\n  "
+                   << url << "#bootstrap=" << server.issueBootstrapCode() << "\n";
         }
+    }
+    if (isSetEnvironmentValue(developmentOrigin)) {
+        output << "Development frontend (one-time link, valid 5 minutes):\n  "
+               << developmentOrigin << "/#bootstrap=" << server.issueBootstrapCode() << "\n";
     }
     output << "Press Ctrl+C to stop.\n";
     output.flush();

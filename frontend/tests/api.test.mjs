@@ -4,7 +4,9 @@ import { readFileSync } from 'node:fs';
 
 const apiSource = readFileSync(new URL('../js/api.js', import.meta.url), 'utf8');
 const apiModuleUrl = `data:text/javascript;base64,${Buffer.from(apiSource).toString('base64')}`;
-const { ApiError, createApiClient, getBackendBaseUrl } = await import(apiModuleUrl);
+const {
+  ApiError, SESSION_TOKEN_HEADER, createApiClient, getBackendBaseUrl, takeBootstrapCode,
+} = await import(apiModuleUrl);
 
 function jsonResponse(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -223,4 +225,89 @@ test('generation and refactoring responses accept an optional thoughts string', 
   };
   const request = { sourceCode: 'a', instruction: 'x', language: 'C++', editorRevision: 'r1' };
   assert.equal((await respond(proposal).refactorCode(request)).thoughts, 'Rename it.');
+});
+
+const TOKEN = '0123456789abcdef'.repeat(4);
+
+test('the session token is obtained once and sent on every later request', async () => {
+  const calls = [];
+  const client = createApiClient({
+    baseUrl: 'http://127.0.0.1:8080',
+    fetchImpl: async (url, options) => {
+      calls.push({ path: new URL(url).pathname, options });
+      if (url.endsWith('/api/session')) return jsonResponse({ token: TOKEN });
+      return jsonResponse({ status: 'ok' });
+    },
+  });
+  assert.equal(client.hasSession(), false);
+  await client.getHealth();
+  assert.equal(calls[0].options.headers[SESSION_TOKEN_HEADER], undefined, 'no token before a session');
+
+  await client.startSession('c'.repeat(64));
+  assert.equal(client.hasSession(), true);
+  const session = calls[1];
+  assert.equal(session.path, '/api/session');
+  assert.deepEqual(JSON.parse(session.options.body), { bootstrap: 'c'.repeat(64) });
+  assert.equal(session.options.credentials, 'include');
+  assert.equal(session.options.headers[SESSION_TOKEN_HEADER], undefined);
+
+  await client.getHealth();
+  assert.equal(calls[2].options.headers[SESSION_TOKEN_HEADER], TOKEN);
+
+  // Without a code the session cookie is used, e.g. after a reload.
+  await client.startSession(null);
+  assert.deepEqual(JSON.parse(calls[3].options.body), {});
+});
+
+test('an invalid session response or a rejected token leaves no usable session', async () => {
+  for (const payload of [{ token: 'short' }, { token: TOKEN, extra: 1 }, { token: 7 }]) {
+    const client = createApiClient({ fetchImpl: async () => jsonResponse(payload) });
+    await assert.rejects(client.startSession('x'), (error) => error.code === 'INVALID_RESPONSE');
+    assert.equal(client.hasSession(), false);
+  }
+
+  const failing = createApiClient({
+    fetchImpl: async () => jsonResponse({ error: { code: 'INVALID_BOOTSTRAP', message: 'This startup link is invalid.' } }, 401),
+  });
+  await assert.rejects(failing.startSession('x'), (error) => error.code === 'INVALID_BOOTSTRAP' && error.status === 401);
+
+  let unauthorized = false;
+  const client = createApiClient({
+    fetchImpl: async (url) => {
+      if (url.endsWith('/api/session')) return jsonResponse({ token: TOKEN });
+      return unauthorized
+        ? jsonResponse({ error: { code: 'UNAUTHORIZED', message: 'Missing or invalid session token.' } }, 401)
+        : jsonResponse({ status: 'ok' });
+    },
+  });
+  await client.startSession('x');
+  unauthorized = true;
+  await assert.rejects(client.getHealth(), (error) => error.code === 'UNAUTHORIZED');
+  assert.equal(client.hasSession(), false, 'a token the server rejects is dropped');
+});
+
+test('takeBootstrapCode reads the one-time code and removes it from the address bar', () => {
+  const replaced = [];
+  const history = { replaceState: (...args) => replaced.push(args) };
+  const code = 'd'.repeat(64);
+  assert.equal(takeBootstrapCode({ hash: `#bootstrap=${code}`, pathname: '/', search: '?x=1' }, history), code);
+  assert.deepEqual(replaced, [[null, '', '/?x=1']]);
+
+  assert.equal(takeBootstrapCode({ hash: '#bootstrap=not-a-code', pathname: '/', search: '' }, history), null);
+  assert.equal(replaced.length, 2, 'a malformed code is removed too');
+
+  assert.equal(takeBootstrapCode({ hash: '', pathname: '/', search: '' }, history), null);
+  assert.equal(takeBootstrapCode({ hash: '#other', pathname: '/', search: '' }, history), null);
+  assert.equal(replaced.length, 2);
+  assert.equal(takeBootstrapCode(undefined, undefined), null);
+});
+
+test('configuration no longer carries the supported-extension list', async () => {
+  const config = { launchDirectory: '/a', activeOutputDirectory: '/b' };
+  const client = createApiClient({ fetchImpl: async () => jsonResponse(config) });
+  assert.deepEqual(await client.getConfig(), config);
+  const extended = createApiClient({
+    fetchImpl: async () => jsonResponse({ ...config, supportedExtensions: ['.cpp'] }),
+  });
+  await assert.rejects(extended.getConfig(), (error) => error.code === 'INVALID_RESPONSE');
 });

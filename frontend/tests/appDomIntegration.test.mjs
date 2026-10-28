@@ -66,7 +66,9 @@ function jsonResponse(payload, status = 200) {
   });
 }
 
-async function createApp(fetchOverride = null) {
+const TEST_TOKEN = 'ab'.repeat(32);
+
+async function createApp(fetchOverride = null, { window: windowOverrides = {} } = {}) {
   const elements = new Map();
   const appRequiredSelectors = [...appSource.matchAll(/'([^']+)'/g)]
     .map((match) => match[1])
@@ -89,10 +91,10 @@ async function createApp(fetchOverride = null) {
   const defaultFetch = async (url, options, record = true) => {
     const path = new URL(url).pathname;
     const body = options.body ? JSON.parse(options.body) : null;
-    if (record) requests.push({ path, method: options.method, body });
+    if (record) requests.push({ path, method: options.method, body, headers: options.headers });
+    if (path === '/api/session') return jsonResponse({ token: TEST_TOKEN });
     if (path === '/api/health') return jsonResponse({ status: 'ok' });
     if (path === '/api/config') return jsonResponse({
-      supportedExtensions: ['.cpp'],
       launchDirectory: '/tmp',
       activeOutputDirectory: '/tmp',
     });
@@ -110,12 +112,12 @@ async function createApp(fetchOverride = null) {
   };
 
   globalThis.document = document;
-  globalThis.window = { confirm: () => true };
+  globalThis.window = { confirm: () => true, ...windowOverrides };
   globalThis.fetch = fetchOverride
     ? (url, options) => {
       const path = new URL(url).pathname;
       const body = options.body ? JSON.parse(options.body) : null;
-      requests.push({ path, method: options.method, body });
+      requests.push({ path, method: options.method, body, headers: options.headers });
       return fetchOverride(path, body, (fallbackUrl, fallbackOptions) => defaultFetch(fallbackUrl, fallbackOptions, false));
     }
     : defaultFetch;
@@ -458,27 +460,38 @@ function typeInEditor(elements, text) {
 function documentBackend(overrides = {}) {
   const writes = [];
   const reads = [];
+  // Contents written through /api/save or /api/files/write, by path.
+  const files = new Map();
   let revision = REVISION_A;
   const handler = (path, body, fallback) => {
     if (overrides[path]) {
       const result = overrides[path](body);
-      if (result) return result;
+      if (result) {
+        if (path === '/api/save' && result.status === 200) {
+          return result.clone().json().then((saved) => {
+            files.set(saved.savedPath, body.content);
+            return result;
+          });
+        }
+        return result;
+      }
     }
     if (path === '/api/files/open-dialog') {
       return jsonResponse({ status: 'SELECTED', selectedPath: '/work/insertion_sort.cpp' });
     }
     if (path === '/api/files/read') {
       reads.push(body.path);
-      return jsonResponse({ path: body.path, content: `// ${body.path}\n`, revision: REVISION_A });
+      return jsonResponse({ path: body.path, content: files.get(body.path) ?? `// ${body.path}\n`, revision: REVISION_A });
     }
     if (path === '/api/files/write') {
       writes.push(body);
+      files.set(body.path, body.content);
       revision = revision === REVISION_A ? REVISION_B : REVISION_C;
       return jsonResponse({ savedPath: body.path, status: 'SAVED', revision });
     }
     return fallback(`http://127.0.0.1:8080${path}`, { method: body ? 'POST' : 'GET', body: body && JSON.stringify(body) });
   };
-  return { handler, writes, reads };
+  return { handler, writes, reads, files };
 }
 
 test('a new document is untitled.cpp and the unsaved marker follows edits', async () => {
@@ -1029,4 +1042,240 @@ test('Enter in the prompt sends it and Shift+Enter does not', async () => {
   assert.equal(requests.filter((request) => request.path === '/api/generate').length, 0);
   elements.get('#prompt-input').dispatch('keydown', { key: 'Enter', shiftKey: false });
   assert.equal(requests.filter((request) => request.path === '/api/generate').length, 1);
+});
+
+// Lets pending promise callbacks run without using timers, for tests that
+// mock setTimeout.
+async function flushMicrotasks() {
+  for (let index = 0; index < 20; index += 1) await Promise.resolve();
+}
+
+test('the page exchanges its one-time code for the session token before calling the API', async () => {
+  const replaced = [];
+  const code = 'e'.repeat(64);
+  const { elements, requests } = await createApp(null, {
+    window: {
+      location: { hash: `#bootstrap=${code}`, pathname: '/', search: '' },
+      history: { replaceState: (...args) => replaced.push(args) },
+    },
+  });
+  assert.deepEqual(replaced, [[null, '', '/']], 'the code is removed from the address bar');
+  assert.equal(requests[0].path, '/api/session');
+  assert.deepEqual(requests[0].body, { bootstrap: code });
+  assert.equal(requests[0].headers['X-CodeAgent-Token'], undefined);
+  const apiCalls = requests.slice(1);
+  assert.ok(apiCalls.some((request) => request.path === '/api/health'));
+  for (const request of apiCalls) {
+    assert.equal(request.headers['X-CodeAgent-Token'], TEST_TOKEN, `${request.path} carries the token`);
+  }
+  assert.equal(elements.get('#assistant-status').dataset.state, 'connected');
+  assert.equal(elements.get('#notification-area').textContent.includes(TEST_TOKEN), false);
+});
+
+test('without a valid session the page reports it and makes no other API calls', async () => {
+  const { elements, requests } = await createApp((path, body, fallback) => {
+    if (path === '/api/session') {
+      return jsonResponse({ error: { code: 'SESSION_REQUIRED', message: 'This page is not connected. Open the link that codeagent gui opened or printed.' } }, 401);
+    }
+    return fallback(`http://127.0.0.1:8080${path}`, { method: body ? 'POST' : 'GET', body: body && JSON.stringify(body) });
+  });
+  assert.deepEqual(requests.map((request) => request.path), ['/api/session']);
+  assert.deepEqual(requests[0].body, {}, 'without a code the session cookie is tried');
+  assert.equal(elements.get('#assistant-status').dataset.state, 'unavailable');
+  assert.equal(elements.get('#assistant-status-message').textContent, 'Not connected');
+  assert.match(elements.get('#assistant-status-detail').textContent, /Open the link/);
+  assert.equal(elements.get('#backend-retry-button').disabled, false, 'Retry stays available');
+});
+
+test('the supported-extension list is no longer displayed, but uploads are still checked', async () => {
+  assert.equal(htmlSource.includes('Supported extensions'), false);
+  assert.equal(htmlSource.includes('backend-config-extensions'), false);
+  assert.equal(appSource.includes('supportedExtensions'), false);
+  const { elements } = await createApp();
+  assert.equal(elements.get('#backend-config-launch-directory').textContent, '/tmp');
+  assert.equal(elements.get('#backend-config-output-directory').textContent, '/tmp');
+  assert.equal(elements.get('#backend-config-values').hidden, false);
+
+  elements.get('#load-source-file-input').files = [{ name: 'notes.txt', size: 4, text: async () => 'x' }];
+  elements.get('#load-source-file-input').dispatch('change');
+  await settle();
+  assert.match(elements.get('#file-status').textContent, /notes\.txt is not a supported source file/);
+});
+
+test('after Save As the editor is the new file: name, path, Save and Reload all use it', async () => {
+  const backend = documentBackend({
+    '/api/save': (body) => jsonResponse({ savedPath: `/out/${body.fileName}`, status: 'SAVED' }),
+  });
+  const { elements, requests } = await createApp(backend.handler);
+  elements.get('#source-path-input').value = '/work/original.cpp';
+  elements.get('#open-source-path-button').dispatch('click');
+  await settle();
+  assert.equal(elements.get('#preview-heading').textContent, 'original.cpp');
+  typeInEditor(elements, 'int edited;\n');
+
+  globalThis.window.prompt = () => 'renamed.cpp';
+  elements.get('#save-document-as-button').dispatch('click');
+  assert.equal(elements.get('#preview-heading').textContent, 'original.cpp ●',
+    'the name changes only once the backend confirms the save');
+  await settle();
+  assert.equal(elements.get('#preview-heading').textContent, 'renamed.cpp');
+  assert.equal(elements.get('#preview-heading').title, '/out/renamed.cpp');
+  assert.equal(elements.get('#code-language').textContent, '/out/renamed.cpp');
+  assert.equal(elements.get('#source-path-input').value, '/out/renamed.cpp');
+  assert.equal(elements.get('#save-file-name').value, 'renamed.cpp');
+  assert.equal(elements.get('#code-status').textContent, 'Saved to disk');
+  assert.match(elements.get('#document-status').textContent, /Saved \/out\/renamed\.cpp/);
+  assert.equal(backend.writes.length, 0, 'the original file is not written');
+
+  typeInEditor(elements, 'int again;\n');
+  elements.get('#save-document-button').dispatch('click');
+  await settle();
+  assert.equal(backend.writes.length, 1);
+  assert.equal(backend.writes[0].path, '/out/renamed.cpp');
+  assert.equal(backend.writes[0].baseRevision, REVISION_A, 'conflicts are checked against the new file');
+
+  elements.get('#reload-document-button').dispatch('click');
+  await settle();
+  assert.equal(backend.reads.at(-1), '/out/renamed.cpp');
+  assert.equal(elements.get('#code-editor').value, 'int again;\n');
+  assert.equal(requests.filter((request) => request.path === '/api/files/read'
+    && request.body.path === '/work/original.cpp').length, 1, 'the old path is never reopened');
+});
+
+test('a failed, cancelled, or repeated Save As keeps the current file', async () => {
+  let failSave = true;
+  const saveCalls = [];
+  const backend = documentBackend({
+    '/api/save': (body) => {
+      saveCalls.push(body);
+      return failSave
+        ? jsonResponse({ error: { code: 'INVALID_FILENAME', message: 'fileName must be a supported source filename without a directory path.' } }, 400)
+        : jsonResponse({ savedPath: `/out/${body.fileName}`, status: 'SAVED' });
+    },
+  });
+  const { elements } = await createApp(backend.handler);
+  elements.get('#source-path-input').value = '/work/original.cpp';
+  elements.get('#open-source-path-button').dispatch('click');
+  await settle();
+  typeInEditor(elements, 'int edited;\n');
+  const unchanged = () => {
+    assert.equal(elements.get('#preview-heading').textContent, 'original.cpp ●');
+    assert.equal(elements.get('#code-language').textContent, '/work/original.cpp');
+    assert.equal(elements.get('#source-path-input').value, '/work/original.cpp');
+    assert.equal(elements.get('#code-editor').value, 'int edited;\n');
+  };
+
+  globalThis.window.prompt = () => 'notes.txt';
+  elements.get('#save-document-as-button').dispatch('click');
+  await settle();
+  unchanged();
+  assert.match(elements.get('#document-status').textContent, /^Save As failed: fileName must be/);
+  assert.equal(elements.get('#document-status').dataset.tone, 'error');
+
+  globalThis.window.prompt = () => null;
+  elements.get('#save-document-as-button').dispatch('click');
+  await settle();
+  unchanged();
+  assert.equal(elements.get('#document-status').textContent, 'Save As cancelled.');
+  assert.equal(saveCalls.length, 1, 'a cancelled Save As sends nothing');
+
+  globalThis.window.prompt = () => 'twice.cpp';
+  failSave = false;
+  elements.get('#save-document-as-button').dispatch('click');
+  assert.equal(elements.get('#save-document-as-button').disabled, true);
+  elements.get('#save-document-as-button').dispatch('click');
+  elements.get('#code-editor').dispatch('keydown', { key: 's', ctrlKey: true });
+  await settle();
+  assert.equal(saveCalls.length, 2, 'only one Save As request is sent');
+  assert.equal(elements.get('#preview-heading').textContent, 'twice.cpp');
+
+  // The original file was written by none of these attempts.
+  elements.get('#save-document-button').dispatch('click');
+  await settle();
+  assert.equal(backend.writes.every((write) => write.path !== '/work/original.cpp'), true);
+});
+
+test('when the saved copy cannot be reopened, Save As says so and does not pretend it is open', async () => {
+  const backend = documentBackend({
+    '/api/save': (body) => jsonResponse({ savedPath: `/out/${body.fileName}`, status: 'SAVED' }),
+    '/api/files/read': (body) => (body.path === '/out/copy.cpp'
+      ? jsonResponse({ error: { code: 'READ_FAILED', message: 'The file could not be read; check its permissions.' } }, 403)
+      : null),
+  });
+  const { elements } = await createApp(backend.handler);
+  typeInEditor(elements, 'int draft;\n');
+  globalThis.window.prompt = () => 'copy.cpp';
+  elements.get('#save-document-as-button').dispatch('click');
+  await settle();
+  assert.equal(elements.get('#preview-heading').textContent, 'copy.cpp');
+  assert.match(elements.get('#code-language').textContent, /Saved to \/out\/copy\.cpp · open it by path/);
+  assert.match(elements.get('#document-status').textContent, /could not be reopened.*check its permissions/);
+  assert.equal(elements.get('#save-document-button').disabled, true, 'no in-place target');
+  assert.equal(elements.get('#reload-document-button').disabled, true);
+});
+
+test('Copy shows Copied! after a successful copy and then restores its label', async (t) => {
+  const copied = [];
+  Object.defineProperty(globalThis, 'navigator', {
+    value: { clipboard: { writeText: async (text) => { copied.push(text); } } },
+    configurable: true,
+    writable: true,
+  });
+  try {
+    const { elements } = await createApp();
+    const button = elements.get('#copy-code-button');
+    const label = elements.get('#copy-code-label');
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    typeInEditor(elements, 'exact\ttext\n');
+    button.dispatch('click');
+    assert.notEqual(label.textContent, 'Copied!', 'nothing is claimed before the clipboard write finishes');
+    await flushMicrotasks();
+    assert.deepEqual(copied, ['exact\ttext\n']);
+    assert.equal(label.textContent, 'Copied!');
+    assert.equal(button.dataset.state, 'copied');
+    assert.match(elements.get('#document-status').textContent, /Copied 2 lines/);
+
+    // A second click restarts the timer instead of adding another one.
+    t.mock.timers.tick(1000);
+    button.dispatch('click');
+    await flushMicrotasks();
+    t.mock.timers.tick(1000);
+    assert.equal(label.textContent, 'Copied!', 'the first timer did not reset the label early');
+    t.mock.timers.tick(800);
+    assert.equal(label.textContent, 'Copy');
+    assert.equal(button.dataset.state, 'idle');
+  } finally {
+    delete globalThis.navigator;
+  }
+});
+
+test('a failed copy never shows Copied! and clears an earlier success', async (t) => {
+  let fail = false;
+  Object.defineProperty(globalThis, 'navigator', {
+    value: { clipboard: { writeText: async () => { if (fail) throw new Error('NotAllowedError'); } } },
+    configurable: true,
+    writable: true,
+  });
+  try {
+    const { elements } = await createApp();
+    const label = elements.get('#copy-code-label');
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    elements.get('#copy-code-button').dispatch('click');
+    await flushMicrotasks();
+    assert.equal(label.textContent, 'Copied!');
+
+    fail = true;
+    globalThis.document.execCommand = () => false;
+    elements.get('#copy-code-button').dispatch('click');
+    await flushMicrotasks();
+    assert.equal(label.textContent, 'Copy');
+    assert.equal(elements.get('#copy-code-button').dataset.state, 'idle');
+    assert.match(elements.get('#document-status').textContent, /Copy failed/);
+    assert.equal(elements.get('#document-status').dataset.tone, 'error');
+    t.mock.timers.tick(5000);
+    assert.equal(label.textContent, 'Copy');
+  } finally {
+    delete globalThis.navigator;
+    delete globalThis.document.execCommand;
+  }
 });

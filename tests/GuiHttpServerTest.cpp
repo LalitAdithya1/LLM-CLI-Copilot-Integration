@@ -8,7 +8,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <fstream>
+#include <cstdio>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <mutex>
@@ -21,6 +23,7 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 class ScriptedNativeDialogProvider final : public NativeDialogProvider {
@@ -41,6 +44,32 @@ namespace {
 std::filesystem::path repositoryRoot() {
     return std::filesystem::path(__FILE__).parent_path().parent_path();
 }
+
+std::string ownOrigin(const GuiHttpServer& server) {
+    return "http://127.0.0.1:" + std::to_string(server.port());
+}
+
+// Obtains the session token the way the page does: by redeeming a bootstrap
+// code at /api/session.
+std::string sessionToken(GuiHttpServer& server) {
+    httplib::Client client("127.0.0.1", server.port());
+    const auto response = client.Post(
+        "/api/session", httplib::Headers{{"Origin", ownOrigin(server)}},
+        nlohmann::json{{"bootstrap", server.issueBootstrapCode()}}.dump(), "application/json");
+    if (!response || response->status != 200) return {};
+    return nlohmann::json::parse(response->body).at("token").get<std::string>();
+}
+
+httplib::Headers authHeaders(GuiHttpServer& server) {
+    return {{GuiHttpServer::kSessionTokenHeader, sessionToken(server)}};
+}
+
+// A client that sends the session token with every request.
+httplib::Client apiClient(GuiHttpServer& server) {
+    httplib::Client client("127.0.0.1", server.port());
+    client.set_default_headers(authHeaders(server));
+    return client;
+}
 } // namespace
 
 TEST(GuiHttpServerTest, StartsOnAnAvailableLoopbackPortAndStops) {
@@ -50,7 +79,7 @@ TEST(GuiHttpServerTest, StartsOnAnAvailableLoopbackPortAndStops) {
     EXPECT_TRUE(server.isRunning());
     EXPECT_GT(server.port(), 0);
 
-    httplib::Client client("127.0.0.1", server.port());
+    auto client = apiClient(server);
     const auto response = client.Get("/");
     ASSERT_TRUE(response);
     EXPECT_EQ(response->status, 404);
@@ -88,7 +117,7 @@ TEST(GuiHttpServerTest, RejectsPortAlreadyHeldByAnotherServer) {
     EXPECT_FALSE(contender.start());
 
     EXPECT_TRUE(owner.isRunning());
-    httplib::Client client("127.0.0.1", owner.port());
+    auto client = apiClient(owner);
     const auto response = client.Get("/");
     ASSERT_TRUE(response);
     EXPECT_EQ(response->status, 404);
@@ -118,7 +147,7 @@ TEST(GuiHttpServerTest, HealthEndpointReturnsJsonSuccess) {
     GuiHttpServer server(0);
     ASSERT_TRUE(server.start());
 
-    httplib::Client client("127.0.0.1", server.port());
+    auto client = apiClient(server);
     const auto response = client.Get("/api/health");
 
     ASSERT_TRUE(response);
@@ -132,45 +161,70 @@ TEST(GuiHttpServerTest, HealthEndpointReturnsJsonSuccess) {
     server.stop();
 }
 
-TEST(GuiHttpServerTest, AllowsConfiguredOriginAndReturnsCorsHeader) {
+TEST(GuiHttpServerTest, DevelopmentOriginsAreRejectedUnlessExplicitlyConfigured) {
     GuiHttpServer server(0);
     ASSERT_TRUE(server.start());
-    httplib::Client client("127.0.0.1", server.port());
+    EXPECT_FALSE(server.allowDevelopmentOrigin("http://127.0.0.1:5500"))
+        << "the origin policy cannot change while running";
+    auto client = apiClient(server);
     for (const auto& origin : {"http://127.0.0.1:5500", "http://localhost:5500"}) {
-        httplib::Headers headers{{"Origin", origin}};
-        const auto response = client.Get("/api/health", headers);
+        const auto response = client.Get("/api/health", httplib::Headers{{"Origin", origin}});
         ASSERT_TRUE(response);
-        EXPECT_EQ(response->status, 200);
-        EXPECT_EQ(response->get_header_value("Access-Control-Allow-Origin"), origin);
-        EXPECT_EQ(response->get_header_value("Vary"), "Origin");
+        EXPECT_EQ(response->status, 403);
+        EXPECT_TRUE(response->get_header_value("Access-Control-Allow-Origin").empty());
     }
     server.stop();
 }
 
-TEST(GuiHttpServerTest, HandlesAllowedJsonPostPreflight) {
+TEST(GuiHttpServerTest, AllowsOnlyTheExactConfiguredDevelopmentOrigin) {
     GuiHttpServer server(0);
+    for (const auto& invalid : {"*", "http://example.com:5500", "https://127.0.0.1:5500",
+                                "http://127.0.0.1", "http://127.0.0.1:5500/", "http://127.0.0.1:0",
+                                "http://127.0.0.1:99999", "null"}) {
+        EXPECT_FALSE(server.allowDevelopmentOrigin(invalid)) << invalid;
+    }
+    ASSERT_TRUE(server.allowDevelopmentOrigin("http://127.0.0.1:5500"));
     ASSERT_TRUE(server.start());
+    auto client = apiClient(server);
+    const auto allowed = client.Get("/api/health", httplib::Headers{{"Origin", "http://127.0.0.1:5500"}});
+    ASSERT_TRUE(allowed);
+    EXPECT_EQ(allowed->status, 200);
+    EXPECT_EQ(allowed->get_header_value("Access-Control-Allow-Origin"), "http://127.0.0.1:5500");
+    EXPECT_EQ(allowed->get_header_value("Vary"), "Origin");
+    const auto other = client.Get("/api/health", httplib::Headers{{"Origin", "http://localhost:5500"}});
+    ASSERT_TRUE(other);
+    EXPECT_EQ(other->status, 403);
+    server.stop();
+}
+
+TEST(GuiHttpServerTest, HandlesAllowedJsonPostPreflightWithoutTheToken) {
+    GuiHttpServer server(0);
+    ASSERT_TRUE(server.allowDevelopmentOrigin("http://127.0.0.1:5500"));
+    ASSERT_TRUE(server.start());
+    // Browsers cannot attach the token to a preflight, so none is sent here.
     httplib::Client client("127.0.0.1", server.port());
     httplib::Headers headers{
         {"Origin", "http://127.0.0.1:5500"},
         {"Access-Control-Request-Method", "POST"},
-        {"Access-Control-Request-Headers", "content-type"}
+        {"Access-Control-Request-Headers", "content-type, x-codeagent-token"}
     };
     const auto response = client.Options("/api/save", headers);
     ASSERT_TRUE(response);
     EXPECT_EQ(response->status, 204);
+    EXPECT_TRUE(response->body.empty());
     EXPECT_EQ(response->get_header_value("Access-Control-Allow-Origin"),
               "http://127.0.0.1:5500");
     EXPECT_EQ(response->get_header_value("Access-Control-Allow-Methods"),
               "GET, POST, OPTIONS");
-    EXPECT_EQ(response->get_header_value("Access-Control-Allow-Headers"), "Content-Type");
+    EXPECT_EQ(response->get_header_value("Access-Control-Allow-Headers"),
+              "Content-Type, X-CodeAgent-Token");
     server.stop();
 }
 
 TEST(GuiHttpServerTest, RejectsForeignOriginAndUnexpectedHost) {
     GuiHttpServer server(0);
     ASSERT_TRUE(server.start());
-    httplib::Client client("127.0.0.1", server.port());
+    auto client = apiClient(server);
     httplib::Headers foreign{{"Origin", "http://evil.example"}};
     const auto originResponse = client.Get("/api/health", foreign);
     ASSERT_TRUE(originResponse);
@@ -206,7 +260,7 @@ TEST(GuiHttpServerTest, RejectsForeignOriginAndUnexpectedHost) {
 TEST(GuiHttpServerTest, AllowsItsOwnLoopbackOriginForTheBundledFrontend) {
     GuiHttpServer server(0);
     ASSERT_TRUE(server.start());
-    httplib::Client client("127.0.0.1", server.port());
+    auto client = apiClient(server);
     const std::string port = std::to_string(server.port());
     for (const auto& origin : {"http://127.0.0.1:" + port, "http://localhost:" + port}) {
         httplib::Headers headers{{"Origin", origin}};
@@ -244,7 +298,7 @@ TEST(GuiHttpServerTest, ServesFrontendFilesWithSecurityHeadersAlongsideTheApi) {
     ASSERT_TRUE(server.serveFrontend(directory));
     ASSERT_TRUE(server.start());
     EXPECT_FALSE(server.serveFrontend(directory));
-    httplib::Client client("127.0.0.1", server.port());
+    auto client = apiClient(server);
 
     const auto index = client.Get("/");
     ASSERT_TRUE(index);
@@ -286,7 +340,7 @@ TEST(GuiHttpServerTest, ServesFrontendFilesWithSecurityHeadersAlongsideTheApi) {
 TEST(GuiHttpServerTest, RejectsNullAndMalformedOrigins) {
     GuiHttpServer server(0);
     ASSERT_TRUE(server.start());
-    httplib::Client client("127.0.0.1", server.port());
+    auto client = apiClient(server);
     for (const auto& origin : {std::string("null"), std::string("http://127.0.0.1:5500/path")}) {
         httplib::Headers headers{{"Origin", origin}};
         const auto response = client.Get("/api/health", headers);
@@ -300,7 +354,7 @@ TEST(GuiHttpServerTest, RejectsNullAndMalformedOrigins) {
 TEST(GuiHttpServerTest, RejectsMissingAndDuplicateHostHeaders) {
     GuiHttpServer server(0);
     ASSERT_TRUE(server.start());
-    httplib::Client client("127.0.0.1", server.port());
+    auto client = apiClient(server);
 
     // An empty explicit Host value is sent as the sole Host header by cpp-httplib.
     const auto missing = client.Get("/api/health", httplib::Headers{{"Host", ""}});
@@ -322,8 +376,8 @@ TEST(GuiHttpServerTest, RejectsMissingAndDuplicateHostHeaders) {
 TEST(GuiHttpServerTest, RejectsDuplicateOriginAndMalformedPreflights) {
     GuiHttpServer server(0);
     ASSERT_TRUE(server.start());
-    httplib::Client client("127.0.0.1", server.port());
-    const auto expectedOrigin = std::string("http://127.0.0.1:5500");
+    auto client = apiClient(server);
+    const auto expectedOrigin = ownOrigin(server);
     httplib::Headers duplicateOrigin{{"Origin", expectedOrigin}, {"Origin", expectedOrigin}};
     const auto duplicate = client.Get("/api/health", duplicateOrigin);
     ASSERT_TRUE(duplicate);
@@ -346,7 +400,13 @@ TEST(GuiHttpServerTest, RejectsDuplicateOriginAndMalformedPreflights) {
         {"Access-Control-Request-Method", "POST"},
         {"Access-Control-Request-Headers", "content-type, authorization"}
     });
-    for (const auto* response : {&unsupportedMethod, &duplicateMethod, &malformedMethod, &unsupportedHeaders}) {
+    const auto duplicateTokenHeader = client.Options("/api/refactor", httplib::Headers{
+        {"Origin", expectedOrigin},
+        {"Access-Control-Request-Method", "POST"},
+        {"Access-Control-Request-Headers", "x-codeagent-token, x-codeagent-token"}
+    });
+    for (const auto* response : {&unsupportedMethod, &duplicateMethod, &malformedMethod, &unsupportedHeaders,
+                                 &duplicateTokenHeader}) {
         ASSERT_TRUE(*response);
         EXPECT_EQ((*response)->status, 403);
         EXPECT_TRUE((*response)->get_header_value("Access-Control-Allow-Origin").empty());
@@ -355,13 +415,13 @@ TEST(GuiHttpServerTest, RejectsDuplicateOriginAndMalformedPreflights) {
     server.stop();
 }
 
-TEST(GuiHttpServerTest, ConfigReturnsSafeDirectoriesAndSupportedExtensions) {
+TEST(GuiHttpServerTest, ConfigReturnsOnlySafeDirectories) {
     const std::filesystem::path launchDirectory =
         std::filesystem::current_path() / "gui-launch-directory";
     GuiHttpServer server(0, launchDirectory);
     ASSERT_TRUE(server.start());
 
-    httplib::Client client("127.0.0.1", server.port());
+    auto client = apiClient(server);
     const auto response = client.Get("/api/config");
 
     ASSERT_TRUE(response);
@@ -372,11 +432,8 @@ TEST(GuiHttpServerTest, ConfigReturnsSafeDirectoriesAndSupportedExtensions) {
     ASSERT_TRUE(body.is_object());
     EXPECT_EQ(body.at("launchDirectory"), launchDirectory.string());
     EXPECT_EQ(body.at("activeOutputDirectory"), launchDirectory.string());
-    EXPECT_EQ(
-        body.at("supportedExtensions"),
-        nlohmann::json({".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"})
-    );
-    EXPECT_EQ(body.size(), 3u);
+    EXPECT_EQ(body.size(), 2u);
+    EXPECT_FALSE(body.contains("supportedExtensions"));
     EXPECT_FALSE(body.contains("apiKey"));
     EXPECT_FALSE(body.contains("GEMINI_API_KEY"));
     EXPECT_FALSE(body.contains("environment"));
@@ -388,7 +445,7 @@ TEST(GuiHttpServerTest, UnknownRouteStillReturnsNotFound) {
     GuiHttpServer server(0);
     ASSERT_TRUE(server.start());
 
-    httplib::Client client("127.0.0.1", server.port());
+    auto client = apiClient(server);
     const auto response = client.Get("/");
 
     ASSERT_TRUE(response);
@@ -400,7 +457,7 @@ TEST(GuiHttpServerTest, UnknownRouteStillReturnsNotFound) {
 TEST(GuiHttpServerTest, UnknownApiRoutesAndUnsupportedMethodsReturnJsonErrors) {
     GuiHttpServer server(0);
     ASSERT_TRUE(server.start());
-    httplib::Client client("127.0.0.1", server.port());
+    auto client = apiClient(server);
     const auto unknown = client.Get("/api/not-a-route");
     const auto apiRoot = client.Get("/api");
     const auto unsupported = client.Put("/api/health", httplib::Headers{});
@@ -420,7 +477,7 @@ TEST(GuiHttpServerTest, GenerationWithoutHandlerReturnsServiceUnavailable) {
     GuiHttpServer server(0);
     ASSERT_TRUE(server.start());
 
-    httplib::Client http("127.0.0.1", server.port());
+    auto http = apiClient(server);
     const auto response = http.Post(
         "/api/generate",
         R"({"instruction":"write a greeting","language":"C++"})",
@@ -469,7 +526,7 @@ protected:
     }
 
     httplib::Client client() const {
-        return httplib::Client("127.0.0.1", server_->port());
+        return apiClient(*server_);
     }
 
     std::unique_ptr<GuiHttpServer> server_;
@@ -693,6 +750,9 @@ protected:
                 return true;
             }
         );
+        ASSERT_TRUE(server_->setClock([this] {
+            return std::chrono::steady_clock::time_point{} + std::chrono::minutes(minutes_.load());
+        }));
         ASSERT_TRUE(server_->start());
     }
 
@@ -703,7 +763,7 @@ protected:
     }
 
     httplib::Client client() const {
-        return httplib::Client("127.0.0.1", server_->port());
+        return apiClient(*server_);
     }
 
     static std::string requestBody(
@@ -722,6 +782,8 @@ protected:
 
     std::unique_ptr<GuiHttpServer> server_;
     std::atomic<int> handlerCalls_{0};
+    // The server's clock, in minutes; tests advance it instead of sleeping.
+    std::atomic<long long> minutes_{0};
     std::mutex providerWaitMutex_;
     std::condition_variable providerWaitCondition_;
     bool providerEntered_ = false;
@@ -737,7 +799,7 @@ TEST(GuiHttpServerTest, RefactoringWithoutHandlerReturnsServiceUnavailable) {
     );
     ASSERT_TRUE(server.start());
 
-    httplib::Client http("127.0.0.1", server.port());
+    auto http = apiClient(server);
     const auto response = http.Post(
         "/api/refactor",
         R"({"sourceCode":"int x;","instruction":"change","language":"C++","editorRevision":"r1"})",
@@ -926,7 +988,7 @@ TEST_F(GuiHttpServerRefactoringTest, ProviderFailuresAndEmptyResultsReturnSafeEr
 TEST_F(GuiHttpServerRefactoringTest, PreflightDoesNotInvokeRefactorHandler) {
     auto http = client();
     const auto response = http.Options("/api/refactor", httplib::Headers{
-        {"Origin", "http://127.0.0.1:5500"},
+        {"Origin", ownOrigin(*server_)},
         {"Access-Control-Request-Method", "POST"},
         {"Access-Control-Request-Headers", "content-type"}
     });
@@ -1183,7 +1245,7 @@ TEST_F(GuiHttpServerProposalReviewTest, CapacityRecoversAfterApprovedProposalsAr
 
 TEST_F(GuiHttpServerProposalReviewTest, OriginChecksCoverEmptyBodyApprovalAndRejection) {
     httplib::Headers foreign{{"Origin", "http://evil.example"}};
-    httplib::Headers allowed{{"Origin", "http://127.0.0.1:5500"}};
+    httplib::Headers allowed{{"Origin", ownOrigin(*server_)}};
     auto http = client();
 
     const std::string approvalId = createProposal();
@@ -1217,7 +1279,7 @@ protected:
         ASSERT_TRUE(server_->start());
     }
     void TearDown() override { if (server_) server_->stop(); std::error_code e; std::filesystem::remove_all(directory_, e); }
-    httplib::Client client() const { return httplib::Client("127.0.0.1", server_->port()); }
+    httplib::Client client() const { return apiClient(*server_); }
     std::string approvedProposal() {
         auto http = client();
         auto created = http.Post("/api/refactor", R"({"sourceCode":"base","instruction":"edit","language":"C++","editorRevision":"r1"})", "application/json");
@@ -1308,7 +1370,7 @@ TEST_F(GuiHttpServerSaveTest, FailedProposalSaveRemainsRetryableAndConcurrentSav
     ASSERT_TRUE(failed); EXPECT_EQ(failed->status, 422);
     std::filesystem::remove(directory_ / "retry.cpp");
     std::atomic<int> ready{0}; std::atomic<bool> go{false}; int results[2] = {};
-    auto save = [&](int index) { httplib::Client c("127.0.0.1", server_->port()); ready++; while (!go) std::this_thread::yield(); auto r = c.Post("/api/save", nlohmann::json{{"proposalId",id},{"fileName","retry.cpp"}}.dump(), "application/json"); results[index] = r ? r->status : -1; };
+    auto save = [&](int index) { auto c = apiClient(*server_); ready++; while (!go) std::this_thread::yield(); auto r = c.Post("/api/save", nlohmann::json{{"proposalId",id},{"fileName","retry.cpp"}}.dump(), "application/json"); results[index] = r ? r->status : -1; };
     std::thread a(save,0), b(save,1); while (ready != 2) std::this_thread::yield(); go = true; a.join(); b.join();
     EXPECT_TRUE((results[0] == 200 && results[1] == 409) || (results[0] == 409 && results[1] == 200));
 }
@@ -1467,7 +1529,7 @@ TEST_F(GuiHttpServerProposalReviewTest, ConcurrentApprovalAndRejectionHaveOneWin
     std::string rejectionResult;
 
     std::thread approvalThread([&] {
-        httplib::Client http("127.0.0.1", server_->port());
+        auto http = apiClient(*server_);
         ready.fetch_add(1);
         while (!start.load()) {
             std::this_thread::yield();
@@ -1479,7 +1541,7 @@ TEST_F(GuiHttpServerProposalReviewTest, ConcurrentApprovalAndRejectionHaveOneWin
         }
     });
     std::thread rejectionThread([&] {
-        httplib::Client http("127.0.0.1", server_->port());
+        auto http = apiClient(*server_);
         ready.fetch_add(1);
         while (!start.load()) {
             std::this_thread::yield();
@@ -1524,7 +1586,7 @@ TEST(GuiHttpServerDialogTest, FileSelectionReturnsPathOnlyAndDoesNotModifySource
     GuiHttpServer server(0, std::filesystem::current_path(), {}, {}, provider);
     ASSERT_TRUE(server.start());
 
-    httplib::Client http("127.0.0.1", server.port());
+    auto http = apiClient(server);
     const auto response = http.Post("/api/files/open-dialog", "{}", "application/json");
 
     ASSERT_TRUE(response);
@@ -1551,7 +1613,7 @@ TEST(GuiHttpServerDialogTest, CancellationAndDialogFailuresAreSafeAndDoNotChange
         );
         GuiHttpServer server(0, std::filesystem::current_path(), {}, {}, provider);
         ASSERT_TRUE(server.start());
-        httplib::Client http("127.0.0.1", server.port());
+        auto http = apiClient(server);
         const auto response = http.Post(
             "/api/output/select-directory", "{}", "application/json"
         );
@@ -1591,7 +1653,7 @@ TEST(GuiHttpServerDialogTest, RejectsInvalidSelectionsAndRequestsWithoutLeakingP
     );
     GuiHttpServer server(0, std::filesystem::current_path(), {}, {}, provider);
     ASSERT_TRUE(server.start());
-    httplib::Client http("127.0.0.1", server.port());
+    auto http = apiClient(server);
 
     const auto invalidSource = http.Post("/api/files/open-dialog", "{}", "application/json");
     const auto invalidOutput = http.Post("/api/output/select-directory", "{}", "application/json");
@@ -1641,7 +1703,7 @@ TEST(GuiHttpServerDialogTest, UpdatesOutputDirectoryForManualAndConcurrentSelect
     );
     GuiHttpServer server(0, firstDirectory, {}, {}, provider);
     ASSERT_TRUE(server.start());
-    httplib::Client http("127.0.0.1", server.port());
+    auto http = apiClient(server);
 
     const auto manual = http.Post(
         "/api/output/select-directory",
@@ -1657,7 +1719,7 @@ TEST(GuiHttpServerDialogTest, UpdatesOutputDirectoryForManualAndConcurrentSelect
     std::vector<std::thread> requests;
     for (int index = 0; index < 8; ++index) {
         requests.emplace_back([&] {
-            httplib::Client client("127.0.0.1", server.port());
+            auto client = apiClient(server);
             const auto response = client.Post(
                 "/api/output/select-directory", "{}", "application/json"
             );
@@ -1705,6 +1767,7 @@ protected:
         server_ = std::make_unique<GuiHttpServer>(0, directory_);
         ASSERT_TRUE(server_->start());
         http_ = std::make_unique<httplib::Client>("127.0.0.1", server_->port());
+        http_->set_default_headers(authHeaders(*server_));
     }
 
     void TearDown() override {
@@ -1877,4 +1940,444 @@ TEST_F(GuiHttpServerDocumentTest, OutputDirectoryMustBeAnExistingWritableDirecto
     const auto config = http_->Get("/api/config");
     ASSERT_TRUE(config);
     EXPECT_EQ(nlohmann::json::parse(config->body).at("activeOutputDirectory"), directory_.string());
+}
+
+// --------------------------------------------------------------------------
+// Session authentication
+// --------------------------------------------------------------------------
+
+namespace {
+std::string errorCode(const httplib::Result& response) {
+    return nlohmann::json::parse(response->body).at("error").at("code").get<std::string>();
+}
+
+std::string cookieFrom(const httplib::Result& response) {
+    const std::string header = response->get_header_value("Set-Cookie");
+    return header.substr(0, header.find(';'));
+}
+} // namespace
+
+TEST(GuiHttpServerAuthTest, EveryApiRouteRejectsMissingOrInvalidTokensWithoutSideEffects) {
+    const auto directory = std::filesystem::temp_directory_path() / ("codeagent-auth-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(directory);
+    const auto source = directory / "a.cpp";
+    std::ofstream(source) << "int a;\n";
+    std::atomic<int> providerCalls{0};
+    std::atomic<int> dialogCalls{0};
+    GuiHttpServer server(
+        0, directory,
+        [&](const std::string&, const std::string&, std::string& code, std::string&) {
+            providerCalls++; code = "x"; return true;
+        },
+        [&](const std::string&, const std::string&, const std::string&, std::string& code, std::string&) {
+            providerCalls++; code = "y"; return true;
+        },
+        std::make_shared<ScriptedNativeDialogProvider>([&](NativeDialogKind) {
+            dialogCalls++; return NativeDialogResult{NativeDialogStatus::Cancelled, {}};
+        }));
+    ASSERT_TRUE(server.start());
+    const std::string token = sessionToken(server);
+    ASSERT_EQ(token.size(), 64u);
+
+    // An authenticated proposal, so decisions on a real ID are covered too.
+    auto authenticated = apiClient(server);
+    const auto created = authenticated.Post("/api/refactor", nlohmann::json{
+        {"sourceCode", "int a;"}, {"instruction", "x"}, {"language", "C++"}, {"editorRevision", "r"}
+    }.dump(), "application/json");
+    ASSERT_TRUE(created);
+    ASSERT_EQ(created->status, 200);
+    const std::string proposalId = nlohmann::json::parse(created->body).at("proposalId");
+    providerCalls = 0;
+
+    const std::vector<std::pair<std::string, nlohmann::json>> posts = {
+        {"/api/generate", {{"instruction", "x"}, {"language", "C++"}}},
+        {"/api/refactor", {{"sourceCode", "int a;"}, {"instruction", "x"}, {"language", "C++"}, {"editorRevision", "r"}}},
+        {"/api/diff", {{"proposalId", proposalId}}},
+        {"/api/save", {{"fileName", "new.cpp"}, {"content", "int b;\n"}, {"overwriteConfirmed", true}}},
+        {"/api/files/read", {{"path", source.string()}}},
+        {"/api/files/write", {{"path", source.string()}, {"content", "int b;\n"}, {"baseRevision", "x"}, {"overwriteConfirmed", true}}},
+        {"/api/files/open-dialog", nlohmann::json::object()},
+        {"/api/output/select-directory", nlohmann::json::object()},
+    };
+    const std::vector<httplib::Headers> badHeaders = {
+        {},
+        {{GuiHttpServer::kSessionTokenHeader, "wrong"}},
+        {{GuiHttpServer::kSessionTokenHeader, std::string(64, '0')}},
+        {{GuiHttpServer::kSessionTokenHeader, token + "0"}},
+        {{GuiHttpServer::kSessionTokenHeader, token.substr(1)}},
+        {{GuiHttpServer::kSessionTokenHeader, token}, {GuiHttpServer::kSessionTokenHeader, token}},
+        {{"Authorization", "Bearer " + token}},
+    };
+    httplib::Client raw("127.0.0.1", server.port());
+    for (std::size_t index = 0; index < badHeaders.size(); ++index) {
+        const auto& headers = badHeaders[index];
+        std::vector<httplib::Result> responses;
+        responses.push_back(raw.Get("/api/health", headers));
+        responses.push_back(raw.Get("/api/config", headers));
+        responses.push_back(raw.Post("/api/changes/" + proposalId + "/approve", headers));
+        responses.push_back(raw.Post("/api/changes/" + proposalId + "/reject", headers));
+        for (const auto& [path, body] : posts) {
+            responses.push_back(raw.Post(path, headers, body.dump(), "application/json"));
+        }
+        for (const auto& response : responses) {
+            ASSERT_TRUE(response) << "header set " << index;
+            EXPECT_EQ(response->status, 401) << "header set " << index;
+            EXPECT_EQ(errorCode(response), "UNAUTHORIZED");
+            EXPECT_EQ(response->body.find(token), std::string::npos);
+        }
+    }
+    EXPECT_EQ(providerCalls.load(), 0);
+    EXPECT_EQ(dialogCalls.load(), 0);
+    EXPECT_FALSE(std::filesystem::exists(directory / "new.cpp"));
+    std::ifstream input(source);
+    EXPECT_EQ(std::string(std::istreambuf_iterator<char>(input), {}), "int a;\n");
+
+    // The proposal is still pending: the rejected decisions changed nothing.
+    const auto approved = authenticated.Post("/api/changes/" + proposalId + "/approve");
+    ASSERT_TRUE(approved);
+    EXPECT_EQ(approved->status, 200);
+    const auto health = authenticated.Get("/api/health");
+    ASSERT_TRUE(health);
+    EXPECT_EQ(health->status, 200);
+    const auto config = authenticated.Get("/api/config");
+    ASSERT_TRUE(config);
+    EXPECT_EQ(config->status, 200);
+    EXPECT_EQ(config->body.find(token), std::string::npos);
+    server.stop();
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+}
+
+TEST(GuiHttpServerSessionTest, BootstrapCodesAreRandomSingleUseAndNeedThePageOrigin) {
+    GuiHttpServer server(0);
+    ASSERT_TRUE(server.start());
+    httplib::Client raw("127.0.0.1", server.port());
+    const std::string code = server.issueBootstrapCode();
+    EXPECT_EQ(code.size(), 64u);
+    EXPECT_NE(code, server.issueBootstrapCode());
+    const auto body = nlohmann::json{{"bootstrap", code}}.dump();
+
+    const auto withoutOrigin = raw.Post("/api/session", body, "application/json");
+    ASSERT_TRUE(withoutOrigin);
+    EXPECT_EQ(withoutOrigin->status, 403);
+    EXPECT_EQ(errorCode(withoutOrigin), "ORIGIN_REQUIRED");
+    const auto foreign = raw.Post("/api/session", httplib::Headers{{"Origin", "http://evil.example"}},
+                                  body, "application/json");
+    ASSERT_TRUE(foreign);
+    EXPECT_EQ(foreign->status, 403);
+    const auto devOrigin = raw.Post("/api/session", httplib::Headers{{"Origin", "http://127.0.0.1:5500"}},
+                                    body, "application/json");
+    ASSERT_TRUE(devOrigin);
+    EXPECT_EQ(devOrigin->status, 403);
+    const httplib::Headers page{{"Origin", ownOrigin(server)}};
+    const auto wrong = raw.Post("/api/session", page,
+                                nlohmann::json{{"bootstrap", std::string(64, 'a')}}.dump(), "application/json");
+    ASSERT_TRUE(wrong);
+    EXPECT_EQ(wrong->status, 401);
+    EXPECT_EQ(errorCode(wrong), "INVALID_BOOTSTRAP");
+
+    // The rejected attempts did not use up the code.
+    const auto exchanged = raw.Post("/api/session", page, body, "application/json");
+    ASSERT_TRUE(exchanged);
+    ASSERT_EQ(exchanged->status, 200);
+    EXPECT_EQ(exchanged->get_header_value("Cache-Control"), "no-store");
+    const std::string token = nlohmann::json::parse(exchanged->body).at("token");
+    EXPECT_EQ(token.size(), 64u);
+    const std::string setCookie = exchanged->get_header_value("Set-Cookie");
+    EXPECT_NE(setCookie.find("HttpOnly"), std::string::npos);
+    EXPECT_NE(setCookie.find("SameSite=Strict"), std::string::npos);
+    EXPECT_NE(setCookie.find("Path=/api/session"), std::string::npos);
+    EXPECT_EQ(setCookie.find(token), std::string::npos) << "the cookie is not the API token";
+
+    const auto reused = raw.Post("/api/session", page, body, "application/json");
+    ASSERT_TRUE(reused);
+    EXPECT_EQ(reused->status, 401);
+    EXPECT_EQ(errorCode(reused), "INVALID_BOOTSTRAP");
+
+    const auto health = raw.Get("/api/health", httplib::Headers{{GuiHttpServer::kSessionTokenHeader, token}});
+    ASSERT_TRUE(health);
+    EXPECT_EQ(health->status, 200);
+    EXPECT_EQ(health->body.find(token), std::string::npos);
+
+    GuiHttpServer other(0);
+    ASSERT_TRUE(other.start());
+    EXPECT_NE(sessionToken(other), token) << "each server has its own token";
+    const auto crossServer = raw.Get("/api/health",
+        httplib::Headers{{GuiHttpServer::kSessionTokenHeader, sessionToken(other)}});
+    ASSERT_TRUE(crossServer);
+    EXPECT_EQ(crossServer->status, 401);
+    other.stop();
+    server.stop();
+}
+
+TEST(GuiHttpServerSessionTest, BootstrapCodesExpireAfterFiveMinutesAndAreBounded) {
+    std::atomic<long long> seconds{0};
+    GuiHttpServer server(0);
+    ASSERT_TRUE(server.setClock([&] {
+        return std::chrono::steady_clock::time_point{} + std::chrono::seconds(seconds.load());
+    }));
+    ASSERT_TRUE(server.start());
+    EXPECT_FALSE(server.setClock([] { return std::chrono::steady_clock::now(); }));
+    httplib::Client raw("127.0.0.1", server.port());
+    const httplib::Headers page{{"Origin", ownOrigin(server)}};
+    const auto exchange = [&](const std::string& code) {
+        return raw.Post("/api/session", page, nlohmann::json{{"bootstrap", code}}.dump(), "application/json");
+    };
+
+    const std::string expiring = server.issueBootstrapCode();
+    const std::string fresh = server.issueBootstrapCode();
+    seconds = 5 * 60;
+    const auto expired = exchange(expiring);
+    ASSERT_TRUE(expired);
+    EXPECT_EQ(expired->status, 401);
+
+    seconds = 4 * 60 + 59;  // Clocks are monotonic in practice; this checks the bound.
+    const auto stillValid = exchange(fresh);
+    ASSERT_TRUE(stillValid);
+    EXPECT_EQ(stillValid->status, 200);
+
+    // Only the 8 newest unused codes are kept.
+    std::vector<std::string> codes;
+    for (int index = 0; index < 9; ++index) codes.push_back(server.issueBootstrapCode());
+    const auto dropped = exchange(codes.front());
+    ASSERT_TRUE(dropped);
+    EXPECT_EQ(dropped->status, 401);
+    const auto newest = exchange(codes.back());
+    ASSERT_TRUE(newest);
+    EXPECT_EQ(newest->status, 200);
+    server.stop();
+}
+
+TEST(GuiHttpServerSessionTest, SessionCookieRestoresTheTokenAfterAReload) {
+    GuiHttpServer server(0);
+    ASSERT_TRUE(server.start());
+    httplib::Client raw("127.0.0.1", server.port());
+    const std::string origin = ownOrigin(server);
+    const auto exchanged = raw.Post("/api/session", httplib::Headers{{"Origin", origin}},
+        nlohmann::json{{"bootstrap", server.issueBootstrapCode()}}.dump(), "application/json");
+    ASSERT_TRUE(exchanged);
+    ASSERT_EQ(exchanged->status, 200);
+    const std::string token = nlohmann::json::parse(exchanged->body).at("token");
+    const std::string cookie = cookieFrom(exchanged);
+    EXPECT_EQ(cookie.rfind("codeagent_session_" + std::to_string(server.port()) + "=", 0), 0u);
+
+    const auto refresh = [&](const httplib::Headers& headers) {
+        return raw.Post("/api/session", headers, "{}", "application/json");
+    };
+    const auto reloaded = refresh({{"Origin", origin}, {"Cookie", "other=1; " + cookie}});
+    ASSERT_TRUE(reloaded);
+    ASSERT_EQ(reloaded->status, 200);
+    EXPECT_EQ(nlohmann::json::parse(reloaded->body).at("token"), token);
+
+    const std::string cookieValue = cookie.substr(cookie.find('=') + 1);
+    for (const auto& headers : std::vector<httplib::Headers>{
+             {{"Origin", origin}},
+             {{"Origin", origin}, {"Cookie", cookie + "0"}},
+             {{"Origin", origin}, {"Cookie", "codeagent_session_1=" + cookieValue}},
+             {{"Origin", origin}, {"Cookie", GuiHttpServer::kSessionTokenHeader + std::string("=") + token}},
+             {{"Origin", "http://evil.example"}, {"Cookie", cookie}},
+             {{"Cookie", cookie}},
+         }) {
+        const auto response = refresh(headers);
+        ASSERT_TRUE(response);
+        EXPECT_GE(response->status, 401);
+        EXPECT_EQ(response->body.find(token), std::string::npos);
+    }
+    // The cookie alone never authenticates an API request.
+    const auto cookieOnly = raw.Get("/api/health", httplib::Headers{{"Cookie", cookie}});
+    ASSERT_TRUE(cookieOnly);
+    EXPECT_EQ(cookieOnly->status, 401);
+    server.stop();
+}
+
+TEST(GuiHttpServerSessionTest, ConfiguredDevelopmentOriginCanStartASession) {
+    GuiHttpServer server(0);
+    ASSERT_TRUE(server.allowDevelopmentOrigin("http://localhost:5500"));
+    ASSERT_TRUE(server.start());
+    httplib::Client raw("127.0.0.1", server.port());
+    const auto exchanged = raw.Post("/api/session", httplib::Headers{{"Origin", "http://localhost:5500"}},
+        nlohmann::json{{"bootstrap", server.issueBootstrapCode()}}.dump(), "application/json");
+    ASSERT_TRUE(exchanged);
+    EXPECT_EQ(exchanged->status, 200);
+    EXPECT_EQ(exchanged->get_header_value("Access-Control-Allow-Origin"), "http://localhost:5500");
+    EXPECT_EQ(exchanged->get_header_value("Access-Control-Allow-Credentials"), "true");
+    server.stop();
+}
+
+// --------------------------------------------------------------------------
+// Proposal expiry
+// --------------------------------------------------------------------------
+
+namespace {
+int diffStatus(httplib::Client& http, const std::string& proposalId) {
+    const auto response = http.Post("/api/diff", nlohmann::json{{"proposalId", proposalId}}.dump(),
+                                    "application/json");
+    return response ? response->status : -1;
+}
+} // namespace
+
+TEST_F(GuiHttpServerProposalReviewTest, IdleProposalsExpireOnlyWhenTheirSlotIsNeeded) {
+    for (std::size_t index = 0; index < 128; ++index) {
+        ASSERT_FALSE(createProposal().empty()) << index;
+    }
+    auto http = client();
+    minutes_ = 29;
+    const auto tooEarly = http.Post("/api/refactor", requestBody(), "application/json");
+    ASSERT_TRUE(tooEarly);
+    EXPECT_EQ(tooEarly->status, 503);
+    EXPECT_EQ(nlohmann::json::parse(tooEarly->body).at("error").at("code"), "PROPOSAL_CAPACITY");
+
+    // Using prop-1 keeps it alive.
+    EXPECT_EQ(diffStatus(http, "prop-1"), 200);
+    minutes_ = 30;
+    EXPECT_EQ(createProposal(), "prop-129");
+    EXPECT_EQ(diffStatus(http, "prop-1"), 200);
+    EXPECT_EQ(diffStatus(http, "prop-2"), 404) << "the longest-idle proposal was evicted";
+    EXPECT_EQ(diffStatus(http, "prop-3"), 200) << "only one slot was freed";
+    // Until evicted, an idle proposal is still fully usable.
+    const auto approved = http.Post("/api/changes/prop-3/approve");
+    ASSERT_TRUE(approved);
+    EXPECT_EQ(approved->status, 200);
+}
+
+TEST_F(GuiHttpServerProposalReviewTest, FinishedProposalsAreEvictedBeforeIdleOnes) {
+    for (std::size_t index = 0; index < 128; ++index) {
+        ASSERT_FALSE(createProposal().empty()) << index;
+    }
+    auto http = client();
+    const auto rejected = http.Post("/api/changes/prop-100/reject");
+    ASSERT_TRUE(rejected);
+    ASSERT_EQ(rejected->status, 200);
+    minutes_ = 45;
+    EXPECT_EQ(createProposal(), "prop-129");
+    EXPECT_EQ(diffStatus(http, "prop-100"), 404);
+    EXPECT_EQ(diffStatus(http, "prop-1"), 200);
+}
+
+TEST_F(GuiHttpServerProposalReviewTest, ReservedIdleSlotIsKeptIfUsedWhileTheProviderRuns) {
+    for (std::size_t index = 0; index < 128; ++index) {
+        ASSERT_FALSE(createProposal().empty()) << index;
+    }
+    minutes_ = 31;
+    httplib::Result pending;
+    std::thread request([&] {
+        auto http = client();
+        pending = http.Post("/api/refactor", requestBody("int y;", "wait"), "application/json");
+    });
+    {
+        std::unique_lock<std::mutex> lock(providerWaitMutex_);
+        providerWaitCondition_.wait(lock, [this] { return providerEntered_; });
+    }
+    // prop-1 was reserved for eviction; approving it marks it in use again.
+    auto http = client();
+    const auto approved = http.Post("/api/changes/prop-1/approve");
+    ASSERT_TRUE(approved);
+    EXPECT_EQ(approved->status, 200);
+    {
+        std::lock_guard<std::mutex> lock(providerWaitMutex_);
+        releaseProvider_ = true;
+    }
+    providerWaitCondition_.notify_all();
+    request.join();
+    ASSERT_TRUE(pending);
+    EXPECT_EQ(pending->status, 200);
+    EXPECT_EQ(diffStatus(http, "prop-1"), 200) << "an in-use proposal is never evicted";
+    EXPECT_EQ(diffStatus(http, "prop-2"), 404) << "another idle proposal was evicted instead";
+}
+
+TEST_F(GuiHttpServerProposalReviewTest, CapacityErrorWhenEveryReservedSlotBecameActive) {
+    for (std::size_t index = 0; index < 128; ++index) {
+        ASSERT_FALSE(createProposal().empty()) << index;
+    }
+    minutes_ = 31;
+    httplib::Result pending;
+    std::thread request([&] {
+        auto http = client();
+        pending = http.Post("/api/refactor", requestBody("int y;", "wait"), "application/json");
+    });
+    {
+        std::unique_lock<std::mutex> lock(providerWaitMutex_);
+        providerWaitCondition_.wait(lock, [this] { return providerEntered_; });
+    }
+    auto http = client();
+    for (int index = 1; index <= 128; ++index) {
+        EXPECT_EQ(diffStatus(http, "prop-" + std::to_string(index)), 200);
+    }
+    {
+        std::lock_guard<std::mutex> lock(providerWaitMutex_);
+        releaseProvider_ = true;
+    }
+    providerWaitCondition_.notify_all();
+    request.join();
+    ASSERT_TRUE(pending);
+    EXPECT_EQ(pending->status, 503);
+    EXPECT_EQ(nlohmann::json::parse(pending->body).at("error").at("code"), "PROPOSAL_CAPACITY");
+    for (int index = 1; index <= 128; ++index) {
+        EXPECT_EQ(diffStatus(http, "prop-" + std::to_string(index)), 200);
+    }
+}
+
+// --------------------------------------------------------------------------
+// Opened files and file safety
+// --------------------------------------------------------------------------
+
+TEST_F(GuiHttpServerDocumentTest, ForgetsTheLeastRecentlyUsedOpenedFileFirst) {
+    std::map<std::string, std::string> revisions;
+    const auto open = [&](const std::string& name) {
+        write(directory_ / name, "int " + name.substr(0, 1) + ";\n");
+        const auto response = post("/api/files/read", {{"path", (directory_ / name).string()}});
+        ASSERT_TRUE(response);
+        ASSERT_EQ(response->status, 200) << name;
+        revisions[name] = nlohmann::json::parse(response->body).at("revision");
+    };
+    const auto save = [&](const std::string& name) {
+        const auto response = post("/api/files/write", {
+            {"path", (directory_ / name).string()}, {"content", "int saved;\n"},
+            {"baseRevision", revisions[name]}, {"overwriteConfirmed", true}});
+        return response ? response->status : -1;
+    };
+    // Opened first, but alphabetically last.
+    open("z.cpp");
+    open("y.cpp");
+    for (int index = 0; index < 254; ++index) {
+        char name[16];
+        std::snprintf(name, sizeof name, "a%03d.cpp", index);
+        open(name);
+    }
+    // 256 files are remembered. Saving z.cpp makes it recently used.
+    ASSERT_EQ(save("z.cpp"), 200);
+    open("m.cpp");
+    EXPECT_EQ(save("y.cpp"), 403) << "the least recently used file is forgotten";
+    EXPECT_EQ(save("z.cpp"), 200);
+    EXPECT_EQ(save("a000.cpp"), 200) << "not the alphabetically first file";
+    EXPECT_EQ(save("m.cpp"), 200);
+}
+
+TEST_F(GuiHttpServerDocumentTest, SavingBackDropsSetuidAndSetgidBits) {
+    namespace fs = std::filesystem;
+    const auto requested = fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec |
+                           fs::perms::set_uid | fs::perms::set_gid;
+    fs::permissions(source_, requested);
+    if ((fs::status(source_).permissions() & (fs::perms::set_uid | fs::perms::set_gid)) == fs::perms::none) {
+        GTEST_SKIP() << "this filesystem does not keep setuid/setgid bits";
+    }
+    const auto document = nlohmann::json::parse(post("/api/files/read", {{"path", source_.string()}})->body);
+    const auto saved = post("/api/files/write", {
+        {"path", document.at("path")}, {"content", "int edited;\n"},
+        {"baseRevision", document.at("revision")}, {"overwriteConfirmed", false}});
+    ASSERT_TRUE(saved);
+    ASSERT_EQ(saved->status, 200);
+    EXPECT_EQ(fs::status(source_).permissions() & fs::perms::mask,
+              fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec);
+    EXPECT_EQ(read(source_), "int edited;\n");
+}
+
+TEST_F(GuiHttpServerDocumentTest, ReadRefusesFifosWithoutBlocking) {
+    const auto fifo = directory_ / "pipe.cpp";
+    ASSERT_EQ(::mkfifo(fifo.c_str(), 0600), 0);
+    const auto response = post("/api/files/read", {{"path", fifo.string()}});
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 422);
+    EXPECT_EQ(nlohmann::json::parse(response->body).at("error").at("code"), "INVALID_SOURCE_FILE");
 }

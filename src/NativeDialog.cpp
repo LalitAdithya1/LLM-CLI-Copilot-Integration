@@ -325,10 +325,11 @@ std::filesystem::path toHostPath(const std::string& path) {
 
 namespace {
 
-// Starts program with url as its only argument, detached from the terminal's
-// process group so Ctrl+C on the server does not reach the browser. Arguments
-// are passed directly to exec; no shell is involved.
-bool spawnBrowserLauncher(const char* program, const std::string& url) {
+// Starts the launcher command (program first) with url appended as the last
+// argument, detached from the terminal's process group so Ctrl+C on the
+// server does not reach the browser. Arguments are passed directly to exec;
+// no shell is involved.
+bool spawnBrowserLauncher(const std::vector<std::string>& command, const std::string& url) {
     posix_spawn_file_actions_t actions;
     if (::posix_spawn_file_actions_init(&actions) != 0) {
         return false;
@@ -358,12 +359,14 @@ bool spawnBrowserLauncher(const char* program, const std::string& url) {
         result = ::posix_spawnattr_setpgroup(&attributes, 0);
     }
 
-    std::string programArgument(program);
-    std::string urlArgument(url);
-    char* arguments[] = {programArgument.data(), urlArgument.data(), nullptr};
+    std::vector<std::string> argumentStorage(command);
+    argumentStorage.push_back(url);
+    std::vector<char*> arguments;
+    for (auto& argument : argumentStorage) arguments.push_back(argument.data());
+    arguments.push_back(nullptr);
     pid_t child = -1;
     if (result == 0) {
-        result = ::posix_spawnp(&child, program, &actions, &attributes, arguments, environ);
+        result = ::posix_spawnp(&child, arguments[0], &actions, &attributes, arguments.data(), environ);
     }
     ::posix_spawnattr_destroy(&attributes);
     ::posix_spawn_file_actions_destroy(&actions);
@@ -372,7 +375,7 @@ bool spawnBrowserLauncher(const char* program, const std::string& url) {
     }
 
     // Reap the launcher without blocking the server; launchers such as
-    // explorer.exe report unreliable exit codes, so the status is ignored.
+    // rundll32.exe report unreliable exit codes, so the status is ignored.
     std::thread([child] {
         int status = 0;
         while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {}
@@ -383,19 +386,24 @@ bool spawnBrowserLauncher(const char* program, const std::string& url) {
 } // namespace
 
 bool launchDefaultBrowser(const std::string& url) {
+    using Command = std::vector<std::string>;
 #ifdef __APPLE__
-    const std::vector<const char*> launchers = {"open"};
+    const std::vector<Command> launchers = {{"open"}};
 #else
     // Under WSL the Windows browser is the default; wslview is optional.
+    // explorer.exe is not used: it does not recognise a URL with a fragment
+    // (the #bootstrap= startup code) and opens File Explorer instead.
+    // url.dll's FileProtocolHandler passes the whole URL to the default
+    // browser.
     const bool wsl = runningUnderWsl();
     if (!wsl && !graphicalDisplayAvailable()) {
         return false;
     }
-    const std::vector<const char*> launchers = wsl
-        ? std::vector<const char*>{"wslview", "explorer.exe"}
-        : std::vector<const char*>{"xdg-open"};
+    const std::vector<Command> launchers = wsl
+        ? std::vector<Command>{{"wslview"}, {"rundll32.exe", "url.dll,FileProtocolHandler"}}
+        : std::vector<Command>{{"xdg-open"}};
 #endif
-    for (const char* launcher : launchers) {
+    for (const auto& launcher : launchers) {
         if (spawnBrowserLauncher(launcher, url)) {
             return true;
         }

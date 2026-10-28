@@ -7,46 +7,104 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <iomanip>
+#include <list>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt")
 #else
 #include <cerrno>
 #include <fcntl.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
 #include <fstream>
 #include <iterator>
-#include <set>
 
 namespace {
 
 constexpr const char* kLoopbackAddress = "127.0.0.1";
 constexpr const char* kJsonContentType = "application/json; charset=utf-8";
-constexpr const char* kAllowedGuiOrigin = "http://127.0.0.1:5500";
-constexpr const char* kAllowedGuiLocalhostOrigin = "http://localhost:5500";
 constexpr std::size_t kMaxRequestBodyBytes = 1024 * 1024;
 constexpr std::size_t kMaximumRetainedProposals = 128;
+// A pending or approved proposal untouched for this long may be evicted when
+// a new proposal needs its slot. It stays usable until then.
+constexpr std::chrono::minutes kProposalIdleExpiry{30};
+constexpr std::chrono::minutes kBootstrapCodeLifetime{5};
+constexpr std::size_t kMaximumBootstrapCodes = 8;
+constexpr std::size_t kSecretBytes = 32;
+constexpr const char* kSessionPath = "/api/session";
 
 using Json = nlohmann::json;
 
-// The bundled frontend is served by this server, so its own loopback origin is
-// allowed as well as the standalone development server on port 5500.
-bool isAllowedGuiOrigin(const std::string& origin, int boundPort) {
-    const std::string port = ":" + std::to_string(boundPort);
-    return origin == kAllowedGuiOrigin || origin == kAllowedGuiLocalhostOrigin ||
-           origin == "http://127.0.0.1" + port || origin == "http://localhost" + port;
+// Reads cryptographically secure random bytes from the operating system.
+bool fillRandomBytes(unsigned char* buffer, std::size_t size) {
+#ifdef _WIN32
+    return BCRYPT_SUCCESS(BCryptGenRandom(
+        nullptr, buffer, static_cast<ULONG>(size), BCRYPT_USE_SYSTEM_PREFERRED_RNG));
+#else
+    std::size_t filled = 0;
+    while (filled < size) {
+        const auto count = ::getrandom(buffer + filled, size - filled, 0);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        filled += static_cast<std::size_t>(count);
+    }
+    return true;
+#endif
+}
+
+// Returns kSecretBytes random bytes as lowercase hex, or an empty string if
+// the system random source failed.
+std::string randomSecret() {
+    unsigned char bytes[kSecretBytes];
+    if (!fillRandomBytes(bytes, sizeof bytes)) return {};
+    std::ostringstream hex;
+    hex << std::hex << std::setfill('0');
+    for (unsigned char byte : bytes) hex << std::setw(2) << static_cast<int>(byte);
+    return hex.str();
+}
+
+// Compares secrets without stopping at the first difference. Secrets have a
+// fixed, public length, so only a length mismatch returns early.
+bool constantTimeEquals(const std::string& actual, const std::string& expected) {
+    if (actual.size() != expected.size() || expected.empty()) return false;
+    unsigned char difference = 0;
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        difference |= static_cast<unsigned char>(actual[index] ^ expected[index]);
+    }
+    return difference == 0;
+}
+
+// Only exact http loopback origins with a port may be configured.
+bool isLoopbackOrigin(const std::string& origin) {
+    for (const std::string prefix : {"http://127.0.0.1:", "http://localhost:"}) {
+        if (origin.compare(0, prefix.size(), prefix) != 0) continue;
+        const std::string port = origin.substr(prefix.size());
+        if (port.empty() || port.size() > 5 ||
+            !std::all_of(port.begin(), port.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
+            return false;
+        }
+        const int value = std::stoi(port);
+        return value >= 1 && value <= 65535 && port[0] != '0';
+    }
+    return false;
 }
 
 const std::vector<std::string>& supportedExtensions();
@@ -108,9 +166,12 @@ bool hasSingleHeader(const httplib::Request& request, const std::string& name,
     return true;
 }
 
+// A preflight may announce Content-Type and the session-token header, each
+// at most once, and nothing else.
 bool isAllowedPreflightHeaderList(const std::string& value) {
     std::size_t start = 0;
     bool sawContentType = false;
+    bool sawToken = false;
     while (start < value.size()) {
         const auto comma = value.find(',', start);
         auto token = value.substr(start, comma == std::string::npos ? comma : comma - start);
@@ -121,8 +182,13 @@ bool isAllowedPreflightHeaderList(const std::string& value) {
         std::transform(token.begin(), token.end(), token.begin(), [](unsigned char c) {
             return static_cast<char>(std::tolower(c));
         });
-        if (token != "content-type" || sawContentType) return false;
-        sawContentType = true;
+        if (token == "content-type" && !sawContentType) {
+            sawContentType = true;
+        } else if (token == "x-codeagent-token" && !sawToken) {
+            sawToken = true;
+        } else {
+            return false;
+        }
         if (comma == std::string::npos) break;
         start = comma + 1;
         if (start == value.size()) return false;
@@ -225,8 +291,9 @@ bool writeFileSafely(const std::filesystem::path& target, const std::string& con
         if (fd < 0 && errno != EEXIST) break;
     }
     if (fd < 0) { error = std::error_code(errno, std::generic_category()); return false; }
-    // A replaced file keeps its permission bits instead of the temporary 0600.
-    if (exists) (void)::fchmod(fd, static_cast<mode_t>(status.permissions()) & 07777);
+    // A replaced file keeps its read/write/execute bits instead of the
+    // temporary 0600, but never setuid, setgid, or sticky bits.
+    if (exists) (void)::fchmod(fd, static_cast<mode_t>(status.permissions()) & 0777);
     std::size_t offset = 0;
     while (offset < content.size()) {
         const auto written = ::write(fd, content.data() + offset, content.size() - offset);
@@ -519,13 +586,52 @@ bool hasSupportedExtension(const std::filesystem::path& path) {
            extensions.end();
 }
 
-bool readWholeFile(const std::filesystem::path& path, std::string& content) {
+enum class ReadResult { Ok, Failed, TooLarge };
+
+// Reads at most maximumBytes from a regular file. The size is enforced while
+// reading, so a file that grows after an earlier size check cannot make the
+// read unbounded, and a path swapped for a FIFO or device is refused without
+// blocking.
+ReadResult readRegularFile(const std::filesystem::path& path, std::uintmax_t maximumBytes,
+                           std::string& content) {
+    content.clear();
+#ifdef _WIN32
     std::ifstream input(path, std::ios::binary);
-    if (!input) {
-        return false;
+    if (!input) return ReadResult::Failed;
+    char buffer[64 * 1024];
+    while (input) {
+        input.read(buffer, sizeof buffer);
+        content.append(buffer, static_cast<std::size_t>(input.gcount()));
+        if (content.size() > maximumBytes) return ReadResult::TooLarge;
     }
-    content.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
-    return !input.bad();
+    return input.bad() ? ReadResult::Failed : ReadResult::Ok;
+#else
+    const int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return ReadResult::Failed;
+    struct stat info {};
+    if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode)) {
+        ::close(fd);
+        return ReadResult::Failed;
+    }
+    char buffer[64 * 1024];
+    ReadResult result = ReadResult::Ok;
+    for (;;) {
+        const auto count = ::read(fd, buffer, sizeof buffer);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            result = ReadResult::Failed;
+            break;
+        }
+        if (count == 0) break;
+        content.append(buffer, static_cast<std::size_t>(count));
+        if (content.size() > maximumBytes) {
+            result = ReadResult::TooLarge;
+            break;
+        }
+    }
+    ::close(fd);
+    return result;
+#endif
 }
 
 // Source files opened in the editor stay well under the 1 MiB request limit,
@@ -572,6 +678,8 @@ class GuiHttpServer::Impl {
         std::string baseEditorHash;
         ProposalStatus status = ProposalStatus::Pending;
         std::uint64_t sequence = 0;
+        // Updated by every request that uses the proposal.
+        std::chrono::steady_clock::time_point lastActivity{};
     };
 
     struct ProposalCapacityReservation {
@@ -604,7 +712,50 @@ public:
           generationHandler_(std::move(generationHandler)),
           refactoringHandler_(std::move(refactoringHandler)),
           dialogProvider_(dialogProvider ? std::move(dialogProvider)
-                                         : createNativeDialogProvider()) {
+                                         : createNativeDialogProvider()),
+          sessionToken_(randomSecret()),
+          refreshSecret_(randomSecret()) {
+        // Exchanges a single-use bootstrap code, or the session cookie set by
+        // an earlier exchange (e.g. after a page reload), for the session
+        // token. This is the only API route that works without the token.
+        server_.Post(kSessionPath, [this](const httplib::Request& request, httplib::Response& response) {
+            response.set_header("Cache-Control", "no-store");
+            if (!isJsonContentType(request.get_header_value("Content-Type"))) {
+                setJsonError(response, 415, "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json.");
+                return;
+            }
+            std::optional<std::string> bootstrapCode;
+            try {
+                const Json body = Json::parse(request.body);
+                if (!body.is_object() || body.size() > 1 ||
+                    (body.size() == 1 && (!body.contains("bootstrap") || !body["bootstrap"].is_string()))) {
+                    setJsonError(response, 400, "INVALID_REQUEST", "Request must be an empty object or contain one bootstrap string.");
+                    return;
+                }
+                if (body.size() == 1) bootstrapCode = body["bootstrap"].get<std::string>();
+            } catch (const Json::exception&) {
+                setJsonError(response, 400, "INVALID_JSON", "Request body must contain valid JSON.");
+                return;
+            }
+
+            if (bootstrapCode) {
+                if (!redeemBootstrapCode(*bootstrapCode)) {
+                    setJsonError(response, 401, "INVALID_BOOTSTRAP",
+                        "This startup link is invalid, expired, or already used. Restart codeagent gui to get a new link.");
+                    return;
+                }
+                // HttpOnly and limited to this path, so page scripts cannot
+                // read it and it is sent nowhere else.
+                response.set_header("Set-Cookie", sessionCookieName() + "=" + refreshSecret_ +
+                    "; Path=" + kSessionPath + "; HttpOnly; SameSite=Strict");
+            } else if (!hasValidSessionCookie(request)) {
+                setJsonError(response, 401, "SESSION_REQUIRED",
+                    "This page is not connected. Open the link that codeagent gui opened or printed.");
+                return;
+            }
+            response.set_content(Json{{"token", sessionToken_}}.dump(), kJsonContentType);
+        });
+
         server_.Get("/api/health", [](const httplib::Request&, httplib::Response& response) {
             response.set_content(
                 nlohmann::json{{"status", "ok"}}.dump(),
@@ -615,7 +766,6 @@ public:
         server_.Get("/api/config", [this](const httplib::Request&, httplib::Response& response) {
             std::lock_guard<std::mutex> lock(configMutex_);
             const nlohmann::json config = {
-                {"supportedExtensions", supportedExtensions()},
                 {"launchDirectory", launchWorkingDirectory_.string()},
                 {"activeOutputDirectory", activeOutputDirectory_.string()}
             };
@@ -705,7 +855,12 @@ public:
                 return;
             }
             std::string content;
-            if (!readWholeFile(canonicalPath, content)) {
+            const ReadResult read = readRegularFile(canonicalPath, kMaximumEditorFileBytes, content);
+            if (read == ReadResult::TooLarge) {
+                setJsonError(response, 413, "FILE_TOO_LARGE", "Source files larger than 512 KiB cannot be opened in the editor.");
+                return;
+            }
+            if (read != ReadResult::Ok) {
                 setJsonError(response, 403, "READ_FAILED", "The file could not be read; check its permissions.");
                 return;
             }
@@ -720,14 +875,7 @@ public:
                 setJsonError(response, 422, "UNSUPPORTED_ENCODING", "The file is not valid UTF-8 text.");
                 return;
             }
-            {
-                std::lock_guard<std::mutex> lock(documentsMutex_);
-                if (openedDocuments_.count(canonicalPath.string()) == 0 &&
-                    openedDocuments_.size() >= kMaximumOpenedDocuments) {
-                    openedDocuments_.erase(openedDocuments_.begin());
-                }
-                openedDocuments_.insert(canonicalPath.string());
-            }
+            rememberOpenedDocument(canonicalPath.string());
             response.set_content(std::move(serializedResponse), kJsonContentType);
         });
 
@@ -764,7 +912,7 @@ public:
             }
             {
                 std::lock_guard<std::mutex> lock(documentsMutex_);
-                if (openedDocuments_.count(path) == 0) {
+                if (openedDocumentIndex_.count(path) == 0) {
                     setJsonError(response, 403, "FILE_NOT_OPENED", "Only files opened in this session can be saved in place. Use Save As to choose a destination.");
                     return;
                 }
@@ -784,8 +932,9 @@ public:
                 return;
             }
             std::string current;
-            const bool unchanged = exists && readWholeFile(target, current) &&
-                                   hashEditorContent(current) == baseRevision;
+            const bool unchanged = exists &&
+                readRegularFile(target, kMaximumEditorFileBytes, current) == ReadResult::Ok &&
+                hashEditorContent(current) == baseRevision;
             if (!unchanged && !overwriteConfirmed) {
                 setJsonError(response, 409, "FILE_CHANGED_ON_DISK", exists
                     ? "The file changed on disk since it was opened, for example in another editor. Reload it, or confirm to overwrite it."
@@ -801,6 +950,7 @@ public:
                     denied ? "Permission denied while writing the file." : "File could not be saved.");
                 return;
             }
+            rememberOpenedDocument(path);
             response.set_content(Json{
                 {"savedPath", target.string()},
                 {"status", "SAVED"},
@@ -980,6 +1130,9 @@ public:
                 const auto proposal = proposals_.find(save.proposalId);
                 if (proposal == proposals_.end()) { setJsonError(response, 404, "PROPOSAL_NOT_FOUND", "Proposal was not found."); return; }
                 if (proposal->second.status != ProposalStatus::Approved) { setJsonError(response, 409, "INVALID_PROPOSAL_STATE", "Only approved proposals can be saved."); return; }
+                // proposalLock stays held until the write finishes, so the
+                // proposal cannot be evicted while it is being saved.
+                proposal->second.lastActivity = clock_();
                 code = proposal->second.proposedCode;
             }
             std::lock_guard<std::mutex> saveLock(saveMutex_);
@@ -1067,11 +1220,16 @@ public:
             std::string serializedResponse;
             try {
                 std::lock_guard<std::mutex> lock(proposalMutex_);
-                if (reservation.evictionId) {
-                    const auto eviction = proposals_.find(*reservation.evictionId);
-                    if (eviction == proposals_.end() ||
-                        (eviction->second.status != ProposalStatus::Rejected &&
-                         eviction->second.status != ProposalStatus::Applied)) {
+                const auto now = clock_();
+                // The reserved slot may have been used again while the
+                // provider ran; it is only evicted if it is still evictable.
+                std::optional<std::string> evictionId = reservation.evictionId;
+                if (evictionId) {
+                    const auto eviction = proposals_.find(*evictionId);
+                    if (eviction == proposals_.end() || !isEvictable(eviction->second, now)) {
+                        evictionId = findEvictionCandidate(now);
+                    }
+                    if (!evictionId) {
                         setJsonError(response, 503, "PROPOSAL_CAPACITY", "Proposal capacity is full; resolve or save existing proposals before creating another.");
                         return;
                     }
@@ -1099,12 +1257,13 @@ public:
                         refactoringRequest.editorRevision,
                         baseEditorHash,
                         ProposalStatus::Pending,
-                        proposalSequence
+                        proposalSequence,
+                        now
                     }
                 );
                 auto stagedNode = staged.extract(proposalId);
-                if (reservation.evictionId) {
-                    auto evictedNode = proposals_.extract(*reservation.evictionId);
+                if (evictionId) {
+                    auto evictedNode = proposals_.extract(*evictionId);
                     try {
                         const auto inserted = proposals_.insert(std::move(stagedNode));
                         if (!inserted.inserted) {
@@ -1167,6 +1326,7 @@ public:
                     );
                     return;
                 }
+                proposal->second.lastActivity = clock_();
                 originalCode = proposal->second.originalCode;
                 proposedCode = proposal->second.proposedCode;
             }
@@ -1257,6 +1417,7 @@ public:
                         return;
                     }
                     proposal->second.status = nextStatus;
+                    proposal->second.lastActivity = clock_();
                 }
 
                 response.set_content(std::move(serializedResponse), kJsonContentType);
@@ -1284,11 +1445,16 @@ public:
             const bool hasOrigin = originRange.first != originRange.second;
             if (hasOrigin) {
                 if (!hasSingleHeader(request, "Origin", origin) ||
-                    !isAllowedGuiOrigin(origin, boundPort_)) {
+                    !isAllowedOrigin(origin)) {
                     setJsonError(response, 403, "ORIGIN_NOT_ALLOWED", "Request origin is not allowed.");
                     return httplib::Server::HandlerResponse::Handled;
                 }
             }
+            const auto allowOrigin = [&] {
+                if (!hasOrigin) return;
+                response.set_header("Access-Control-Allow-Origin", origin);
+                response.set_header("Access-Control-Allow-Credentials", "true");
+            };
 
             if (request.method == "OPTIONS") {
                 std::string requestedMethod;
@@ -1302,14 +1468,37 @@ public:
                     setJsonError(response, 403, "INVALID_PREFLIGHT", "Preflight request is not allowed.");
                     return httplib::Server::HandlerResponse::Handled;
                 }
-                response.set_header("Access-Control-Allow-Origin", origin);
+                // Browsers never send custom headers such as the session token
+                // on a preflight, so a preflight cannot be authenticated. It
+                // only permits the actual request, which needs the token, and
+                // never reaches a route handler.
+                allowOrigin();
                 response.status = 204;
                 response.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-                response.set_header("Access-Control-Allow-Headers", "Content-Type");
+                response.set_header("Access-Control-Allow-Headers",
+                    std::string("Content-Type, ") + GuiHttpServer::kSessionTokenHeader);
                 response.set_header("Access-Control-Max-Age", "600");
                 return httplib::Server::HandlerResponse::Handled;
             }
-            if (hasOrigin) response.set_header("Access-Control-Allow-Origin", origin);
+
+            // Lets an allowed page read API responses, including errors.
+            allowOrigin();
+            if (request.path == kSessionPath) {
+                // The exchange is only for pages, which always send Origin
+                // with a POST.
+                if (!hasOrigin) {
+                    setJsonError(response, 403, "ORIGIN_REQUIRED", "Session requests must come from the CodeAgent page.");
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+                return httplib::Server::HandlerResponse::Unhandled;
+            }
+            std::string token;
+            if (!hasSingleHeader(request, GuiHttpServer::kSessionTokenHeader, token) ||
+                !constantTimeEquals(token, sessionToken_)) {
+                setJsonError(response, 401, "UNAUTHORIZED",
+                    "Missing or invalid session token. Reload the page or open the link printed by codeagent gui.");
+                return httplib::Server::HandlerResponse::Handled;
+            }
             return httplib::Server::HandlerResponse::Unhandled;
         });
 
@@ -1373,6 +1562,10 @@ public:
         if (requestedPort_ < 0 || requestedPort_ > 65535) {
             return false;
         }
+        // Never serve the API without authentication.
+        if (sessionToken_.empty() || refreshSecret_.empty()) {
+            return false;
+        }
 
         if (requestedPort_ == 0) {
             const int selectedPort =
@@ -1432,6 +1625,36 @@ public:
         });
     }
 
+    std::string issueBootstrapCode() {
+        std::string code = randomSecret();
+        if (code.empty()) return code;
+        std::lock_guard<std::mutex> lock(sessionMutex_);
+        const auto now = clock_();
+        bootstrapCodes_.erase(
+            std::remove_if(bootstrapCodes_.begin(), bootstrapCodes_.end(),
+                           [now](const BootstrapCode& entry) { return entry.expires <= now; }),
+            bootstrapCodes_.end());
+        if (bootstrapCodes_.size() >= kMaximumBootstrapCodes) {
+            bootstrapCodes_.erase(bootstrapCodes_.begin());
+        }
+        bootstrapCodes_.push_back({code, now + kBootstrapCodeLifetime});
+        return code;
+    }
+
+    bool allowDevelopmentOrigin(const std::string& origin) {
+        std::lock_guard<std::mutex> lock(lifecycleMutex_);
+        if (state_ != State::Ready || !isLoopbackOrigin(origin)) return false;
+        developmentOrigin_ = origin;
+        return true;
+    }
+
+    bool setClock(GuiHttpServer::Clock clock) {
+        std::lock_guard<std::mutex> lock(lifecycleMutex_);
+        if (state_ != State::Ready || !clock) return false;
+        clock_ = std::move(clock);
+        return true;
+    }
+
     void stop() {
         std::lock_guard<std::mutex> lock(lifecycleMutex_);
         if (serverThread_.joinable()) {
@@ -1461,21 +1684,11 @@ private:
         std::lock_guard<std::mutex> lock(proposalMutex_);
         std::optional<std::string> evictionId;
         if (proposals_.size() + proposalReservations_ >= kMaximumRetainedProposals) {
-            auto oldestTerminal = proposals_.end();
-            for (auto proposal = proposals_.begin(); proposal != proposals_.end(); ++proposal) {
-                const bool terminal = proposal->second.status == ProposalStatus::Rejected ||
-                                      proposal->second.status == ProposalStatus::Applied;
-                if (terminal && reservedEvictions_.count(proposal->first) == 0 &&
-                    (oldestTerminal == proposals_.end() ||
-                     proposal->second.sequence < oldestTerminal->second.sequence)) {
-                    oldestTerminal = proposal;
-                }
-            }
-            if (oldestTerminal == proposals_.end()) {
+            evictionId = findEvictionCandidate(clock_());
+            if (!evictionId) {
                 setJsonError(response, 503, "PROPOSAL_CAPACITY", "Proposal capacity is full; resolve or save existing proposals before creating another.");
                 return false;
             }
-            evictionId = oldestTerminal->first;
         }
         if (evictionId) reservedEvictions_.insert(*evictionId);
         reservation.evictionId = std::move(evictionId);
@@ -1484,11 +1697,112 @@ private:
         return true;
     }
 
+    // Rejected and applied proposals are finished. Pending and approved ones
+    // are abandoned once idle for kProposalIdleExpiry. Callers hold
+    // proposalMutex_, which every request using a proposal also holds while
+    // it reads or changes it, so an in-progress save is never evicted.
+    static bool isEvictable(const PendingProposal& proposal,
+                            std::chrono::steady_clock::time_point now) {
+        if (proposal.status == ProposalStatus::Rejected ||
+            proposal.status == ProposalStatus::Applied) {
+            return true;
+        }
+        return now - proposal.lastActivity >= kProposalIdleExpiry;
+    }
+
+    // Prefers the oldest finished proposal, then the longest-idle abandoned
+    // one. Slots already reserved by another request are skipped.
+    std::optional<std::string> findEvictionCandidate(std::chrono::steady_clock::time_point now) const {
+        auto best = proposals_.end();
+        const auto rank = [&](const PendingProposal& proposal) {
+            const bool finished = proposal.status == ProposalStatus::Rejected ||
+                                  proposal.status == ProposalStatus::Applied;
+            return std::make_tuple(finished ? 0 : 1,
+                                   finished ? std::chrono::steady_clock::time_point{} : proposal.lastActivity,
+                                   proposal.sequence);
+        };
+        for (auto proposal = proposals_.begin(); proposal != proposals_.end(); ++proposal) {
+            if (reservedEvictions_.count(proposal->first) != 0 ||
+                !isEvictable(proposal->second, now)) {
+                continue;
+            }
+            if (best == proposals_.end() || rank(proposal->second) < rank(best->second)) {
+                best = proposal;
+            }
+        }
+        if (best == proposals_.end()) return std::nullopt;
+        return best->first;
+    }
+
     void releaseProposalCapacity(ProposalCapacityReservation& reservation) {
         std::lock_guard<std::mutex> lock(proposalMutex_);
         if (reservation.evictionId) reservedEvictions_.erase(*reservation.evictionId);
         if (proposalReservations_ > 0) --proposalReservations_;
         reservation.active = false;
+    }
+
+    // The page served by this server, and an explicitly configured
+    // development origin; nothing else.
+    bool isAllowedOrigin(const std::string& origin) const {
+        const std::string port = ":" + std::to_string(boundPort_);
+        return origin == "http://127.0.0.1" + port || origin == "http://localhost" + port ||
+               (!developmentOrigin_.empty() && origin == developmentOrigin_);
+    }
+
+    bool redeemBootstrapCode(const std::string& code) {
+        std::lock_guard<std::mutex> lock(sessionMutex_);
+        const auto now = clock_();
+        for (auto entry = bootstrapCodes_.begin(); entry != bootstrapCodes_.end(); ++entry) {
+            if (constantTimeEquals(code, entry->code)) {
+                const bool valid = entry->expires > now;
+                bootstrapCodes_.erase(entry);
+                return valid;
+            }
+        }
+        return false;
+    }
+
+    // One cookie name per port, so two servers do not overwrite each other's
+    // cookie (cookies are not separated by port).
+    std::string sessionCookieName() const {
+        return "codeagent_session_" + std::to_string(boundPort_);
+    }
+
+    bool hasValidSessionCookie(const httplib::Request& request) const {
+        const std::string prefix = sessionCookieName() + "=";
+        const auto cookies = request.headers.equal_range("Cookie");
+        for (auto header = cookies.first; header != cookies.second; ++header) {
+            const std::string& value = header->second;
+            std::size_t start = 0;
+            while (start < value.size()) {
+                auto end = value.find(';', start);
+                if (end == std::string::npos) end = value.size();
+                std::string cookie = value.substr(start, end - start);
+                const auto first = cookie.find_first_not_of(' ');
+                cookie = first == std::string::npos ? "" : cookie.substr(first);
+                if (cookie.compare(0, prefix.size(), prefix) == 0 &&
+                    constantTimeEquals(cookie.substr(prefix.size()), refreshSecret_)) {
+                    return true;
+                }
+                start = end + 1;
+            }
+        }
+        return false;
+    }
+
+    void rememberOpenedDocument(const std::string& path) {
+        std::lock_guard<std::mutex> lock(documentsMutex_);
+        const auto known = openedDocumentIndex_.find(path);
+        if (known != openedDocumentIndex_.end()) {
+            openedDocuments_.splice(openedDocuments_.end(), openedDocuments_, known->second);
+            return;
+        }
+        if (openedDocuments_.size() >= kMaximumOpenedDocuments) {
+            openedDocumentIndex_.erase(openedDocuments_.front());
+            openedDocuments_.pop_front();
+        }
+        openedDocuments_.push_back(path);
+        openedDocumentIndex_.emplace(path, std::prev(openedDocuments_.end()));
     }
 
     static std::filesystem::path resolveLaunchDirectory(
@@ -1519,11 +1833,25 @@ private:
     std::mutex proposalMutex_;
     std::mutex saveMutex_;
     std::mutex documentsMutex_;
-    // Canonical paths the user opened for editing; the only in-place save targets.
-    std::set<std::string> openedDocuments_;
+    // Canonical paths the user opened for editing; the only in-place save
+    // targets. Ordered from least to most recently opened or saved; the
+    // least recently used path is forgotten when the limit is reached.
+    std::list<std::string> openedDocuments_;
+    std::map<std::string, std::list<std::string>::iterator> openedDocumentIndex_;
     std::map<std::string, PendingProposal> proposals_;
     std::unordered_set<std::string> reservedEvictions_;
     std::size_t proposalReservations_ = 0;
+    struct BootstrapCode {
+        std::string code;
+        std::chrono::steady_clock::time_point expires;
+    };
+    // Kept in memory only; never logged or returned except by /api/session.
+    const std::string sessionToken_;
+    const std::string refreshSecret_;
+    std::mutex sessionMutex_;
+    std::vector<BootstrapCode> bootstrapCodes_;
+    std::string developmentOrigin_;
+    GuiHttpServer::Clock clock_ = [] { return std::chrono::steady_clock::now(); };
     std::uint64_t nextProposalId_ = 1;
     std::atomic<int> boundPort_{0};
     State state_ = State::Ready;
@@ -1594,6 +1922,18 @@ bool GuiHttpServer::start() {
 
 bool GuiHttpServer::serveFrontend(const std::filesystem::path& directory) {
     return impl_->serveFrontend(directory);
+}
+
+std::string GuiHttpServer::issueBootstrapCode() {
+    return impl_->issueBootstrapCode();
+}
+
+bool GuiHttpServer::allowDevelopmentOrigin(const std::string& origin) {
+    return impl_->allowDevelopmentOrigin(origin);
+}
+
+bool GuiHttpServer::setClock(Clock clock) {
+    return impl_->setClock(std::move(clock));
 }
 
 void GuiHttpServer::stop() {

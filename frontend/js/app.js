@@ -5,6 +5,7 @@ import {
   getProposalDiff,
   getConfig,
   getHealth,
+  hasSession,
   markProposalApplied,
   openSourceFileDialog,
   readSourceFile,
@@ -13,6 +14,8 @@ import {
   saveGeneratedCode,
   saveProposal,
   selectOutputDirectory,
+  startSession,
+  takeBootstrapCode,
   writeSourceFile,
 } from './api.js';
 import { createProposalWorkflow } from './proposalWorkflow.js';
@@ -34,6 +37,8 @@ const MAX_LOADED_FILE_BYTES = 512 * 1024;
 // Name shown for editor content that is not tied to a file yet. It uses a
 // supported extension so Save As can keep it.
 const UNTITLED_DOCUMENT_NAME = 'untitled.cpp';
+// How long the Copy button shows "Copied!".
+const COPY_FEEDBACK_MS = 1800;
 
 const REQUIRED_ELEMENTS = [
   '[data-app="codeagent"]',
@@ -56,7 +61,6 @@ const REQUIRED_ELEMENTS = [
   '#backend-retry-button',
   '#backend-config-status',
   '#backend-config-values',
-  '#backend-config-extensions',
   '#backend-config-launch-directory',
   '#backend-config-output-directory',
   '#select-output-directory-button',
@@ -84,6 +88,7 @@ const REQUIRED_ELEMENTS = [
   '#set-output-directory-button',
   '#file-status',
   '#copy-code-button',
+  '#copy-code-label',
   '#save-document-button',
   '#save-document-as-button',
   '#reload-document-button',
@@ -127,7 +132,6 @@ function initializeApp() {
   const backendRetryButton = document.querySelector('#backend-retry-button');
   const backendConfigStatus = document.querySelector('#backend-config-status');
   const backendConfigValues = document.querySelector('#backend-config-values');
-  const backendConfigExtensions = document.querySelector('#backend-config-extensions');
   const backendConfigLaunchDirectory = document.querySelector('#backend-config-launch-directory');
   const backendConfigOutputDirectory = document.querySelector('#backend-config-output-directory');
   const selectOutputDirectoryButton = document.querySelector('#select-output-directory-button');
@@ -143,6 +147,7 @@ function initializeApp() {
   const setOutputDirectoryButton = document.querySelector('#set-output-directory-button');
   const fileStatus = document.querySelector('#file-status');
   const copyCodeButton = document.querySelector('#copy-code-button');
+  const copyCodeLabel = document.querySelector('#copy-code-label');
   const saveDocumentButton = document.querySelector('#save-document-button');
   const saveDocumentAsButton = document.querySelector('#save-document-as-button');
   const reloadDocumentButton = document.querySelector('#reload-document-button');
@@ -170,6 +175,9 @@ function initializeApp() {
   let selectionInProgress = false;
   let outputDirectorySelectionVersion = 0;
   let backendRefreshPromise = null;
+  // Read once at startup; the code is single-use.
+  let bootstrapCode = takeBootstrapCode();
+  let copyFeedbackTimer = null;
   let editorRevisionSequence = 0;
   let selectedMode = 'generate';
   // The document in the editor. path and revision are set only when the
@@ -284,13 +292,13 @@ function initializeApp() {
     } else if (acceptedIntoEditor) {
       proposalReviewAvailability.textContent = `The proposed code replaced the editor contents of ${currentDocument.name}. Nothing was written to disk: review or edit it, then select Save (Ctrl+S) or Save As.`;
     } else if (!proposal.sourceMatches) {
-      proposalReviewAvailability.textContent = 'The editor content has changed since this proposal was created. Restore the original source shown above before approving or saving it.';
+      proposalReviewAvailability.textContent = 'The editor content has changed since this proposal was created. Restore the original source shown above before accepting it.';
     } else if (proposal.status === 'PENDING') {
       proposalReviewAvailability.textContent = state.decisionBlocked
         ? 'The last decision was not confirmed. No proposal-status lookup is available, so further decisions are disabled.'
         : proposal.reviewed
           ? 'Review the diff, then Accept it into the editor or Reject it.'
-          : 'Load the backend diff before approving or rejecting this proposal.';
+          : 'Select Review changes to load the diff before accepting or rejecting this proposal.';
     } else if (proposal.status === 'APPROVED') {
       proposalReviewAvailability.textContent = 'The backend confirmed approval, but the proposal was not applied to the editor.';
     } else if (proposal.status === 'REJECTED') {
@@ -344,7 +352,9 @@ function initializeApp() {
       ? currentDocument.path
       : currentDocument.origin === 'upload'
         ? 'Opened in the browser · location unknown, use Save As to write it to disk'
-        : 'New document · not saved to disk';
+        : currentDocument.origin === 'saved'
+          ? `Saved to ${currentDocument.savedPath} · open it by path to save in place`
+          : 'New document · not saved to disk';
     codeStatus.textContent = dirty
       ? 'Unsaved changes'
       : currentDocument.path ? 'Saved to disk' : 'Not saved to disk';
@@ -615,6 +625,22 @@ function initializeApp() {
     }
   }
 
+  // Shows "Copied!" on the button for a moment. A new click restarts the
+  // timer instead of stacking another one; a failed copy shows nothing.
+  function renderCopyFeedback(copied) {
+    clearTimeout(copyFeedbackTimer);
+    copyFeedbackTimer = null;
+    copyCodeLabel.textContent = copied ? 'Copied!' : 'Copy';
+    copyCodeButton.dataset.state = copied ? 'copied' : 'idle';
+    if (copied) {
+      copyFeedbackTimer = setTimeout(() => {
+        copyFeedbackTimer = null;
+        copyCodeLabel.textContent = 'Copy';
+        copyCodeButton.dataset.state = 'idle';
+      }, COPY_FEEDBACK_MS);
+    }
+  }
+
   async function copyEditorContents() {
     const text = codeEditor.value;
     const lineCount = text.split('\n').length;
@@ -631,6 +657,7 @@ function initializeApp() {
     // The Clipboard API needs a secure context and permission; fall back to
     // copying a selection, which browsers allow during a click.
     if (!copied && typeof document.execCommand === 'function') {
+      const { selectionStart, selectionEnd } = codeEditor;
       codeEditor.focus();
       codeEditor.select?.();
       try {
@@ -638,7 +665,11 @@ function initializeApp() {
       } catch {
         copied = false;
       }
+      // Put the editor selection and keyboard focus back where they were.
+      codeEditor.setSelectionRange?.(selectionStart, selectionEnd);
+      copyCodeButton.focus?.();
     }
+    renderCopyFeedback(copied);
     renderMessage(documentStatus, copied
       ? `Copied ${lineCount} line${lineCount === 1 ? '' : 's'} of ${currentDocument.name} to the clipboard.`
       : 'Copy failed: clipboard access was denied. Select the editor text and press Ctrl+C instead.',
@@ -716,17 +747,31 @@ function initializeApp() {
         }
         result = await saveGeneratedCode({ fileName, content, overwriteConfirmed: true });
       }
+      // Reopen the new file so the backend allows saving to it in place.
+      // From here on the editor is that file: Save and Reload use its path,
+      // and conflicts are detected against what was just written.
       let file = null;
+      let reopenError = null;
       try {
         file = await readSourceFile(result.savedPath);
-      } catch {
-        file = null;
+      } catch (error) {
+        reopenError = error;
       }
-      currentDocument = file
-        ? { name: fileNameOf(file.path), path: file.path, revision: file.revision, savedContent: content, origin: 'disk' }
-        : { name: fileName, path: null, revision: null, savedContent: content, origin: 'upload' };
+      if (file) {
+        currentDocument = {
+          name: fileNameOf(file.path), path: file.path, revision: file.revision,
+          savedContent: file.content, origin: 'disk',
+        };
+        sourcePathInput.value = file.path;
+        renderMessage(documentStatus, `Saved ${file.path}. The editor now shows this file.`, 'success');
+      } else {
+        currentDocument = {
+          name: fileNameOf(result.savedPath), path: null, revision: null,
+          savedContent: content, origin: 'saved', savedPath: result.savedPath,
+        };
+        renderMessage(documentStatus, `Saved ${result.savedPath}, but it could not be reopened for in-place saving (${apiErrorMessage(reopenError, 'request failed')}). Open it by path to keep editing it.`, 'error');
+      }
       saveFileName.value = currentDocument.name;
-      renderMessage(documentStatus, `Saved ${result.savedPath}.`, 'success');
       return true;
     } catch (error) {
       renderMessage(documentStatus, `Save As failed: ${apiErrorMessage(error, 'the file could not be saved.')}`, 'error');
@@ -771,9 +816,6 @@ function initializeApp() {
 
     try {
       const config = await getConfig();
-      backendConfigExtensions.textContent = config.supportedExtensions.length > 0
-        ? config.supportedExtensions.join(', ')
-        : 'No extensions reported';
       backendConfigLaunchDirectory.textContent = config.launchDirectory.trim()
         ? config.launchDirectory
         : 'No launch directory reported';
@@ -795,16 +837,39 @@ function initializeApp() {
     }
   }
 
+  // Obtains the API session token: from the one-time code the page was
+  // opened with, or after a reload from the session cookie.
+  async function connectSession() {
+    if (hasSession()) return true;
+    assistantStatus.dataset.state = 'checking';
+    assistantStatusMessage.textContent = 'Connecting to the backend…';
+    assistantStatusDetail.textContent = '';
+    const code = bootstrapCode;
+    bootstrapCode = null;
+    try {
+      await startSession(code);
+      return true;
+    } catch (error) {
+      const message = apiErrorMessage(error, 'Could not connect to the local backend.');
+      assistantStatus.dataset.state = 'unavailable';
+      assistantStatusMessage.textContent = 'Not connected';
+      assistantStatusDetail.textContent = message;
+      backendConfigStatus.textContent = 'Configuration unavailable';
+      renderStatus(`Not connected to the backend: ${message}`);
+      return false;
+    }
+  }
+
   function refreshBackendInformation() {
     if (backendRefreshPromise) {
       return backendRefreshPromise;
     }
 
     backendRetryButton.disabled = true;
-    backendRefreshPromise = Promise.all([
+    backendRefreshPromise = connectSession().then((connected) => connected && Promise.all([
       refreshBackendHealth(),
       refreshBackendConfig(),
-    ]).finally(() => {
+    ])).finally(() => {
       backendRefreshPromise = null;
       backendRetryButton.disabled = false;
     });
@@ -936,7 +1001,7 @@ function initializeApp() {
     const confirmed = await proposalWorkflow.review();
     const state = proposalWorkflow.getState();
     renderStatus(confirmed
-      ? 'The backend diff is ready. Review it before approving or rejecting.'
+      ? 'The diff is ready. Review it, then Accept it into the editor or Reject it.'
       : `Diff review failed. ${state.error}`);
   }
 

@@ -529,7 +529,7 @@
 
 .backend-config__values {
   display: grid;
-  grid-template-columns: minmax(0, 0.8fr) repeat(2, minmax(0, 1.1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-3);
   margin: 0;
 }
@@ -879,7 +879,7 @@
   margin: 0;
   padding: var(--space-3);
   overflow: auto;
-  color: #777583;
+  color: #ffffff;
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 0.75rem;
   line-height: 1.6;
@@ -1249,4 +1249,35 @@
 .document-button:disabled {
   cursor: not-allowed;
   opacity: 0.5;
+}
+
+/* Copy button: shows "Copied!" with a check mark after a successful copy. */
+.copy-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.copy-button svg {
+  width: 0.95rem;
+  height: 0.95rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.7;
+}
+
+.copy-button__check,
+.copy-button[data-state="copied"] .copy-button__icon {
+  display: none;
+}
+
+.copy-button[data-state="copied"] .copy-button__check {
+  display: block;
+}
+
+.copy-button[data-state="copied"] {
+  border-color: rgb(34 197 94 / 45%);
+  color: #86efac;
 }

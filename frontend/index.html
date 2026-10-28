@@ -72,10 +72,6 @@
           </div>
           <dl class="backend-config__values" id="backend-config-values" hidden>
             <div>
-              <dt>Supported extensions</dt>
-              <dd id="backend-config-extensions"></dd>
-            </div>
-            <div>
               <dt>Launch directory</dt>
               <dd id="backend-config-launch-directory"></dd>
             </div>
@@ -150,11 +146,15 @@
                 <button class="document-button" id="save-document-button" type="button" title="Save to the opened file (Ctrl+S)" disabled>Save</button>
                 <button class="document-button" id="save-document-as-button" type="button" title="Save to a new file in the output directory">Save As</button>
                 <button class="document-button" id="reload-document-button" type="button" title="Reload the opened file from disk" disabled>Reload</button>
-                <button class="icon-button" id="copy-code-button" type="button" aria-label="Copy editor contents" title="Copy editor contents">
-                  <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+                <button class="document-button copy-button" id="copy-code-button" type="button" title="Copy editor contents" data-state="idle">
+                  <svg class="copy-button__icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
                     <rect x="8" y="8" width="13" height="13" rx="2" />
                     <path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" />
                   </svg>
+                  <svg class="copy-button__check" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+                    <path d="m5 12.5 4.5 4.5L19 7.5" />
+                  </svg>
+                  <span id="copy-code-label">Copy</span>
                 </button>
               </div>
             </header>

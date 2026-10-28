@@ -42,7 +42,8 @@ std::string translateWindowsPathForWsl(const std::string& path);
 std::filesystem::path toHostPath(const std::string& path);
 
 // Asks the desktop to open url in the default browser without waiting for it.
-// WSL uses wslview or explorer.exe, Linux uses xdg-open, macOS uses open.
+// WSL uses wslview or rundll32.exe url.dll,FileProtocolHandler, Linux uses
+// xdg-open, macOS uses open.
 // Returns false when no launcher could be started; the caller keeps running.
 bool launchDefaultBrowser(const std::string& url);
 

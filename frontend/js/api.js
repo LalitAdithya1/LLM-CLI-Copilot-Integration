@@ -10,6 +10,25 @@ export function getBackendBaseUrl(location = globalThis.window?.location) {
 
 export const BACKEND_BASE_URL = getBackendBaseUrl();
 
+// Header that carries the session token on every API request.
+export const SESSION_TOKEN_HEADER = 'X-CodeAgent-Token';
+
+// `codeagent gui` opens the page with a one-time code in the URL fragment
+// (#bootstrap=<code>). Returns the code and removes it from the address bar
+// and history, so it is not bookmarked or reused.
+export function takeBootstrapCode(
+  location = globalThis.window?.location,
+  history = globalThis.window?.history,
+) {
+  const hash = typeof location?.hash === 'string' ? location.hash : '';
+  if (!hash.startsWith('#bootstrap=')) return null;
+  if (typeof history?.replaceState === 'function') {
+    history.replaceState(null, '', `${location.pathname}${location.search}`);
+  }
+  const match = /^#bootstrap=([0-9a-f]{64})$/.exec(hash);
+  return match ? match[1] : null;
+}
+
 export class ApiError extends Error {
   constructor(code, message, status = null) {
     super(message);
@@ -57,13 +76,11 @@ function validateHealth(payload) {
 function validateConfig(payload) {
   expectFields(
     payload,
-    ['supportedExtensions', 'launchDirectory', 'activeOutputDirectory'],
+    ['launchDirectory', 'activeOutputDirectory'],
     'configuration',
   );
   if (
-    !Array.isArray(payload.supportedExtensions)
-    || !payload.supportedExtensions.every((extension) => typeof extension === 'string')
-    || typeof payload.launchDirectory !== 'string'
+    typeof payload.launchDirectory !== 'string'
     || typeof payload.activeOutputDirectory !== 'string'
   ) {
     throw new ApiError(
@@ -211,8 +228,10 @@ export function createApiClient({
   fetchImpl = globalThis.fetch,
 } = {}) {
   const normalizedBaseUrl = String(baseUrl).replace(/\/+$/, '');
+  // Kept only in memory; it is lost when the page unloads.
+  let sessionToken = null;
 
-  async function requestJson(path, { method = 'GET', body } = {}) {
+  async function requestJson(path, { method = 'GET', body, session = false } = {}) {
     if (typeof fetchImpl !== 'function') {
       throw new ApiError(
         'NETWORK_ERROR',
@@ -224,6 +243,13 @@ export function createApiClient({
       method,
       headers: { Accept: 'application/json' },
     };
+    if (session) {
+      // Sends and stores the HttpOnly session cookie, also for a configured
+      // development origin.
+      options.credentials = 'include';
+    } else if (sessionToken !== null) {
+      options.headers[SESSION_TOKEN_HEADER] = sessionToken;
+    }
 
     if (body !== undefined) {
       options.headers['Content-Type'] = 'application/json';
@@ -284,6 +310,8 @@ export function createApiClient({
         && backendError.message.trim().length > 0
         ? backendError.message
         : `The backend request failed with HTTP ${response.status}.`;
+      // The server no longer accepts this token, e.g. after a restart.
+      if (code === 'UNAUTHORIZED') sessionToken = null;
 
       throw new ApiError(code, message, response.status);
     }
@@ -303,6 +331,24 @@ export function createApiClient({
   }
 
   return Object.freeze({
+    // Exchanges the one-time bootstrap code, or without one the session
+    // cookie from an earlier exchange (after a reload), for the token.
+    async startSession(bootstrapCode = null) {
+      const body = typeof bootstrapCode === 'string' && bootstrapCode.length > 0
+        ? { bootstrap: bootstrapCode }
+        : {};
+      const payload = await requestJson('/api/session', { method: 'POST', body, session: true });
+      expectFields(payload, ['token'], 'session');
+      if (typeof payload.token !== 'string' || !/^[0-9a-f]{64}$/.test(payload.token)) {
+        throw new ApiError('INVALID_RESPONSE', 'The backend returned an invalid session response.');
+      }
+      sessionToken = payload.token;
+    },
+
+    hasSession() {
+      return sessionToken !== null;
+    },
+
     async getHealth() {
       return validateHealth(await requestJson('/api/health'));
     },
@@ -458,6 +504,8 @@ export function createApiClient({
 
 const defaultClient = createApiClient();
 
+export const startSession = (bootstrapCode) => defaultClient.startSession(bootstrapCode);
+export const hasSession = () => defaultClient.hasSession();
 export const getHealth = () => defaultClient.getHealth();
 export const getConfig = () => defaultClient.getConfig();
 export const generateCode = (request) => defaultClient.generateCode(request);

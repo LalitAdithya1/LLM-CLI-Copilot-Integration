@@ -32,7 +32,7 @@ Create a `.env` file in the directory you launch `codeagent` from. The file is g
 GEMINI_API_KEY=your-key-here
 ```
 
-You can also `export GEMINI_API_KEY=...`. Existing environment variables take precedence over `.env`. The key is sent only to Gemini in the `x-goog-api-key` header. It is never printed, logged, or returned to the browser. The model is `gemini-3.5-flash`.
+You can also `export GEMINI_API_KEY=...`. Existing environment variables take precedence over `.env`. A value may be wrapped in one pair of matching quotes (`GEMINI_API_KEY="..."`); the quotes are not part of the key. `.env` is read once per process, before the GUI server starts handling requests. The key is sent only to Gemini in the `x-goog-api-key` header. It is never printed, logged, or returned to the browser. The model is `gemini-3.5-flash`.
 
 ### Build and test
 
@@ -56,8 +56,10 @@ node --test frontend/tests/*.test.mjs
 
 1. Starts the C++ server on `127.0.0.1:8080`. It binds to loopback only, never to `0.0.0.0`.
 2. Serves the browser frontend (HTML/CSS/JS) and the JSON API from that same origin.
-3. Opens your default browser: `wslview` or `explorer.exe` under WSL, `xdg-open` on Linux. If that is not possible, it prints the URL to open manually and keeps running.
+3. Opens your default browser: `wslview` or `rundll32.exe url.dll,FileProtocolHandler` under WSL, `xdg-open` on Linux. The address carries a one-time startup code (`#bootstrap=…`), which the page exchanges for the API session token (see [GUI server security](#gui-server-security)). If no browser can be opened, or `CODEAGENT_NO_BROWSER` is set, it prints a one-time link instead. Open it within 5 minutes.
 4. Runs until you press **Ctrl+C**.
+
+Reloading the page or opening the address again in a new tab of the same browser reconnects on its own. Another browser needs a new link: restart `codeagent gui`.
 
 | Environment variable | Purpose |
 | --- | --- |
@@ -65,6 +67,7 @@ node --test frontend/tests/*.test.mjs
 | `CODEAGENT_GUI_PORT` | Use another port, e.g. `CODEAGENT_GUI_PORT=8081 ./build/codeagent gui`. |
 | `CODEAGENT_NO_BROWSER` | Set to `1` to skip opening a browser (headless/SSH use). |
 | `CODEAGENT_FRONTEND_DIR` | Directory containing `index.html`, if the frontend is not found automatically. |
+| `CODEAGENT_DEV_ORIGIN` | Development only: also accept a frontend served from another loopback origin, exactly `http://127.0.0.1:<port>` or `http://localhost:<port>` (e.g. `http://127.0.0.1:5500`). A one-time link for it is printed at startup. Unset by default. |
 
 `codeagent` finds the frontend without depending on your working directory. It checks, in order: `CODEAGENT_FRONTEND_DIR`; `frontend/` next to the executable or one level above it (the build tree); `../share/codeagent/frontend` (after `cmake --install build`); and finally the source tree it was built from.
 
@@ -74,12 +77,12 @@ node --test frontend/tests/*.test.mjs
   * Type its path in *Source file* and select *Open path* (or press Enter). Both WSL paths (`/mnt/d/project/insertion_sort.cpp`) and Windows paths (`D:\project\insertion_sort.cpp`, `\\wsl.localhost\Ubuntu\home\me\x.cpp`) work; under WSL the backend translates Windows paths.
   * Alternatively, select *Choose source path* to pick the file in a native dialog. It uses zenity when installed; under WSL without zenity it opens a Windows file dialog through `powershell.exe`, which may appear behind the browser. If no dialog is available, the page says so and focuses the path field.
   * The editor heading shows the file name. A `●` and *Unsaved changes* mark edits that are not yet on disk. A new document is shown as `untitled.cpp`.
-* **Save** (or Ctrl+S) writes the editor back to the file you opened, atomically. Its permission bits are kept.
+* **Save** (or Ctrl+S) writes the editor back to the file you opened, atomically. Its read/write/execute permission bits are kept; setuid, setgid, and sticky bits are cleared.
   * If the file changed on disk since you opened or last saved it (for example, you saved it in VS Code), Save asks before overwriting. *Reload* re-reads the file from disk.
   * Opening another file, reloading, or uploading over unsaved edits asks for confirmation first.
-* **Save As** asks for a filename and writes it to the active output directory, asking before replacing an existing file. Later Saves go to the new file.
+* **Save As** asks for a filename and writes it to the active output directory, asking before replacing an existing file. Once the backend confirms the save, the editor *is* the new file: its name, the *Source file* path, Save, Reload, and change detection all use the new path. The original file is not modified. If the save fails or you cancel, the editor keeps the current file. If the saved file cannot be reopened for in-place saving, the page says so; open it by path to keep editing it.
 * *Open file in editor* loads a copy through the browser file picker. Browsers do not reveal where such a file lives, so it can only be written with Save As.
-* *Copy* (the icon next to Save) copies the current editor text. It uses the Clipboard API and falls back to the browser's copy command; failures are reported next to the editor.
+* *Copy* copies the current editor text. The button shows *Copied!* with a check mark for about 2 seconds once the copy succeeded. It uses the Clipboard API and falls back to the browser's copy command; if both fail, the button keeps saying *Copy* and the failure is reported next to the editor.
 * **Generate:** enter a language and an instruction, then select *Generate code*. Gemini's output is shown for review.
   * *Accept* puts it into the editor (replacing the editor contents) to edit and save with Save or Save As.
   * *Save output* instead writes it as-is to the output directory.
@@ -90,12 +93,16 @@ node --test frontend/tests/*.test.mjs
   * *Reject* leaves the editor and the files on disk unchanged.
 * **Saving output** writes `<active output directory>/<filename>`.
   * The output directory defaults to the launch directory. Type a WSL or Windows path and select *Set directory*, or use *Choose output directory* for a native dialog. The backend accepts only existing, writable directories, and the active directory is always displayed.
-  * Filenames must be plain names with a supported extension (`.c .cc .cpp .cxx .h .hh .hpp .hxx`). Paths and `..` are rejected.
+  * Filenames must be plain names with a supported extension (see [Supported files](#supported-files)). Paths and `..` are rejected.
   * Replacing an existing file always asks for confirmation.
   * Writes are atomic: the content goes to a temporary file that is then renamed into place.
   * Buttons are disabled while a request is in flight, so double clicks cannot approve or save twice.
 * Nothing is saved without an explicit Save, Save As, or Save output. AI-generated code is **never executed**.
 * The prompts ask Gemini for raw code. If a complete response is nevertheless one Markdown code block (`` ```cpp `` … `` ``` ``), the CLI and GUI receive only the code inside it. Any other response, including partial output or text around a code block, is shown exactly as returned.
+
+#### Supported files
+
+The backend opens, saves in place, and writes only C and C++ source files: `.c .cc .cpp .cxx .h .hh .hpp .hxx`. It enforces this on every open and save; the page no longer lists the extensions, and *Open file in editor* checks the same list before loading a file. Files are limited to 512 KiB of UTF-8 text.
 
 #### Editing the same file in VS Code
 
@@ -107,7 +114,8 @@ Save writes the file on disk. It does not talk to VS Code. VS Code watches files
 | --- | --- |
 | Terminal: `Warning: GEMINI_API_KEY is not set`; browser: `GENERATION_FAILED` / `REFACTOR_FAILED` | Add the key to `.env` in the launch directory or export it, then restart. The terminal running `codeagent` prints the specific cause (missing key, HTTP status, network error); the browser intentionally shows only a generic message. |
 | `Could not start the GUI server on 127.0.0.1:8080` | Another program (often another `codeagent gui`) is using the port. Stop it, or run with `CODEAGENT_GUI_PORT=8081`. |
-| `Could not open a browser automatically` | Open the printed `http://127.0.0.1:<port>/` URL yourself. The server keeps running. |
+| `Could not open a browser automatically` | Open the printed one-time link (`http://127.0.0.1:<port>/#bootstrap=…`) within 5 minutes. The server keeps running. |
+| The page says *Not connected* / `SESSION_REQUIRED` or `INVALID_BOOTSTRAP` | The page was opened without a valid one-time link (typed address, other browser, link used twice or older than 5 minutes), or the server was restarted. Restart `codeagent gui` and use the link it opens or prints. |
 | `Frontend files were not found; only the API is available` | Set `CODEAGENT_FRONTEND_DIR=/path/to/repo/frontend`. |
 | *Choose source path* / *Choose output directory* say no dialog is available | On Linux, install zenity (`sudo apt install zenity`) and run in a graphical session. Under WSL, the Windows dialog needs `powershell.exe` to be reachable through WSL interop. Either way, typing the path and selecting *Open path* / *Set directory* always works. |
 | The dialog seems not to open | Under WSL the Windows dialog can open behind the browser window; check the taskbar. It closes itself after 2 minutes. |
@@ -257,24 +265,33 @@ The CLI commands are `help`, `gui`, `generate "<instruction>"`, and `refactor <f
 
 ### GUI server security
 
-The API accepts browser requests only from its own origin (`http://127.0.0.1:<port>` and `http://localhost:<port>`) and from the optional development origins `http://127.0.0.1:5500` and `http://localhost:5500`. Other origins and `Origin: null` are rejected. Every API request must carry a `Host` of `127.0.0.1:<port>` or `localhost:<port>`, which blocks DNS rebinding. Request bodies are limited to 1 MiB. Static files are served with `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`, and a same-origin `Content-Security-Policy`. cpp-httplib rejects `..` traversal and symlinks that escape the frontend directory.
+**Session token.** Each server instance generates a random 256-bit session token at startup from the operating system's cryptographic random source (`getrandom`). Every `/api/*` request must send it in the `X-CodeAgent-Token` header, or it gets `401 UNAUTHORIZED` before any route runs: no file is read or written, no dialog opens, no proposal changes, and Gemini is not called. The comparison takes the same time however many characters match. The token is kept in memory only. It is never printed, logged, or returned by any route except `POST /api/session`.
 
-For frontend-only development you can still serve `frontend/` from a separate static server on port 5500. The page then calls the API on port 8080.
+**How the page gets the token.** `codeagent gui` creates a one-time *bootstrap code* (also 256 bits, valid 5 minutes, single use) and opens the browser at `http://127.0.0.1:<port>/#bootstrap=<code>`. The code is in the URL fragment, which browsers never send to the server or in a `Referer`. The page reads it, removes it from the address bar and history, and posts it to `POST /api/session`. That route requires an allowed `Origin`. It returns the token, which the page keeps in a JavaScript variable (not `localStorage` or `sessionStorage`). It also sets an `HttpOnly; SameSite=Strict` cookie restricted to `/api/session`, which holds a separate secret. After a reload the page posts to `/api/session` without a code, and the cookie gets it the token again. The cookie alone never authorizes an API call; only the header does.
 
-The backend reads a file only when the user explicitly opens it by path or through the dialog (`POST /api/files/read`). Only supported source extensions up to 512 KiB of UTF-8 text are accepted. It writes back in place only to files opened that way in the current session (`POST /api/files/write`), checking that the file has not changed since; every other write goes through the output-directory rules above. Files mode and settings are disabled placeholders.
+**Origins.** The API accepts browser requests only from the page it serves: `http://127.0.0.1:<port>` and `http://localhost:<port>`. Development origins are no longer allowed by default. Set `CODEAGENT_DEV_ORIGIN` to one exact loopback origin to allow it, for example `CODEAGENT_DEV_ORIGIN=http://127.0.0.1:5500` for a static server on port 5500. The page then calls the API on port 8080, and a one-time link for that origin is printed. Other origins, wildcards, and `Origin: null` are rejected. CORS preflights from an allowed origin may announce only `Content-Type` and `X-CodeAgent-Token`. Browsers never attach custom headers to a preflight, so `OPTIONS` requests cannot carry the token. A preflight therefore performs no action and returns no data; it only permits the authenticated request that follows.
 
-The backend retains at most 128 proposals and in-flight creation reservations combined. Refactor capacity is reserved before provider work begins. At capacity, the backend can replace only the oldest unreserved rejected or applied proposal. A proposal counts as applied once it has been saved, or once the browser has put it into the editor (`mark-applied`). Pending, approved, saving, and actively reserved proposals remain protected. If no slot or terminal proposal is available, the request receives `503 PROPOSAL_CAPACITY` without invoking the provider. Failed provider or response-preparation work releases its reservation and preserves any proposal selected for replacement.
+Every API request must also carry a `Host` of `127.0.0.1:<port>` or `localhost:<port>`, which blocks DNS rebinding. Request bodies are limited to 1 MiB. Static files are served with `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`, and a same-origin `Content-Security-Policy`. cpp-httplib rejects `..` traversal and symlinks that escape the frontend directory. The frontend's static files contain no secrets.
+
+**Limits of this protection.** The token stops other websites and other local users' processes from using the API, as long as they cannot read your files or memory. It does not protect against malicious software running as your own user. Such software can read the browser's memory or profile, the terminal output, or attach to the server process. The bootstrap code is passed to the browser launcher on its command line, where other local users can briefly see it in the process list until the page uses it. It is also printed when no browser can be opened. Both cases are limited by the code being single-use and expiring after 5 minutes.
+
+The backend reads a file only when the user explicitly opens it by path or through the dialog (`POST /api/files/read`). Only regular files with a supported source extension, up to 512 KiB of UTF-8 text, are accepted. Symbolic links must resolve to a supported source file. The size limit is enforced while reading, so a file that grows after the check cannot be read beyond it, and FIFOs and devices are refused without blocking. The 256 most recently opened or saved files can be saved in place; beyond that, the least recently used one must be opened again. It writes back in place only to files opened that way in the current session (`POST /api/files/write`), checking that the file has not changed since; every other write goes through the output-directory rules above. Files mode and settings are disabled placeholders.
+
+The backend retains at most 128 proposals and in-flight creation reservations combined. Refactor capacity is reserved before provider work begins. Proposals are only removed when a new one needs the slot. The backend then picks one in this order:
+
+1. The oldest rejected or applied proposal. A proposal counts as applied once it has been saved, or once the browser has put it into the editor (`mark-applied`).
+2. Otherwise, the pending or approved proposal that has been idle longest, if it has been idle for at least **30 minutes**. Idle means no diff, approve, reject, mark-applied, or save request has used it. This reclaims proposals abandoned by a page reload.
+
+Proposals reserved for another in-flight request are skipped. The choice is made, and checked again when the new proposal is stored, under the same lock that every proposal request and the proposal save hold. A proposal is therefore never removed while it is being saved or changing state. If a proposal reserved for replacement was used again while Gemini was working, another eligible proposal is replaced instead, or the request fails. If no slot is available, the request receives `503 PROPOSAL_CAPACITY`, without invoking the provider when this is known up front. An idle proposal stays fully usable until it is actually replaced. Failed provider or response-preparation work releases its reservation and keeps the proposal selected for replacement.
 
 On POSIX systems, native dialogs use `zenity` when it is installed and a graphical `DISPLAY` or `WAYLAND_DISPLAY` exists. Under WSL without zenity, they use a Windows Forms dialog started through `powershell.exe`, and the returned Windows path is translated to its WSL path. Dialogs time out after 2 minutes. A native Windows build reports dialogs unavailable. macOS has no native dialog integration. Automated tests cover dialog outcomes through an injected provider. The WSL PowerShell dialog has not been exercised with a real click in automated testing; only its launch, path translation, and script syntax have been verified.
 
-There is no `/api/session/exit` route. Stop the backend with Ctrl+C in its terminal.
+There is no route to stop the server. Stop the backend with Ctrl+C in its terminal.
 
 Run the frontend checks with:
 
 ```bash
-node frontend/tests/api.test.mjs
-node frontend/tests/proposalWorkflow.test.mjs
-node frontend/tests/appDomIntegration.test.mjs
+node --test frontend/tests/*.test.mjs
 ```
 
 The app DOM integration test runs the real frontend module against a small, dependency-free test DOM. It verifies the HTML selectors and the event handlers for file loading, generation, review, approve, reject, and save. It does not replace a browser smoke test.

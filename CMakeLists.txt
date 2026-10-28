@@ -224,6 +224,24 @@ target_link_libraries(UnifiedDiffTest
 )
 
 # --------------------------------------------------
+# .env loading tests
+# --------------------------------------------------
+add_executable(EnvLoaderTest
+    tests/EnvLoaderTest.cpp
+    src/EnvLoader.cpp
+)
+
+target_include_directories(EnvLoaderTest
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(EnvLoaderTest
+    PRIVATE
+        GTest::gtest_main
+)
+
+# --------------------------------------------------
 # CLI refactoring workflow tests
 # --------------------------------------------------
 add_executable(CLIControllerTest
@@ -259,6 +277,7 @@ gtest_discover_tests(PromptBuilderTest)
 gtest_discover_tests(LLMClientTest)
 gtest_discover_tests(ResponseParserTest)
 gtest_discover_tests(UnifiedDiffTest)
+gtest_discover_tests(EnvLoaderTest)
 gtest_discover_tests(CLIControllerTest)
 gtest_discover_tests(GuiHttpServerTest)
 

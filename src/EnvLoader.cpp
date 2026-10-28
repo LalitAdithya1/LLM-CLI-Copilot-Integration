@@ -44,7 +44,12 @@ bool loadEnvFile(const std::string& filePath) {
         }
 
         const std::string key = trim(line.substr(0, separator));
-        const std::string value = trim(line.substr(separator + 1));
+        std::string value = trim(line.substr(separator + 1));
+        // KEY="value" and KEY='value' store value without the quotes.
+        if (value.size() >= 2 && (value.front() == '"' || value.front() == '\'') &&
+            value.back() == value.front()) {
+            value = value.substr(1, value.size() - 2);
+        }
 
         if (key.empty()) {
             continue;
