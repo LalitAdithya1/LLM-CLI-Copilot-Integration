@@ -108,6 +108,77 @@ FinishReasonResult classifyFinishReason(const std::string& reason) {
     };
 }
 
+std::string trimSpacesAndTabs(const std::string& text) {
+    const auto first = text.find_first_not_of(" \t\r");
+    if (first == std::string::npos) {
+        return "";
+    }
+    const auto last = text.find_last_not_of(" \t\r");
+    return text.substr(first, last - first + 1);
+}
+
+// Returns the code inside one Markdown fence that encloses the whole text,
+// such as "```cpp\n...\n```". Returns nothing unless the text is exactly one
+// fenced block: an opening line of three or more backticks with an optional
+// language label, and a last line holding the same backticks alone.
+std::optional<std::string> stripEnclosingCodeFence(const std::string& text) {
+    const auto first = text.find_first_not_of(" \t\r\n");
+    const auto last = text.find_last_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return std::nullopt;
+    }
+
+    std::size_t fenceLength = 0;
+    while (first + fenceLength <= last && text[first + fenceLength] == '`') {
+        ++fenceLength;
+    }
+    if (fenceLength < 3) {
+        return std::nullopt;
+    }
+    const std::string fence(fenceLength, '`');
+
+    const auto openingEnd = text.find('\n', first);
+    if (openingEnd == std::string::npos || openingEnd > last) {
+        return std::nullopt;
+    }
+    // The label is a language name such as cpp, c++, C++ or c, or nothing.
+    const std::string label = trimSpacesAndTabs(
+        text.substr(first + fenceLength, openingEnd - first - fenceLength)
+    );
+    for (unsigned char ch : label) {
+        if (!std::isalnum(ch) && ch != '+' && ch != '#' && ch != '-' &&
+            ch != '_' && ch != '.') {
+            return std::nullopt;
+        }
+    }
+
+    const auto closingLineBreak = text.rfind('\n', last);
+    if (closingLineBreak == std::string::npos || closingLineBreak < openingEnd ||
+        trimSpacesAndTabs(text.substr(closingLineBreak + 1, last - closingLineBreak)) != fence) {
+        return std::nullopt;
+    }
+
+    // Keep the code exactly, including the line break that ends its last line.
+    std::string code = text.substr(openingEnd + 1, closingLineBreak - openingEnd);
+
+    // Another fence line inside means several blocks or prose around code.
+    std::size_t lineStart = 0;
+    while (lineStart < code.size()) {
+        const auto lineEnd = code.find('\n', lineStart);
+        const auto contentStart = code.find_first_not_of(" \t", lineStart);
+        if (contentStart != std::string::npos &&
+            (lineEnd == std::string::npos || contentStart < lineEnd) &&
+            code.compare(contentStart, fenceLength, fence) == 0) {
+            return std::nullopt;
+        }
+        if (lineEnd == std::string::npos) {
+            break;
+        }
+        lineStart = lineEnd + 1;
+    }
+    return code;
+}
+
 } // namespace
 
 ParsedResponse ResponseParser::parseResponse(
@@ -238,6 +309,7 @@ ParsedResponse ResponseParser::parseResponse(
     }
 
     std::string generatedText;
+    std::string thoughts;
 
     for (const auto& part : content["parts"]) {
         if (!part.is_object()) {
@@ -255,7 +327,11 @@ ParsedResponse ResponseParser::parseResponse(
                 );
             }
 
-            generatedText += part["text"].get<std::string>();
+            const bool isThought = part.contains("thought") &&
+                                   part["thought"].is_boolean() &&
+                                   part["thought"].get<bool>();
+            (isThought ? thoughts : generatedText) +=
+                part["text"].get<std::string>();
         }
     }
 
@@ -266,8 +342,24 @@ ParsedResponse ResponseParser::parseResponse(
         );
     }
 
+    // Models often wrap code in a Markdown fence despite the prompt. Only a
+    // complete (or legacy unspecified) response is unwrapped; partial output
+    // is returned exactly as received.
+    if (finishResult.error == ResponseParseError::None) {
+        if (auto code = stripEnclosingCodeFence(generatedText)) {
+            if (isWhitespaceOnly(*code)) {
+                return failWithFinishReason(
+                    ResponseParseError::EmptyGeneratedText,
+                    "Gemini returned an empty code block."
+                );
+            }
+            generatedText = std::move(*code);
+        }
+    }
+
     ParsedResponse response;
     response.generatedText = std::move(generatedText);
+    response.thoughts = std::move(thoughts);
     response.finishReason = std::move(finishReason);
     response.completionStatus = finishResult.status;
 
@@ -277,4 +369,80 @@ ParsedResponse ResponseParser::parseResponse(
     }
 
     return response;
+}
+
+namespace {
+
+bool matchesCharacters(const std::string& text, bool allowLowercase, bool allowDash) {
+    if (text.empty() || text.size() > 128) return false;
+    for (unsigned char ch : text) {
+        const bool allowed = std::isupper(ch) || std::isdigit(ch) || ch == '_' ||
+                             (allowLowercase && std::islower(ch)) ||
+                             (allowDash && ch == '-');
+        if (!allowed) return false;
+    }
+    return true;
+}
+
+bool isRetryDelay(const std::string& text) {
+    // Duration strings such as "30s" or "1.5s".
+    if (text.size() < 2 || text.size() > 16 || text.back() != 's') return false;
+    bool sawDigit = false;
+    bool sawPoint = false;
+    for (std::size_t i = 0; i + 1 < text.size(); ++i) {
+        const unsigned char ch = static_cast<unsigned char>(text[i]);
+        if (std::isdigit(ch)) {
+            sawDigit = true;
+        } else if (ch == '.' && !sawPoint && sawDigit) {
+            sawPoint = true;
+        } else {
+            return false;
+        }
+    }
+    return sawDigit;
+}
+
+std::string stringField(const json& object, const char* name) {
+    const auto field = object.find(name);
+    return field != object.end() && field->is_string() ? field->get<std::string>() : "";
+}
+
+} // namespace
+
+std::optional<ProviderErrorDetails> ResponseParser::parseProviderError(
+    const std::string& responseBody
+) const {
+    const json result = json::parse(responseBody, nullptr, false);
+    if (result.is_discarded() || !result.is_object()) return std::nullopt;
+    const auto error = result.find("error");
+    if (error == result.end() || !error->is_object()) return std::nullopt;
+
+    ProviderErrorDetails details;
+    const auto code = error->find("code");
+    if (code != error->end() && code->is_number_integer()) details.code = code->get<long>();
+    const std::string status = stringField(*error, "status");
+    if (matchesCharacters(status, false, false)) details.status = status;
+
+    const auto entries = error->find("details");
+    if (entries == error->end() || !entries->is_array()) return details;
+    for (const json& entry : *entries) {
+        if (!entry.is_object()) continue;
+        const std::string type = stringField(entry, "@type");
+        if (type == "type.googleapis.com/google.rpc.ErrorInfo") {
+            const std::string reason = stringField(entry, "reason");
+            if (matchesCharacters(reason, false, false)) details.reason = reason;
+        } else if (type == "type.googleapis.com/google.rpc.QuotaFailure") {
+            const auto violations = entry.find("violations");
+            if (violations == entry.end() || !violations->is_array()) continue;
+            for (const json& violation : *violations) {
+                if (!violation.is_object()) continue;
+                const std::string quotaId = stringField(violation, "quotaId");
+                if (matchesCharacters(quotaId, true, true)) details.quotaIds.push_back(quotaId);
+            }
+        } else if (type == "type.googleapis.com/google.rpc.RetryInfo") {
+            const std::string delay = stringField(entry, "retryDelay");
+            if (isRetryDelay(delay)) details.retryDelay = delay;
+        }
+    }
+    return details;
 }

@@ -1,0 +1,56 @@
+.main-content {
+  padding: var(--space-4) var(--space-6) var(--space-6);
+}
+
+.workspace-panels {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  align-items: stretch;
+  gap: var(--space-4);
+}
+
+.assistant-panel,
+.preview-panel {
+  min-width: 0;
+  min-height: 28rem;
+}
+
+.assistant-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.preview-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.conversation {
+  /* Side by side, the conversation fills whatever height the editor card
+     sets and scrolls. Size containment keeps its messages from making the
+     row, and so the editor card, any taller. */
+  min-height: 12rem;
+  flex: 1 1 0;
+  contain: size;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: var(--color-scrollbar) var(--color-surface-sunken);
+  scrollbar-width: thin;
+}
+
+@media (max-width: 760px) {
+  .main-content {
+    padding-inline: var(--space-4);
+  }
+
+  .workspace-panels {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* Stacked, each card sizes to its own content. */
+  .conversation {
+    flex-basis: auto;
+    max-height: 24rem;
+    contain: none;
+  }
+}

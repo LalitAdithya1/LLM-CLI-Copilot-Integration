@@ -6,6 +6,7 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <unistd.h>
 #include "FileManager.hpp"
 #include "../src/detail/FileReplacement.hpp"
 
@@ -142,4 +143,106 @@ TEST_F(FileManagerTestFixture, ReplacementFailurePreservesOriginalContents) {
     EXPECT_TRUE(originalWasPresentAtReplacement);
     EXPECT_EQ(readContents(target), original);
     EXPECT_FALSE(std::filesystem::exists(temporary));
+}
+
+// --------------------------------------------------------------------------
+// saveFile: validation, confirmation, and failure reporting
+// --------------------------------------------------------------------------
+
+class SaveFileTest : public FileManagerTestFixture {
+protected:
+    FileManager::WriteResult save(
+        const std::filesystem::path& path,
+        const std::string& answers,
+        FileManager::PermissionPrompt prompt =
+            FileManager::PermissionPrompt::AlreadyGranted
+    ) {
+        std::istringstream input(answers);
+        output.str("");
+        error.str("");
+        FileManager manager(input, output, error);
+        return manager.saveFile(path, kCode, prompt);
+    }
+
+    const std::string kCode = "int main() { return 0; }\n";
+    std::ostringstream output;
+    std::ostringstream error;
+};
+
+TEST_F(SaveFileTest, InvalidPathsAreRejectedBeforeAnythingIsWritten) {
+    EXPECT_EQ(save("", ""), FileManager::WriteResult::InvalidPath);
+    EXPECT_NE(error.str().find("cannot be empty"), std::string::npos);
+
+    EXPECT_EQ(save(testDir / "notes.txt", ""), FileManager::WriteResult::InvalidPath);
+    EXPECT_NE(error.str().find("not a supported source file name"), std::string::npos);
+    EXPECT_FALSE(std::filesystem::exists(testDir / "notes.txt"));
+
+    EXPECT_EQ(save(testDir / "missing" / "main.cpp", ""), FileManager::WriteResult::InvalidPath);
+    EXPECT_NE(error.str().find("does not exist. Create it first or choose another path."),
+              std::string::npos);
+    EXPECT_FALSE(std::filesystem::exists(testDir / "missing"));
+
+    std::filesystem::create_directory(testDir / "folder.cpp");
+    EXPECT_EQ(save(testDir / "folder.cpp", ""), FileManager::WriteResult::InvalidPath);
+    EXPECT_NE(error.str().find("is a folder. Include a file name"), std::string::npos);
+}
+
+TEST_F(SaveFileTest, AUserChosenPathIsWrittenWithoutAPermissionPrompt) {
+    const auto target = testDir / "main.cpp";
+    EXPECT_EQ(save(target, ""), FileManager::WriteResult::Written);
+    EXPECT_EQ(readContents(target), kCode);
+    EXPECT_EQ(output.str().find("wants permission"), std::string::npos);
+    EXPECT_FALSE(std::filesystem::exists(target.string() + ".codeagent.tmp"));
+}
+
+TEST_F(SaveFileTest, AnExistingFileIsOnlyReplacedAfterConfirmation) {
+    const auto target = testDir / "existing.cpp";
+    std::ofstream(target) << "old contents\n";
+
+    EXPECT_EQ(save(target, "n\n"), FileManager::WriteResult::Declined);
+    EXPECT_NE(output.str().find("Overwrite this file? [y/N]"), std::string::npos);
+    EXPECT_EQ(readContents(target), "old contents\n");
+
+    // End of input is not consent.
+    EXPECT_EQ(save(target, ""), FileManager::WriteResult::Declined);
+    EXPECT_EQ(readContents(target), "old contents\n");
+
+    EXPECT_EQ(save(target, "y\n"), FileManager::WriteResult::Written);
+    EXPECT_EQ(readContents(target), kCode);
+}
+
+TEST_F(SaveFileTest, PermissionDeniedIsReportedAsSuch) {
+    if (::geteuid() == 0) GTEST_SKIP() << "root ignores file permissions";
+    // A folder on the local file system: drives mounted from Windows under
+    // WSL ignore permission bits.
+    const auto folder = std::filesystem::temp_directory_path() /
+        ("codeagent-save-" + std::to_string(::getpid()));
+    std::filesystem::create_directories(folder);
+    std::filesystem::permissions(folder, std::filesystem::perms::owner_read |
+                                         std::filesystem::perms::owner_exec);
+    const bool enforced = !std::ofstream(folder / "probe.cpp").is_open();
+    const auto target = folder / "main.cpp";
+    const auto result = enforced ? save(target, "") : FileManager::WriteResult::Failed;
+    std::filesystem::permissions(folder, std::filesystem::perms::owner_all);
+    const bool written = std::filesystem::exists(target);
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+    if (!enforced) GTEST_SKIP() << "this file system does not enforce permissions";
+
+    EXPECT_EQ(result, FileManager::WriteResult::Failed);
+    EXPECT_NE(error.str().find("Permission denied: CodeAgent cannot write to"), std::string::npos);
+    EXPECT_FALSE(written);
+}
+
+TEST_F(SaveFileTest, OtherWriteFailuresNameTheCauseAndKeepUnrelatedFiles) {
+    const auto target = testDir / "main.cpp";
+    // Something that is not ours already occupies the temporary path.
+    const auto blocker = std::filesystem::path(target.string() + ".codeagent.tmp");
+    std::filesystem::create_directory(blocker);
+
+    EXPECT_EQ(save(target, ""), FileManager::WriteResult::Failed);
+    EXPECT_NE(error.str().find("Error: Could not write"), std::string::npos);
+    EXPECT_NE(error.str().find("Is a directory"), std::string::npos);
+    EXPECT_FALSE(std::filesystem::exists(target));
+    EXPECT_TRUE(std::filesystem::is_directory(blocker));
 }

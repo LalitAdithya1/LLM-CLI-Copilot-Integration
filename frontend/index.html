@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="CodeAgent — a local C++ coding assistant interface.">
+    <title>CodeAgent — C++ Coding Copilot</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="css/main.css">
+    <link rel="stylesheet" href="css/layout.css">
+    <link rel="stylesheet" href="css/components.css">
+    <script type="module" src="js/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell" data-app="codeagent">
+      <header class="app-header" id="app-header">
+        <a class="brand" href="#main-content" aria-label="CodeAgent home">
+          <svg class="brand__icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+            <path d="m8 5-7 7 7 7M16 5l7 7-7 7M14 3l-4 18" />
+          </svg>
+          <span class="brand__copy">
+            <span class="brand__name">CodeAgent</span>
+            <span class="brand__subtitle">C++ Coding Copilot</span>
+          </span>
+        </a>
+
+        <div class="header-actions">
+          <span class="local-badge" id="local-status" role="status">
+            <span class="status-indicator" aria-hidden="true"></span>
+            Local
+          </span>
+          <button class="icon-button" id="settings-button" type="button" aria-label="Settings unavailable" disabled>
+            <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+              <path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Z" />
+              <path d="m19.4 15 .1.1a1.8 1.8 0 0 1-2.5 2.5l-.1-.1a1.8 1.8 0 0 0-3 .9v.2a1.8 1.8 0 0 1-3.6 0v-.2a1.8 1.8 0 0 0-3-.9l-.1.1a1.8 1.8 0 0 1-2.5-2.5l.1-.1a1.8 1.8 0 0 0-.9-3h-.2a1.8 1.8 0 0 1 0-3.6h.2a1.8 1.8 0 0 0 .9-3l-.1-.1a1.8 1.8 0 0 1 2.5-2.5l.1.1a1.8 1.8 0 0 0 3-.9v-.2a1.8 1.8 0 0 1 3.6 0v.2a1.8 1.8 0 0 0 3 .9l.1-.1a1.8 1.8 0 0 1 2.5 2.5l-.1.1a1.8 1.8 0 0 0 .9 3h.2a1.8 1.8 0 0 1 0 3.6h-.2a1.8 1.8 0 0 0-.9 3Z" />
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <main id="main-content" class="main-content">
+        <nav class="mode-cards" aria-label="Assistant mode">
+          <button class="mode-card" id="mode-generate" type="button" data-mode="generate" aria-pressed="true">
+            <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+              <path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8m0-12.8L5.6 18.4" />
+            </svg>
+            <span>Generate</span>
+          </button>
+          <button class="mode-card" id="mode-refactor" type="button" data-mode="refactor" aria-pressed="false" aria-controls="source-file-controls">
+            <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+              <path d="m14 6 4-4 4 4-4 4M18 2v9a5 5 0 0 1-5 5H6m4 2-4 4-4-4m4 4v-9a5 5 0 0 1 5-5h1" />
+            </svg>
+            <span>Refactor</span>
+          </button>
+        </nav>
+
+        <p class="availability-note" id="workflow-note">
+          Generate writes new code; Refactor works on the code in the editor, which you can open from a source file. Generated code and refactoring proposals appear below for review; Accept puts them into the editor, and nothing is written until you Save. Save As writes to the active output directory.
+        </p>
+
+        <section class="backend-config" aria-labelledby="backend-config-heading">
+          <div class="backend-config__header">
+            <h2 id="backend-config-heading">Backend configuration</h2>
+            <p id="backend-config-status" role="status">Loading configuration…</p>
+          </div>
+          <dl class="backend-config__values" id="backend-config-values" hidden>
+            <div>
+              <dt>Launch directory</dt>
+              <dd id="backend-config-launch-directory"></dd>
+            </div>
+            <div>
+              <dt>Active output directory</dt>
+              <dd id="backend-config-output-directory"></dd>
+            </div>
+          </dl>
+          <div class="path-row" id="source-file-controls" hidden>
+            <label for="source-path-input">Source file</label>
+            <input id="source-path-input" type="text" spellcheck="false" autocomplete="off" placeholder="/mnt/d/project/main.cpp or D:\project\main.cpp">
+            <button class="action-button" id="open-source-path-button" type="button">Open path</button>
+            <button class="action-button" id="select-source-file-button" type="button">Choose source path</button>
+            <button class="action-button" id="load-source-file-button" type="button" title="Loads a copy; the browser cannot reveal its location, so save it with Save As">Open file in editor</button>
+            <input id="load-source-file-input" type="file" accept=".c,.cc,.cpp,.cxx,.h,.hh,.hpp,.hxx" hidden>
+          </div>
+          <div class="path-row">
+            <label for="output-directory-input">Output directory</label>
+            <input id="output-directory-input" type="text" spellcheck="false" autocomplete="off" placeholder="/mnt/d/project or D:\project">
+            <button class="action-button" id="set-output-directory-button" type="button">Set directory</button>
+            <button class="action-button" id="select-output-directory-button" type="button">Choose output directory</button>
+          </div>
+          <p class="file-status" id="file-status" role="status" aria-live="polite" hidden></p>
+          <p class="backend-config__error" id="backend-config-error" role="alert" hidden></p>
+        </section>
+
+        <div class="workspace-panels">
+          <section class="assistant-panel" id="assistant-panel" aria-labelledby="assistant-heading">
+            <div class="panel-heading">
+              <div class="panel-heading__title">
+                <svg class="panel-heading__icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+                  <path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8A8.5 8.5 0 0 1 8.7 3.9a8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8Z" />
+                </svg>
+                <h1 id="assistant-heading">AI Assistant</h1>
+              </div>
+              <button class="document-button" id="clear-chat-button" type="button" title="Clear the conversation; the editor and proposal are unchanged">Clear</button>
+            </div>
+
+            <div class="conversation" id="conversation" role="log" aria-live="polite" aria-label="Conversation with Gemini">
+              <p class="message-placeholder conversation__empty" id="conversation-empty">
+                Your prompts, Gemini's replies and its thoughts appear here. Generated code and refactoring proposals are also shown in the review below.
+              </p>
+            </div>
+
+            <div class="assistant-status" id="assistant-status" data-state="checking" role="status" aria-live="polite">
+              <span class="status-indicator" aria-hidden="true"></span>
+              <span id="assistant-status-message">Checking backend…</span>
+              <span class="assistant-status__detail" id="assistant-status-detail"></span>
+              <button class="assistant-status__retry" id="backend-retry-button" type="button" disabled>Retry</button>
+            </div>
+
+            <form class="prompt-form" id="prompt-form">
+              <label class="visually-hidden" for="prompt-input">Instruction for CodeAgent</label>
+              <label class="visually-hidden" for="language-input">Programming language</label>
+              <input id="language-input" name="language" type="text" placeholder="Programming language (for example, C++)" aria-describedby="prompt-help prompt-feedback">
+              <textarea id="prompt-input" name="prompt" rows="3" placeholder="Describe the code to generate. Enter sends, Shift+Enter adds a line." aria-describedby="prompt-help prompt-feedback"></textarea>
+              <p class="visually-hidden" id="prompt-help">Enter a programming language and an instruction. Refactoring creates a proposal for diff review. Accepting it replaces the editor contents; save them with Save or Save As.</p>
+              <p class="prompt-feedback" id="prompt-feedback" role="alert" aria-live="assertive" hidden></p>
+              <div class="prompt-actions">
+                <button class="action-button action-button--primary" id="generate-submit-button" type="submit">Generate code</button>
+                <button class="action-button" id="resend-prompt-button" type="button" title="Send your last prompt to Gemini again, unchanged, as a new exchange" disabled>Resend prompt</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="preview-panel" id="preview-panel" aria-labelledby="preview-heading">
+            <header class="preview-header">
+              <div class="preview-title">
+                <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+                  <path d="m8 5-7 7 7 7M16 5l7 7-7 7M14 3l-4 18" />
+                </svg>
+                <h2 id="preview-heading">untitled.cpp</h2>
+              </div>
+              <div class="document-actions">
+                <button class="document-button" id="save-document-button" type="button" title="Save to the opened file (Ctrl+S)" disabled>Save</button>
+                <button class="document-button" id="save-document-as-button" type="button" title="Save to a new file in the output directory">Save As</button>
+                <button class="document-button" id="reload-document-button" type="button" title="Reload the opened file from disk" disabled>Reload</button>
+                <button class="document-button copy-button" id="copy-code-button" type="button" title="Copy editor contents" data-state="idle">
+                  <svg class="copy-button__icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+                    <rect x="8" y="8" width="13" height="13" rx="2" />
+                    <path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" />
+                  </svg>
+                  <svg class="copy-button__check" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+                    <path d="m5 12.5 4.5 4.5L19 7.5" />
+                  </svg>
+                  <span id="copy-code-label">Copy</span>
+                </button>
+              </div>
+            </header>
+
+            <div class="code-preview" id="code-preview" role="region" aria-label="Editable sample code workspace">
+              <ol class="line-numbers" id="editor-line-numbers" aria-hidden="true"></ol>
+              <textarea
+                class="code-editor"
+                id="code-editor"
+                rows="12"
+                wrap="off"
+                spellcheck="false"
+                autocomplete="off"
+                aria-label="Code editor"
+                aria-describedby="editor-description"
+              ></textarea>
+            </div>
+            <p class="visually-hidden" id="editor-description">Sample source until you open a file. Save writes back to a file opened by path; Save As writes to the output directory. Refactoring sends editor text to the backend.</p>
+            <p class="file-status" id="document-status" role="status" aria-live="polite" hidden></p>
+
+            <footer class="preview-footer">
+              <span id="code-language">New document · not saved to disk</span>
+              <span id="code-status" role="status">Not saved to disk</span>
+            </footer>
+          </section>
+        </div>
+
+        <section class="proposal-review" id="proposal-review" aria-labelledby="proposal-review-heading">
+          <header class="proposal-review__header">
+            <div>
+              <h2 id="proposal-review-heading">Proposal review</h2>
+              <p class="proposal-review__status" id="proposal-review-status" role="status">No proposal available</p>
+            </div>
+            <p class="proposal-review__notice" role="note">
+              <span class="proposal-review__notice-label">NOTE:</span>
+              <span id="proposal-review-availability">Review the proposed changes carefully. Select Accept to apply the proposal to the editor, or Reject to discard it. After accepting, review or edit the code, then select Save or Save As to write it to disk. Complete your review before starting another generation or proposal.</span>
+            </p>
+          </header>
+
+          <div class="proposal-review__code-panes">
+            <section class="proposal-code" aria-labelledby="proposal-original-heading">
+              <h3 id="proposal-original-heading">Original code</h3>
+              <pre class="proposal-code__content" id="proposal-original-code" aria-label="Original code">No original code loaded.</pre>
+            </section>
+            <section class="proposal-code" aria-labelledby="proposal-proposed-heading">
+              <h3 id="proposal-proposed-heading">Proposed code</h3>
+              <pre class="proposal-code__content" id="proposal-proposed-code" aria-label="Proposed code">No proposal available.</pre>
+            </section>
+          </div>
+
+          <section class="proposal-diff" aria-labelledby="proposal-diff-heading">
+            <h3 id="proposal-diff-heading">Unified diff</h3>
+            <pre class="proposal-diff__content" id="proposal-diff-content" role="region" aria-live="polite" aria-label="Proposal diff">No diff loaded.</pre>
+          </section>
+
+          <div class="proposal-review__actions">
+            <button class="action-button" id="review-changes-button" type="button" aria-describedby="proposal-review-availability" disabled>Review changes</button>
+            <button class="action-button" id="reject-proposal-button" type="button" aria-describedby="proposal-review-availability" disabled>Reject</button>
+            <button class="action-button action-button--primary" id="accept-proposal-button" type="button" aria-describedby="proposal-review-availability" disabled>Accept</button>
+          </div>
+        </section>
+
+      </main>
+
+      <footer class="app-footer">
+        <p id="concept-note">The editor is a plain text workspace. AI output is never executed; files are written only when you save.</p>
+        <div id="notification-area" role="status" aria-live="polite" aria-label="Status and notifications">
+          Ready to connect to the local backend.
+        </div>
+      </footer>
+    </div>
+  </body>
+</html>

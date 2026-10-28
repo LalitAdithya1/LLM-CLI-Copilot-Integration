@@ -3,6 +3,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 enum class ResponseParseError {
     None,
@@ -36,6 +37,10 @@ struct ParsedResponse {
     // Gemini's current response shape has no separate explanation field.
     std::optional<std::string> explanation;
 
+    // Thought-summary parts ("thought": true), combined in order. They are
+    // never part of generatedText. Empty unless thoughts were requested.
+    std::string thoughts;
+
     // Kept exactly as provided. An absent field stays empty; no reason is
     // inferred from the response text.
     std::optional<std::string> finishReason;
@@ -59,9 +64,27 @@ struct ParsedResponse {
     }
 };
 
+// The machine-readable parts of a Gemini error body
+// ({"error": {"code", "status", "details": [...]}}). The free-text message is
+// deliberately not kept: it is never shown or logged. Every field is checked
+// against a strict character set, so it is safe to log.
+struct ProviderErrorDetails {
+    long code = 0;
+    std::string status;                   // e.g. RESOURCE_EXHAUSTED
+    std::string reason;                   // ErrorInfo reason, e.g. API_KEY_INVALID
+    std::vector<std::string> quotaIds;    // QuotaFailure violations
+    std::optional<std::string> retryDelay; // RetryInfo, e.g. "30s"
+};
+
 class ResponseParser {
 public:
     ParsedResponse parseResponse(
+        const std::string& responseBody
+    ) const;
+
+    // Returns nullopt when the body is not a JSON object with an "error"
+    // object.
+    std::optional<ProviderErrorDetails> parseProviderError(
         const std::string& responseBody
     ) const;
 };

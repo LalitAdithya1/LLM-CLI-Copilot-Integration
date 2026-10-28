@@ -53,7 +53,9 @@ bool PromptBuilder::buildGenerationPrompt(
         "Generate code according to the requirements below.\n\n"
         "Programming language:\n" + language + "\n\n"
         "User instructions:\n" + instruction + "\n\n"
-        "Return the generated code and nothing else.";
+        "Return only the raw " + language + " source code, ready to save "
+        "as a file. Do not wrap it in Markdown code fences and do not add "
+        "explanations.";
 
     return true;
 }
@@ -82,7 +84,9 @@ bool PromptBuilder::buildRefactoringPrompt(
         "User instructions:\n" + instruction + "\n\n"
         "Source code:\n"
         "```" + language + "\n" + sourceCode + "\n```\n\n"
-        "Return the refactored code and nothing else.";
+        "Return only the complete refactored " + language + " source code, "
+        "ready to save as a file. Do not wrap it in Markdown code fences "
+        "and do not add explanations.";
 
     return true;
 }

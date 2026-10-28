@@ -1,0 +1,135 @@
+:root {
+  color-scheme: light;
+
+  /* Neutral Elegance palette */
+  --palette-beige: #ffdbbb;
+  --palette-stone: #ccbeb1;
+  --palette-brown: #997e67;
+  --palette-deep-brown: #664930;
+  --palette-espresso: #2b1f16;
+
+  /* Surfaces, from the page backdrop up to raised cards */
+  --color-page: #ebe1d6;
+  --color-app: #faf6f1;
+  --color-panel: #f4ece3;
+  --color-card: #fffcf8;
+  --color-surface-sunken: #efe5da;
+  --color-input: #fffcf8;
+  --color-hover: #efe3d6;
+  --color-active: #e6d7c8;
+  --color-disabled: #efe9e2;
+
+  /* Text */
+  --color-text: var(--palette-espresso);
+  --color-text-muted: #6b5443;
+  --color-placeholder: #8a7461;
+
+  /* Borders */
+  --color-border: #ddd0c3;
+  --color-border-strong: var(--palette-stone);
+  --color-border-hover: var(--palette-brown);
+  --color-input-border: var(--palette-brown);
+
+  /* Accent */
+  --color-accent: var(--palette-deep-brown);
+  --color-accent-hover: #553c27;
+  --color-accent-active: #47321f;
+  --color-accent-text: var(--palette-deep-brown);
+  --color-on-accent: #fff8f1;
+  --color-accent-soft: #ffeedf;
+  --color-accent-selected: var(--palette-beige);
+  --color-accent-border: var(--palette-brown);
+  --color-focus-ring: rgb(102 73 48 / 18%);
+
+  /* Status */
+  --color-status: #3f8f4e;
+  --color-success: #2f6b3a;
+  --color-warning: #8a5300;
+  --color-warning-dot: #c98a2b;
+  --color-danger: #a33a2e;
+  --color-danger-dot: #c0473a;
+  --color-danger-border: rgb(163 58 46 / 40%);
+
+  /* Code surfaces stay dark so code and diff colors read clearly. */
+  --color-code-bg: #2a1f17;
+  --color-code-border: #3e2f23;
+  --color-code-text: #f5ebe0;
+  --color-code-muted: #a08b78;
+  --color-code-selection: rgb(255 219 187 / 26%);
+  --color-scrollbar: var(--palette-stone);
+
+  --shadow-sm: 0 1px 2px rgb(60 40 25 / 8%);
+  --shadow-md: 0 6px 20px rgb(60 40 25 / 8%);
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+
+  --radius-panel: 0.75rem;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+  background: var(--color-page);
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background: var(--color-page);
+  color: var(--color-text);
+  font-family: Inter, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 0.9375rem;
+  line-height: 1.5;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+
+.app-shell {
+  width: min(100% - 2rem, 80rem);
+  min-height: calc(100vh - 4rem);
+  margin: var(--space-8) auto;
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-panel);
+  background: var(--color-app);
+  box-shadow: var(--shadow-md);
+}
+
+/* `hidden` always wins over component display rules. */
+[hidden] {
+  display: none !important;
+}
+
+/* Text for screen readers only. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}

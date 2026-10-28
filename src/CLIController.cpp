@@ -1,33 +1,318 @@
 
 #include "CLIController.hpp"
 
+#include "CodeAgentError.hpp"
 #include "FileManager.hpp"
+#include "GuiHttpServer.hpp"
 #include "PromptBuilder.hpp"
+#include "EnvLoader.hpp"
 #include "LLMClient.hpp"
+#include "UnifiedDiff.hpp"
 
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <csignal>
+#include <cstdlib>
+#include <filesystem>
+#include <exception>
 #include <iostream>
+#include <new>
 #include <string>
+#include <system_error>
+#include <thread>
+#include <utility>
+#include <vector>
 
 namespace {
 
-void displayHelp() {
-    std::cout
-        << "CodingCLI - AI Coding Assistant\n\n"
+volatile std::sig_atomic_t guiStopRequested = 0;
+constexpr int kDefaultGuiPort = 8080;
+
+void requestGuiStop(int) {
+    guiStopRequested = 1;
+}
+
+bool isSetEnvironmentValue(const char* value) {
+    if (value == nullptr) {
+        return false;
+    }
+    for (const char* character = value; *character != '\0'; ++character) {
+        if (!std::isspace(static_cast<unsigned char>(*character))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// CODEAGENT_GUI_PORT overrides the default port, e.g. when 8080 is taken.
+// Throws ConfigurationError for a value that is not a valid port.
+int resolveGuiPort() {
+    const char* value = std::getenv("CODEAGENT_GUI_PORT");
+    if (!isSetEnvironmentValue(value)) {
+        return kDefaultGuiPort;
+    }
+    const std::string text(value);
+    const bool digitsOnly = text.size() <= 5 && std::all_of(
+        text.begin(), text.end(),
+        [](unsigned char character) { return std::isdigit(character) != 0; }
+    );
+    const int port = digitsOnly ? std::stoi(text) : 0;
+    if (port < 1 || port > 65535) {
+        throw ConfigurationError(
+            "Configuration error: CODEAGENT_GUI_PORT must be a port number from 1 to 65535. "
+            "Change it, or unset it to use port 8080."
+        );
+    }
+    return port;
+}
+
+bool containsFrontend(const std::filesystem::path& directory) {
+    std::error_code ignored;
+    return std::filesystem::is_regular_file(directory / "index.html", ignored);
+}
+
+// Finds the frontend independently of the working directory: an explicit
+// CODEAGENT_FRONTEND_DIR, then locations relative to the executable (build
+// tree or installed share/codeagent), then the source tree it was built from.
+std::filesystem::path findFrontendDirectory(std::ostream& error) {
+    const char* configured = std::getenv("CODEAGENT_FRONTEND_DIR");
+    if (isSetEnvironmentValue(configured)) {
+        if (containsFrontend(configured)) {
+            return configured;
+        }
+        error << "Warning: CODEAGENT_FRONTEND_DIR does not contain index.html; "
+              << "searching the default locations.\n";
+    }
+
+    std::vector<std::filesystem::path> candidates;
+    std::error_code executableError;
+    const auto executable =
+        std::filesystem::read_symlink("/proc/self/exe", executableError);
+    if (!executableError) {
+        const auto directory = executable.parent_path();
+        candidates.push_back(directory / "frontend");
+        candidates.push_back(directory.parent_path() / "frontend");
+        candidates.push_back(directory.parent_path() / "share/codeagent/frontend");
+    }
+#ifdef CODEAGENT_FRONTEND_SOURCE_DIR
+    candidates.emplace_back(CODEAGENT_FRONTEND_SOURCE_DIR);
+#endif
+    for (const auto& candidate : candidates) {
+        if (containsFrontend(candidate)) {
+            return candidate.lexically_normal();
+        }
+    }
+    return {};
+}
+
+int runGuiCommand(std::ostream& output, std::ostream& error) {
+    const int port = resolveGuiPort();
+
+    // Report a missing key at startup instead of only on the first request.
+    // The key itself is never printed or sent to the browser. The .env files
+    // are loaded here, once, before any request thread exists.
+    loadConfigurationFilesOnce();
+    if (!isSetEnvironmentValue(std::getenv("GEMINI_API_KEY"))) {
+        error << "Warning: GEMINI_API_KEY is not set. Export it, or add it to "
+              << ".env in the launch directory or to "
+              << "~/.config/codeagent/.env; generation and refactoring will "
+              << "fail until it is configured.\n";
+    }
+
+    GuiHttpServer::GenerationHandler generationHandler =
+        [](const std::string& instruction,
+           const std::string& language,
+           std::string& generatedCode,
+           std::string& thoughts) {
+            PromptBuilder promptBuilder;
+            std::string prompt;
+            if (!promptBuilder.buildGenerationPrompt(
+                    instruction,
+                    language,
+                    prompt)) {
+                return false;
+            }
+
+            // Failures propagate as exceptions, so the GUI server can tell
+            // the user why generation failed.
+            auto result = LLMClient().generate(prompt, {false, true});
+            generatedCode = std::move(result.text);
+            thoughts = std::move(result.thoughts);
+            return true;
+        };
+    GuiHttpServer::RefactoringHandler refactoringHandler =
+        [](const std::string& instruction,
+           const std::string& language,
+           const std::string& sourceCode,
+           std::string& refactoredCode,
+           std::string& thoughts) {
+            PromptBuilder promptBuilder;
+            std::string prompt;
+            if (!promptBuilder.buildRefactoringPrompt(
+                    instruction,
+                    language,
+                    sourceCode,
+                    prompt)) {
+                return false;
+            }
+
+            auto result = LLMClient().generate(prompt, {true, true});
+            refactoredCode = std::move(result.text);
+            thoughts = std::move(result.thoughts);
+            return true;
+        };
+    GuiHttpServer server(
+        port,
+        std::filesystem::current_path(),
+        std::move(generationHandler),
+        std::move(refactoringHandler)
+    );
+    // A frontend on another origin, such as a live-reload server, is only
+    // accepted when explicitly configured.
+    const char* developmentOrigin = std::getenv("CODEAGENT_DEV_ORIGIN");
+    if (isSetEnvironmentValue(developmentOrigin) &&
+        !server.allowDevelopmentOrigin(developmentOrigin)) {
+        throw ConfigurationError(
+            "Configuration error: CODEAGENT_DEV_ORIGIN must be exactly "
+            "http://127.0.0.1:<port> or http://localhost:<port>. Fix or unset it."
+        );
+    }
+    const auto frontendDirectory = findFrontendDirectory(error);
+    const bool servingFrontend =
+        !frontendDirectory.empty() && server.serveFrontend(frontendDirectory);
+    if (!servingFrontend) {
+        error << "Warning: Frontend files were not found; only the API is "
+              << "available. Set CODEAGENT_FRONTEND_DIR to the frontend "
+              << "directory that contains index.html.\n";
+    }
+    if (!server.start()) {
+        error << "Error: Could not start the GUI server on 127.0.0.1:"
+              << port << ". The port may be in use by another program "
+              << "(is another 'codeagent gui' running?). Stop it or choose "
+              << "another port, e.g. CODEAGENT_GUI_PORT=8081 codeagent gui\n";
+        return 1;
+    }
+
+    guiStopRequested = 0;
+    const auto previousInterruptHandler =
+        std::signal(SIGINT, requestGuiStop);
+    if (previousInterruptHandler == SIG_ERR) {
+        server.stop();
+        error << "Error: Could not install the interrupt handler for the GUI server.\n";
+        return 1;
+    }
+
+#ifdef SIGTERM
+    const auto previousTerminateHandler =
+        std::signal(SIGTERM, requestGuiStop);
+    if (previousTerminateHandler == SIG_ERR) {
+        std::signal(SIGINT, previousInterruptHandler);
+        server.stop();
+        error << "Error: Could not install the termination handler for the GUI server.\n";
+        return 1;
+    }
+#endif
+
+    const std::string url =
+        "http://127.0.0.1:" + std::to_string(server.port()) + "/";
+    output << "CodeAgent GUI running at " << url << "\n";
+    // The page needs a one-time code to obtain the API session token. It is
+    // put in the URL fragment, which browsers do not send to the server. The
+    // session token itself is never printed.
+    if (servingFrontend) {
+        output << "Serving frontend from " << frontendDirectory.string() << "\n";
+        const bool openBrowser = !isSetEnvironmentValue(std::getenv("CODEAGENT_NO_BROWSER"));
+        if (openBrowser && launchDefaultBrowser(url + "#bootstrap=" + server.issueBootstrapCode())) {
+            output << "Opening your default browser...\n";
+        } else {
+            if (openBrowser) output << "Could not open a browser automatically.\n";
+            output << "Open this one-time link within 5 minutes:\n  "
+                   << url << "#bootstrap=" << server.issueBootstrapCode() << "\n";
+        }
+    }
+    if (isSetEnvironmentValue(developmentOrigin)) {
+        output << "Development frontend (one-time link, valid 5 minutes):\n  "
+               << developmentOrigin << "/#bootstrap=" << server.issueBootstrapCode() << "\n";
+    }
+    output << "Press Ctrl+C to stop.\n";
+    output.flush();
+
+    while (guiStopRequested == 0 && server.isRunning()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    server.stop();
+    std::signal(SIGINT, previousInterruptHandler);
+#ifdef SIGTERM
+    std::signal(SIGTERM, previousTerminateHandler);
+#endif
+    guiStopRequested = 0;
+    output << "GUI backend stopped.\n";
+    return 0;
+}
+
+void displayHelp(std::ostream& output) {
+    output
+        << "CodeAgent - AI Coding Assistant\n\n"
         << "Usage:\n"
         << "  codeagent help\n"
+        << "  codeagent gui\n"
         << "  codeagent generate \"<instruction>\"\n"
         << "  codeagent refactor <file-path> \"<instruction>\"\n\n"
         << "Commands:\n"
-        << "  generate   Generate code from an instruction\n"
+        << "  gui        Start the browser GUI on 127.0.0.1 and open it (Ctrl+C to stop)\n"
+        << "  generate   Generate code from an instruction, then optionally save it\n"
         << "  refactor   Refactor a source file using AI\n"
         << "  help       Display this help message\n\n"
         << "Options:\n"
-        << "  -h, --help Display this help message\n";
+        << "  -h, --help Display this help message\n\n"
+        << "Environment:\n"
+        << "  GEMINI_API_KEY          Gemini API key\n"
+        << "  CODEAGENT_ENV_FILE      A specific .env file to read first\n"
+        << "  CODEAGENT_GUI_PORT      GUI port (default 8080)\n"
+        << "  CODEAGENT_NO_BROWSER    Set to 1 to skip opening a browser\n"
+        << "  CODEAGENT_FRONTEND_DIR  Directory containing the frontend index.html\n\n"
+        << "Configuration lookup (the first value found wins):\n"
+        << "  1. variables already set in the environment\n"
+        << "  2. the file named by CODEAGENT_ENV_FILE\n"
+        << "  3. .env in the current directory\n"
+        << "  4. ~/.config/codeagent/.env (or $XDG_CONFIG_HOME/codeagent/.env)\n";
 }
 
-void displayUsageError(const std::string& message) {
-    std::cerr << "Error: " << message << "\n\n";
-    std::cerr << "Run 'codeagent help' for usage instructions.\n";
+void displayUsageError(std::ostream& error, const std::string& message) {
+    error << "Error: " << message << "\n\n";
+    error << "Run 'codeagent help' for usage instructions.\n";
+}
+
+bool isApproval(const std::string& response) {
+    std::string normalized;
+    const auto first = response.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return false;
+    }
+    const auto last = response.find_last_not_of(" \t\r\n");
+    normalized = response.substr(first, last - first + 1);
+    std::transform(
+        normalized.begin(), normalized.end(), normalized.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); }
+    );
+    return normalized == "y" || normalized == "yes";
+}
+
+bool isRejection(const std::string& response) {
+    std::string normalized;
+    const auto first = response.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return false;
+    }
+    const auto last = response.find_last_not_of(" \t\r\n");
+    normalized = response.substr(first, last - first + 1);
+    std::transform(
+        normalized.begin(), normalized.end(), normalized.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); }
+    );
+    return normalized == "n" || normalized == "no";
 }
 
 std::string joinArguments(
@@ -48,11 +333,136 @@ std::string joinArguments(
     return result;
 }
 
+// Removes surrounding whitespace (including a Windows \r) and one pair of
+// matching quotes, which terminals add when a path is dragged in.
+std::filesystem::path cleanPathInput(const std::string& input) {
+    const auto first = input.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return {};
+    }
+    const auto last = input.find_last_not_of(" \t\r\n");
+    std::string path = input.substr(first, last - first + 1);
+    if (path.size() >= 2 && (path.front() == '"' || path.front() == '\'') &&
+        path.back() == path.front()) {
+        path = path.substr(1, path.size() - 2);
+    }
+    return path;
+}
+
 } // namespace
 
+CLIController::CLIController()
+    : CLIController(
+          [](const std::string& prompt,
+             std::string& response,
+             bool requireExplicitCompletion) {
+              // Throws CodeAgentError on failure; run() reports it.
+              response = LLMClient().generate(
+                  prompt, {requireExplicitCompletion, false}).text;
+              return true;
+          },
+          std::cin,
+          std::cout,
+          std::cerr) {
+}
+
+CLIController::CLIController(
+    LLMCall llmCall,
+    std::istream& input,
+    std::ostream& output,
+    std::ostream& error,
+    GuiCommand guiCommand
+)
+    : llmCall_(std::move(llmCall)),
+      input_(input),
+      output_(output),
+      error_(error),
+      guiCommand_(std::move(guiCommand)) {
+    if (!guiCommand_) {
+        guiCommand_ = runGuiCommand;
+    }
+}
+
+// Asks whether to save generated code and where. Declining, or input ending
+// before the code is saved, leaves every file untouched and still succeeds;
+// only a failed write is an error.
+int CLIController::offerToSave(const std::string& generatedCode) {
+    for (;;) {
+        output_ << "\nDo you want to save the generated code to a file? (y/n): ";
+        std::string answer;
+        if (!std::getline(input_, answer)) {
+            output_ << "\nNo answer received; the generated code was not saved.\n";
+            return 0;
+        }
+        if (isRejection(answer)) {
+            output_ << "The generated code was not saved.\n";
+            return 0;
+        }
+        if (isApproval(answer)) {
+            break;
+        }
+        output_ << "Please answer y or n.";
+    }
+
+    FileManager fileManager(input_, output_, error_);
+    for (;;) {
+        output_ << "Enter the output file path: ";
+        std::string answer;
+        if (!std::getline(input_, answer)) {
+            output_ << "\nNo path received; the generated code was not saved.\n";
+            return 0;
+        }
+
+        const std::filesystem::path path = cleanPathInput(answer);
+        // The user typed this path, which is their permission to write it;
+        // an existing file still needs confirmation before it is replaced.
+        switch (fileManager.saveFile(
+                    path, generatedCode,
+                    FileManager::PermissionPrompt::AlreadyGranted)) {
+        case FileManager::WriteResult::Written: {
+            std::error_code ignored;
+            const auto shown = path.empty()
+                ? path : std::filesystem::absolute(path, ignored).lexically_normal();
+            output_ << "Generated code saved successfully to: "
+                    << shown.string() << '\n';
+            return 0;
+        }
+        case FileManager::WriteResult::InvalidPath:
+            break;
+        case FileManager::WriteResult::Declined:
+            output_ << "Enter a different path to save the code elsewhere, "
+                    << "or end input (Ctrl+D) to skip saving.\n";
+            break;
+        case FileManager::WriteResult::Failed:
+            error_ << "Error: The generated code was not saved.\n";
+            return 1;
+        }
+    }
+}
+
+// The application-level error boundary: a failure anywhere below is reported
+// as a message and exit code 1 instead of terminating the program.
 int CLIController::run(int argc, char* argv[]) {
+    try {
+        return dispatch(argc, argv);
+    } catch (const CodeAgentError& failure) {
+        error_ << failure.what() << '\n';
+        if (!failure.diagnostic().empty()) {
+            error_ << "Details: " << failure.diagnostic() << '\n';
+        }
+    } catch (const std::bad_alloc&) {
+        error_ << "Error: CodeAgent ran out of memory. Close other programs "
+               << "or use a smaller file, then retry.\n";
+    } catch (const std::exception& failure) {
+        error_ << "Error: An unexpected internal error occurred ("
+               << redactSecrets(failure.what()) << "). Please retry.\n";
+    }
+    return 1;
+}
+
+int CLIController::dispatch(int argc, char* argv[]) {
     if (argc < 2) {
-        displayUsageError("No command provided.");
+        displayUsageError(error_, "No command provided.");
         return 1;
     }
 
@@ -65,8 +475,20 @@ int CLIController::run(int argc, char* argv[]) {
     if (command == "help" ||
         command == "--help" ||
         command == "-h") {
-        displayHelp();
+        displayHelp(output_);
         return 0;
+    }
+
+    // ------------------------------------------------------------
+    // GUI
+    // ------------------------------------------------------------
+
+    if (command == "gui") {
+        if (argc != 2) {
+            displayUsageError(error_, "The gui command does not accept arguments.");
+            return 1;
+        }
+        return guiCommand_(output_, error_);
     }
 
     // ------------------------------------------------------------
@@ -75,7 +497,7 @@ int CLIController::run(int argc, char* argv[]) {
 
     if (command == "generate") {
         if (argc < 3) {
-            displayUsageError(
+            displayUsageError(error_,
                 "The generate command requires an instruction."
             );
             return 1;
@@ -93,31 +515,30 @@ int CLIController::run(int argc, char* argv[]) {
                 instruction,
                 language,
                 prompt)) {
-            std::cerr
+            error_
                 << "Error: Could not build generation prompt.\n";
             return 1;
         }
 
-        LLMClient llmClient;
         std::string generatedCode;
 
-        std::cout
+        output_
             << "Sending generation request to Gemini...\n";
 
-        if (!llmClient.generateContent(prompt, generatedCode)) {
-            std::cerr
+        if (!llmCall_(prompt, generatedCode, false)) {
+            error_
                 << "Error: Code generation failed. Check your "
                 << ".env API key, internet connection, and Gemini "
                 << "API configuration.\n";
             return 1;
         }
 
-        std::cout
+        output_
             << "\nGenerated code:\n\n"
             << generatedCode
             << '\n';
 
-        return 0;
+        return offerToSave(generatedCode);
     }
 
     // ------------------------------------------------------------
@@ -126,7 +547,7 @@ int CLIController::run(int argc, char* argv[]) {
 
     if (command == "refactor") {
         if (argc < 4) {
-            displayUsageError(
+            displayUsageError(error_,
                 "The refactor command requires a file path "
                 "and an instruction."
             );
@@ -137,11 +558,11 @@ int CLIController::run(int argc, char* argv[]) {
         const std::string instruction =
             joinArguments(argc, argv, 3);
 
-        FileManager fileManager;
+        FileManager fileManager(input_, output_, error_);
         std::string sourceCode;
 
         if (!fileManager.readFile(filePath, sourceCode)) {
-            std::cerr
+            error_
                 << "Refactoring cancelled because the source file "
                 << "could not be read.\n";
             return 1;
@@ -156,29 +577,58 @@ int CLIController::run(int argc, char* argv[]) {
                 language,
                 sourceCode,
                 prompt)) {
-            std::cerr
+            error_
                 << "Error: Could not build refactoring prompt.\n";
             return 1;
         }
 
-        LLMClient llmClient;
         std::string refactoredCode;
 
-        std::cout
+        output_
             << "Sending refactoring request to Gemini...\n";
 
-        if (!llmClient.generateContent(prompt, refactoredCode)) {
-            std::cerr
+        if (!llmCall_(prompt, refactoredCode, true)) {
+            error_
                 << "Error: Refactoring failed. Check your "
                 << ".env API key, internet connection, and Gemini "
                 << "API configuration.\n";
             return 1;
         }
 
-        std::cout
-            << "\nRefactored code:\n\n"
-            << refactoredCode
-            << '\n';
+        output_ << "\nRefactoring diff:\n"
+                << makeUnifiedDiff(sourceCode, refactoredCode);
+
+        if (sourceCode == refactoredCode) {
+            output_ << "No changes to apply.\n";
+            return 0;
+        }
+
+        output_ << "\nApply these changes? [y/N]: ";
+        std::string approval;
+        if (!std::getline(input_, approval)) {
+            error_
+                << "Refactoring was not approved; source file was not modified.\n";
+            return 1;
+        }
+
+        if (!isApproval(approval)) {
+            if (isRejection(approval)) {
+                output_
+                    << "Refactoring rejected; source file was not modified.\n";
+                return 0;
+            }
+            error_
+                << "Invalid approval input; source file was not modified.\n";
+            return 1;
+        }
+
+        if (!fileManager.writeFile(filePath, refactoredCode)) {
+            error_
+                << "Refactoring was approved but could not be saved.\n";
+            return 1;
+        }
+
+        output_ << "Refactoring applied successfully.\n";
 
         return 0;
     }
@@ -187,6 +637,6 @@ int CLIController::run(int argc, char* argv[]) {
     // UNKNOWN COMMAND
     // ------------------------------------------------------------
 
-    displayUsageError("Unknown command: " + command);
+    displayUsageError(error_, "Unknown command: " + command);
     return 1;
 }
