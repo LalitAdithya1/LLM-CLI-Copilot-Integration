@@ -254,24 +254,9 @@ LLMClient::LLMClient()
           performHttpRequest,
           "gemini-3.5-flash"
       ) {
-    loadDotEnvOnce();
-}
-
-void LLMClient::loadDotEnvOnce() {
-    // A function-local static is initialized exactly once, even when several
-    // request threads construct clients at the same time. Existing
-    // environment variables are preserved.
-    static const bool loaded = [] {
-        if (!loadEnvFile(".env")) {
-            std::cerr
-                << "Warning: Could not load .env from the current "
-                << "working directory. Checking the process environment "
-                << "for GEMINI_API_KEY instead.\n";
-            return false;
-        }
-        return true;
-    }();
-    (void)loaded;
+    // Reads the .env files once per process; see EnvLoader.hpp for the
+    // lookup order. Existing environment variables are preserved.
+    loadConfigurationFilesOnce();
 }
 
 LLMClient::LLMClient(

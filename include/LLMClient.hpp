@@ -32,13 +32,9 @@ public:
         std::string thoughts;
     };
 
-    // Uses the default libcurl-based HTTP transport. Loads .env on first use.
+    // Uses the default libcurl-based HTTP transport. Loads the .env files
+    // (see loadConfigurationFilesOnce in EnvLoader.hpp) on first use.
     LLMClient();
-
-    // Loads .env from the working directory into the environment once per
-    // process; later calls do nothing. Call before starting threads that read
-    // the environment, because setting variables is not thread-safe.
-    static void loadDotEnvOnce();
 
     // Allows unit tests to inject a simulated HTTP transport.
     explicit LLMClient(

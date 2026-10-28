@@ -4,6 +4,7 @@ build
 # CMake build directories
 /build/
 /build-cli/
+/build-release/
 
 # Project/runtime files
 .codeagent

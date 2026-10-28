@@ -1,20 +1,17 @@
-# AI Code Generation and Refactoring Assistant
+# CodeAgent: AI Code Generation and Refactoring Assistant
 
-A cross-platform, terminal-based C++ application that uses a Large Language Model (LLM) API to generate code, analyze existing source files, and suggest refactoring improvements.
+CodeAgent is a C++17 application that uses Google's Gemini API to generate C++ code and to propose refactorings of existing source files. It has two front ends over one C++ core:
 
-The application provides a command-line interface (CLI) for interacting with an LLM, managing source files, and reviewing AI-generated code changes. It is designed to work across Windows, Linux, and macOS with a shared C++ codebase.
+* a **terminal command**, `codeagent`, for generating code (and saving it) and for refactoring a file after reviewing a diff;
+* a **browser GUI**, started with `codeagent gui`, with a chat, an editor, diff review, and Save/Save As. The GUI is served by a local C++ HTTP server.
 
-## 1. Project Overview
+Nothing is written to disk without the user's explicit approval, and AI-generated code is never executed. CodeAgent calls an external model; it does not train or host one.
 
-The AI Code Generation and Refactoring Assistant helps developers improve their productivity by integrating AI-powered code generation and refactoring into a terminal workflow.
+Detailed design documentation: [docs/project-report.md](docs/project-report.md) (architecture, UML, OOP and C++ design, testing). Demonstration plan and viva preparation: [docs/demo-and-viva.md](docs/demo-and-viva.md). HTTP API: [docs/gui-api-contract.md](docs/gui-api-contract.md).
 
-Users can provide instructions to generate new code, analyze existing code for potential improvements, and review suggested changes before applying them to their projects.
+## 1. Quick Start
 
-The application communicates with an external LLM API. It does not train or host its own language model.
-
-## Quick Start
-
-Supported and tested platform: **Linux, including WSL2 on Windows (Ubuntu 24.04)**. A native Windows (MSVC/MinGW) build is not supported: `EnvLoader` uses POSIX `setenv`. macOS is untested.
+Supported and tested platform: **Linux, including WSL2 on Windows (Ubuntu 24.04)**. A native Windows (MSVC/MinGW) build is not supported: `EnvLoader` uses POSIX `setenv`, and the Windows-specific code paths in the GUI server have never been built. macOS is untested.
 
 ### Dependencies
 
@@ -24,17 +21,49 @@ sudo apt install build-essential cmake libcurl4-openssl-dev nlohmann-json3-dev n
 
 CMake downloads GoogleTest and cpp-httplib automatically the first time you configure. Node.js is only needed to run the frontend tests.
 
-### Configure the Gemini API key
+### Install the `codeagent` command
 
-Create a `.env` file in the directory you launch `codeagent` from. The file is git-ignored.
-
-```text
-GEMINI_API_KEY=your-key-here
+```bash
+scripts/install.sh            # or: bash scripts/install.sh
 ```
 
-You can also `export GEMINI_API_KEY=...`. Existing environment variables take precedence over `.env`. A value may be wrapped in one pair of matching quotes (`GEMINI_API_KEY="..."`); the quotes are not part of the key. `.env` is read once per process, before the GUI server starts handling requests. The key is sent only to Gemini in the `x-goog-api-key` header. It is never printed, logged, or returned to the browser. The model is `gemini-3.5-flash`.
+The script configures a Release build in `build-release/`, builds it, runs the test suite, and installs into `~/.local` (no `sudo`):
 
-### Build and test
+```text
+~/.local/bin/codeagent                 the command
+~/.local/share/codeagent/frontend/     the GUI, found relative to the binary
+```
+
+On Ubuntu, `~/.profile` puts `~/.local/bin` on `PATH` for new terminals once the folder exists; the script tells you if it is not on your `PATH` yet. Then, from **any** directory:
+
+```bash
+codeagent help
+```
+
+Options: `--prefix DIR` installs elsewhere (for example `--prefix /usr/local` with `sudo`), `--skip-tests` skips the tests, and `--uninstall` removes exactly the files the last install created (your configuration is kept). Re-run the script after pulling changes.
+
+To check an installation end to end, run `scripts/smoke-test.sh`. It runs `codeagent` in a clean environment from a temporary folder outside the repository, checks configuration handling, sends Gemini a deliberately invalid key, and starts the GUI to check that it serves its installed frontend and API. It never uses your real key.
+
+### Configure the Gemini API key
+
+Store the key once per user so that `codeagent` finds it from any directory:
+
+```bash
+mkdir -p ~/.config/codeagent
+printf 'GEMINI_API_KEY=%s\n' 'your-key-here' > ~/.config/codeagent/.env
+chmod 600 ~/.config/codeagent/.env
+```
+
+`codeagent` looks for configuration in this order; the first value found for a variable wins:
+
+1. variables already set in the environment (`export GEMINI_API_KEY=...`);
+2. the file named by `CODEAGENT_ENV_FILE`, if set (a missing file is reported);
+3. `.env` in the current directory, for per-project settings (git-ignored in this repository);
+4. `$XDG_CONFIG_HOME/codeagent/.env`, or `~/.config/codeagent/.env` when `XDG_CONFIG_HOME` is unset.
+
+A value may be wrapped in one pair of matching quotes (`GEMINI_API_KEY="..."`); the quotes are not part of the key. The files are read once per process, before the GUI server starts handling requests. If the key is missing, the error says so and lists the files that were checked. The key is sent only to Gemini, in the `x-goog-api-key` header. It is never printed, logged, or returned to the browser, and error diagnostics are redacted. The model is `gemini-3.5-flash`.
+
+### Build and test (development)
 
 ```bash
 cmake -S . -B build
@@ -43,16 +72,18 @@ ctest --test-dir build --output-on-failure
 node --test frontend/tests/*.test.mjs
 ```
 
+During development you can also run the binary from the build tree, for example `./build/codeagent gui`.
+
 ### Run
 
 ```bash
-./build/codeagent help
-./build/codeagent generate "Implement binary search in C++"
-./build/codeagent refactor src/example.cpp "Improve readability"
-./build/codeagent gui
+codeagent help
+codeagent generate "Implement binary search in C++"
+codeagent refactor src/example.cpp "Improve readability"
+codeagent gui
 ```
 
-After `generate` prints the code, it asks `Do you want to save the generated code to a file? (y/n):`. Answer `y` and enter a path ending in a C/C++ source extension (`.cpp`, `.hpp`, …) inside an existing folder. An empty or invalid path is explained and asked again; an existing file is only replaced after you confirm. Answering `n`, or ending input, saves nothing.
+After `generate` prints the code, it asks `Do you want to save the generated code to a file? (y/n):`. Answer `y` and enter a path ending in a C/C++ source extension (`.cpp`, `.hpp`, …) inside an existing folder. An empty or invalid path is explained and asked again; an existing file is only replaced after you confirm. Answering `n`, or ending input, saves nothing. `refactor` prints a unified diff and writes the file only after you answer `y`.
 
 `codeagent gui` is the only process you need to start. It:
 
@@ -61,17 +92,20 @@ After `generate` prints the code, it asks `Do you want to save the generated cod
 3. Opens your default browser: `wslview` or `rundll32.exe url.dll,FileProtocolHandler` under WSL, `xdg-open` on Linux. The address carries a one-time startup code (`#bootstrap=…`), which the page exchanges for the API session token (see [GUI server security](#gui-server-security)). If no browser can be opened, or `CODEAGENT_NO_BROWSER` is set, it prints a one-time link instead. Open it within 5 minutes.
 4. Runs until you press **Ctrl+C**.
 
+The folder you start it from becomes the default output directory for Save As.
+
 Reloading the page or opening the address again in a new tab of the same browser reconnects on its own. Another browser needs a new link: restart `codeagent gui`.
 
 | Environment variable | Purpose |
 | --- | --- |
-| `GEMINI_API_KEY` | Gemini API key (or set it in `./.env`). |
-| `CODEAGENT_GUI_PORT` | Use another port, e.g. `CODEAGENT_GUI_PORT=8081 ./build/codeagent gui`. |
+| `GEMINI_API_KEY` | Gemini API key (see the lookup order above). |
+| `CODEAGENT_ENV_FILE` | A specific `.env` file to read before the others. |
+| `CODEAGENT_GUI_PORT` | Use another port, e.g. `CODEAGENT_GUI_PORT=8081 codeagent gui`. |
 | `CODEAGENT_NO_BROWSER` | Set to `1` to skip opening a browser (headless/SSH use). |
 | `CODEAGENT_FRONTEND_DIR` | Directory containing `index.html`, if the frontend is not found automatically. |
 | `CODEAGENT_DEV_ORIGIN` | Development only: also accept a frontend served from another loopback origin, exactly `http://127.0.0.1:<port>` or `http://localhost:<port>` (e.g. `http://127.0.0.1:5500`). A one-time link for it is printed at startup. Unset by default. |
 
-`codeagent` finds the frontend without depending on your working directory. It checks, in order: `CODEAGENT_FRONTEND_DIR`; `frontend/` next to the executable or one level above it (the build tree); `../share/codeagent/frontend` (after `cmake --install build`); and finally the source tree it was built from.
+`codeagent` finds the frontend without depending on your working directory. It checks, in order: `CODEAGENT_FRONTEND_DIR`; `frontend/` next to the executable or one level above it (the build tree); `../share/codeagent/frontend` relative to the executable (the installed layout); and finally the source tree it was built from. At startup it prints `Serving frontend from <folder>`.
 
 ### Using the browser editor
 
@@ -116,7 +150,9 @@ Save writes the file on disk. It does not talk to VS Code. VS Code watches files
 
 | Symptom | Fix |
 | --- | --- |
-| Terminal: `Warning: GEMINI_API_KEY is not set`; browser: `Configuration error: GEMINI_API_KEY is not configured` | Add the key to `.env` in the launch directory or export it, then restart. |
+| `codeagent: command not found` | Run `scripts/install.sh`. If it reports that `~/.local/bin` is not on your `PATH`, add it as shown, then open a new terminal. `command -v codeagent` shows which binary runs. |
+| Terminal: `Warning: GEMINI_API_KEY is not set`; browser or CLI: `Configuration error: GEMINI_API_KEY is not configured` | Put the key in `~/.config/codeagent/.env` (works from every folder) or export it, then restart. The CLI's `Details:` line lists the `.env` files that were checked. A `.env` in the repository is only read when you run `codeagent` from that folder. |
+| `Warning: CODEAGENT_ENV_FILE is set to …, but that file could not be read` | Fix the path in `CODEAGENT_ENV_FILE`, or unset it. |
 | Browser or CLI: `Authentication failed`, `Request rate limited`, `Network error`, `Request timed out` | The message names the cause and the next step. The terminal running `codeagent` also logs a redacted diagnostic, such as the HTTP status and Gemini's error reason; API keys are never printed. |
 | `Could not start the GUI server on 127.0.0.1:8080` | Another program (often another `codeagent gui`) is using the port. Stop it, or run with `CODEAGENT_GUI_PORT=8081`. |
 | `Could not open a browser automatically` | Open the printed one-time link (`http://127.0.0.1:<port>/#bootstrap=…`) within 5 minutes. The server keeps running. |
@@ -128,145 +164,82 @@ Save writes the file on disk. It does not talk to VS Code. VS Code watches files
 
 ## 2. Objectives
 
-* Develop a cross-platform terminal application using C++.
-* Integrate an external LLM API for code generation and refactoring.
-* Read and process local source-code files.
-* Construct prompts using user instructions and source-code context.
-* Parse API responses and present results clearly in the terminal.
-* Support multiple programming languages as input.
-* Protect original source files by requiring user approval before applying modifications.
-* Maintain a portable codebase that can be compiled on Windows, Linux, and macOS.
+* Build a C++17 application that integrates an external LLM API (Gemini) for code generation and refactoring.
+* Read local source files, combine them with user instructions into prompts, and parse the JSON responses.
+* Protect the user's files: show generated code or a diff first, and write only after explicit approval.
+* Report every failure (configuration, network, provider, parsing, file system) with a message that explains the cause and the next step, without exposing secrets.
+* Offer both a terminal workflow and a local browser GUI over the same C++ core.
+* Keep the core testable without network access, through injected transports and handlers.
 
-## 3. Core Features
+## 3. Implemented Features
 
-### Code Generation
-
-* Accept natural-language instructions from the user.
-* Generate code based on the provided requirements.
-* Display generated code in the terminal.
-* Optionally save generated code to a user-specified file.
-* Support specifying the desired programming language.
-
-### Code Refactoring
-
-* Read source-code files from a specified project directory.
-* Submit relevant code and refactoring instructions to the LLM.
-* Suggest improvements in readability, maintainability, and structure.
-* Display suggested changes and explanations.
-* Present a diff between the original and proposed code where practical.
-* Apply changes only after explicit user approval.
-
-### File Management
-
-* Read individual source files.
-* Support processing selected files within a project directory.
-* Save generated code and approved refactoring results.
-* Preserve original files unless the user explicitly approves changes.
-* Handle missing files, unsupported file types, and file-access errors.
-
-### LLM Integration
-
-* Send HTTP requests to an external LLM API.
-* Construct prompts using source code and user instructions.
-* Parse JSON responses.
-* Handle network errors, API failures, rate limits, and malformed responses.
-* Load API credentials from environment variables or local configuration that is excluded from version control.
-
-### Terminal Interface
-
-* Provide a command-based interface.
-* Display generated code, refactoring suggestions, and error messages.
-* Support commands such as `gui`, `generate`, `refactor`, `help`, and `exit`.
-* Validate user input and provide clear usage instructions.
+| Area | What is implemented |
+| --- | --- |
+| Code generation | `codeagent generate "<instruction>"` and the GUI *Generate* mode. The terminal command offers to save the code to a path you choose, with overwrite confirmation. |
+| Refactoring | `codeagent refactor <file> "<instruction>"` shows a unified diff and writes the file only after `y`. The GUI creates a proposal; *Review changes* shows a colored diff; *Accept* puts it into the editor, *Reject* discards it. |
+| GUI editor | Line-numbered editor that scrolls up to 45 visible lines and keeps the complete document; open by path or dialog, Save (with external-change detection), Save As, Reload, Copy. |
+| Chat | Prompts, Gemini replies with their thought summaries, decisions, and errors stay in the conversation; *Resend prompt* sends the last prompt again unchanged. |
+| Files | Atomic writes through a temporary file and rename, supported C/C++ extensions only, 512 KiB editor limit, explicit overwrite confirmation everywhere. |
+| Errors | A typed C++ exception hierarchy turns failures into specific, actionable messages in the terminal and the browser. |
+| Security | Loopback-only server, per-session token, origin and host checks, request size limits, redacted diagnostics; the API key never leaves the backend except to Gemini. |
+| Installation | `scripts/install.sh` installs a `codeagent` command that works from any directory, with a documented configuration lookup. |
 
 ## 4. Technology Stack
 
-| Component              | Technology                               |
-| ---------------------- | ---------------------------------------- |
-| Programming language   | C++17 or later                           |
-| Build system           | CMake                                    |
-| HTTP client            | libcurl                                  |
-| JSON parsing           | nlohmann/json                            |
-| Filesystem operations  | C++ Standard Library (`std::filesystem`) |
-| File input/output      | C++ Standard Library                     |
-| AI integration         | External LLM API                         |
-| Version control        | Git                                      |
-| Cross-platform testing | GitHub Actions (optional)                |
-
-Dependencies should be selected and configured to support the operating systems targeted by the project.
+| Component | Technology |
+| --- | --- |
+| Language | C++17 (backend, CLI); JavaScript ES modules, HTML, CSS (frontend, no framework) |
+| Build | CMake ≥ 3.15 |
+| HTTP client | libcurl |
+| HTTP server | cpp-httplib v0.58.0 (fetched by CMake) |
+| JSON | nlohmann/json |
+| Files | `std::filesystem` and POSIX file APIs |
+| Tests | GoogleTest v1.14.0 (fetched by CMake), Node.js built-in test runner |
+| LLM | Google Gemini API, model `gemini-3.5-flash` |
 
 ## 5. System Architecture
 
-The application is organized into modular components.
-
-1. **CLI Controller:** Parses commands and coordinates the workflow.
-2. **File Manager:** Reads source files and saves generated or approved code.
-3. **Prompt Builder:** Combines user instructions with source-code context.
-4. **LLM Client:** Sends HTTP requests and receives responses from the LLM API.
-5. **Response Parser:** Extracts generated code, explanations, and proposed changes.
-6. **Code Generator:** Handles code-generation requests.
-7. **Code Refactorer:** Handles source-code analysis and refactoring requests.
-8. **Diff and Approval Manager:** Displays changes and obtains user approval before modifying files.
-
-### Workflow
-
-For code generation:
-
-1. The user enters a generation command.
-2. The application collects the user's requirements.
-3. The prompt builder constructs the request.
-4. The LLM client sends the request to the configured API.
-5. The response parser extracts the result.
-6. The application displays the generated code and optionally saves it.
-
-For refactoring:
-
-1. The user specifies a source file or project directory.
-2. The file manager reads the selected source code.
-3. The prompt builder creates the refactoring request.
-4. The LLM client submits the request to the API.
-5. The response parser extracts the proposed changes.
-6. The application displays the suggestions and, where supported, a diff.
-7. The user reviews and approves the changes before they are saved.
-
-## 6. Proposed Project Structure
-
 ```text
-AI-Code-Assistant/
-├── include/
-│   ├── CLIController.hpp
-│   ├── FileManager.hpp
-│   ├── PromptBuilder.hpp
-│   ├── LLMClient.hpp
-│   ├── ResponseParser.hpp
-│   ├── CodeGenerator.hpp
-│   ├── CodeRefactorer.hpp
-│   └── DiffManager.hpp
-├── src/
-│   ├── main.cpp
-│   ├── CLIController.cpp
-│   ├── FileManager.cpp
-│   ├── PromptBuilder.cpp
-│   ├── LLMClient.cpp
-│   ├── ResponseParser.cpp
-│   ├── CodeGenerator.cpp
-│   ├── CodeRefactorer.cpp
-│   └── DiffManager.cpp
-├── tests/
-│   ├── test_file_manager.cpp
-│   ├── test_prompt_builder.cpp
-│   └── test_response_parser.cpp
-├── .gitignore
-├── CMakeLists.txt
-├── README.md
-└── LICENSE
+ Terminal ──► main ──► CLIController ──► PromptBuilder ──► LLMClient ──► Gemini API
+                         │    │                              │
+                         │    └─► FileManager (CLI files)    ├─► ResponseParser
+                         │                                   └─► EnvLoader (configuration)
+                         └─► codeagent gui ─► GuiHttpServer ◄──── browser frontend (JS)
+                                               │  handlers supplied by CLIController
+                                               ├─► UnifiedDiff, file I/O, proposals
+                                               └─► NativeDialogProvider (zenity / PowerShell)
+ All layers report failures as CodeAgentError subclasses (include/CodeAgentError.hpp).
 ```
 
-This is a proposed structure; the final organization can be adjusted during implementation.
+The GUI server does not depend on `LLMClient`: `CLIController` gives it generation and refactoring handlers (`std::function`), which tests replace with fakes. The class responsibilities, UML class and sequence diagrams, and the design reasoning are in [docs/project-report.md](docs/project-report.md).
+
+## 6. Project Structure
+
+```text
+LLM-CLI-Copilot-Integration/
+├── include/            public headers (one class or module per file)
+│   ├── CLIController.hpp      command dispatch, terminal workflows
+│   ├── CodeAgentError.hpp     exception hierarchy and reporting helpers
+│   ├── EnvLoader.hpp          .env loading and configuration lookup
+│   ├── FileManager.hpp        CLI file reading and safe writing
+│   ├── GuiHttpServer.hpp      local HTTP server for the GUI (pimpl)
+│   ├── LLMClient.hpp          Gemini requests and failure classification
+│   ├── NativeDialog.hpp       file/folder dialog interface, WSL path helpers
+│   ├── PromptBuilder.hpp      generation and refactoring prompts
+│   ├── ResponseParser.hpp     Gemini response and error parsing
+│   └── UnifiedDiff.hpp        unified diff generation
+├── src/                implementations, main.cpp, detail/FileReplacement.hpp
+├── tests/              GoogleTest suites (one per component)
+├── frontend/           index.html, css/, js/, tests/ (Node test runner)
+├── scripts/            install.sh, smoke-test.sh
+├── docs/               project report, demo and viva guide, API contract
+├── CMakeLists.txt
+└── README.md
+```
 
 ## 7. Usage Details
 
-The CLI commands are `help`, `gui`, `generate "<instruction>"`, and `refactor <file> "<instruction>"`. The CLI `generate` prints the code without saving it. The CLI `refactor` prints a unified diff and writes the file only after you answer `y`. See the Quick Start for the GUI workflow.
+The CLI commands are `help` (also `-h`, `--help`), `gui`, `generate "<instruction>"`, and `refactor <file> "<instruction>"`. Unknown commands and missing arguments print a usage error and exit with status 1. `generate` prints the code and then offers to save it (see the Quick Start). `refactor` prints a unified diff and writes the file only after you answer `y`. See the Quick Start for the GUI workflow.
 
 ### GUI server security
 
@@ -293,130 +266,88 @@ On POSIX systems, native dialogs use `zenity` when it is installed and a graphic
 
 There is no route to stop the server. Stop the backend with Ctrl+C in its terminal.
 
-Run the frontend checks with:
-
-```bash
-node --test frontend/tests/*.test.mjs
-```
-
-The app DOM integration test runs the real frontend module against a small, dependency-free test DOM. It verifies the HTML selectors and the event handlers for file loading, generation, review, approve, reject, and save. It does not replace a browser smoke test.
-
 ## 8. Requirements
 
-* A C++17-compatible compiler.
-* CMake.
-* Git.
-* libcurl.
-* nlohmann/json.
-* An API key for a compatible LLM provider.
-* An internet connection for API requests.
+* Linux or WSL2 (Ubuntu 24.04 tested), a C++17 compiler (GCC tested), CMake ≥ 3.15.
+* libcurl and nlohmann/json development packages; internet access the first time CMake configures (to fetch GoogleTest and cpp-httplib).
+* Node.js 18 or later for the frontend tests.
+* A Gemini API key and an internet connection for generation and refactoring.
 
 ## 9. Build and Installation
 
-The project aims to support Windows, Linux, and macOS. The same C++ source code can be used across these systems, but the application must be compiled separately for the target operating system and architecture.
-
-### Clone the repository
+See [Install the `codeagent` command](#install-the-codeagent-command) for the recommended installation and [Build and test (development)](#build-and-test-development) for a development build. A manual installation is equivalent to what the script does:
 
 ```bash
-git clone <repository-url>
-cd AI-Code-Assistant
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release -j2
+cmake --install build-release --prefix ~/.local
 ```
 
-### Configure and build
-
-```bash
-cmake -S . -B build
-cmake --build build --config Release
-```
-
-The exact dependency installation and executable location will depend on the operating system, compiler, and CMake configuration.
-
-Before distributing the application, provide tested build instructions for each supported platform.
+The install contains only `bin/codeagent` and `share/codeagent/frontend/`; GoogleTest's own install rules are switched off.
 
 ## 10. Configuration
 
-The application requires an API endpoint, an API key, and any provider-specific model configuration.
+The key lookup is described in [Configure the Gemini API key](#configure-the-gemini-api-key). The endpoint and model (`gemini-3.5-flash`) are set in `src/LLMClient.cpp`; the request timeout is 60 seconds with a 10-second connection timeout.
 
-The application reads the Gemini key from `GEMINI_API_KEY`, either from the environment or from a `.env` file in the launch directory. The endpoint and model (`gemini-3.5-flash`) are set in `src/LLMClient.cpp`.
+Security rules the implementation follows:
 
-**Security requirements:**
+* API keys are never committed (`.env` and `.codeagent/` are git-ignored), printed, logged, or sent to the browser.
+* Diagnostics are passed through `redactSecrets`, which removes the configured key, Google-style keys, and key-carrying URL parameters and headers.
+* Gemini's free-text error messages are never shown or logged; only validated, structured fields (status, reason, quota identifiers, retry delay) are.
+* Source files and LLM responses are treated as untrusted input; generated code is never executed and is rendered in the browser as text, never as HTML.
 
-* Never commit API keys or other credentials to Git.
-* Add local secret and configuration files to `.gitignore`.
-* Do not print API keys in terminal output or logs.
-* Avoid embedding credentials directly in the executable.
-* Treat source files and LLM responses as untrusted input.
+## 11. Platform Support
 
-## 11. Cross-Platform Compatibility
-
-To improve portability:
-
-* Use standard C++ filesystem and input/output APIs.
-* Avoid depending on shell-specific commands such as `cls` or `clear`.
-* Use portable path handling instead of hardcoded operating-system-specific paths.
-* Use CMake to configure builds across supported platforms.
-* Handle operating-system-specific behavior in isolated modules when unavoidable.
-* Test builds and functionality on Windows, Linux, and macOS.
-
-Cross-platform source code does not guarantee that one compiled executable will run on every operating system. Separate builds and platform-specific testing are required.
+| Platform | Status |
+| --- | --- |
+| Ubuntu 24.04 under WSL2 | Built, unit-tested, installed, and smoke-tested |
+| Other Linux distributions | Expected to work; not tested |
+| Native Windows | Not supported (`setenv`; the Windows code paths have never been built) |
+| macOS | Not tested; no native dialog integration |
 
 ## 12. Error Handling and Reliability
 
-The application should handle:
+Every failure that the user can act on is thrown as a subclass of `CodeAgentError` (`include/CodeAgentError.hpp`) and caught at a boundary that reports it: `CLIController::run` for the terminal (exit status 1), the GUI route handlers (JSON error with a specific status and code), and `main` as a last resort. Examples of messages:
 
-* Missing or unreadable source files.
-* Invalid commands and command-line arguments.
-* API authentication failures.
-* Network timeouts and connection failures.
-* API rate limits and unsuccessful HTTP responses.
-* Invalid JSON or unexpected response formats.
-* Large source files and context limits.
-* Write failures and permission errors.
-* Refactoring results that cannot be safely applied.
+| Situation | Message |
+| --- | --- |
+| No API key | `Configuration error: GEMINI_API_KEY is not configured. Set it in your environment or .env file.` |
+| Rejected key (HTTP 401/403, or 400 `API_KEY_INVALID`) | `Authentication failed: Gemini rejected the configured credentials. Verify the API key.` |
+| HTTP 429 without a daily-quota violation | `Request rate limited. Wait briefly before retrying.` (plus Gemini's suggested delay when given) |
+| Connection failure / timeout | `Network error: Unable to connect to Gemini. Check your connection.` / `Request timed out. Retry when the service is reachable.` |
+| Gemini 5xx | `Gemini is temporarily unavailable. Retry in a moment.` |
+| No write permission | `Permission denied: CodeAgent cannot access this file. …` (GUI) / `Permission denied: CodeAgent cannot write to <path>. …` (CLI) |
+| File changed since it was opened | `The file changed externally. Reload it or save to another path.` |
 
-The application should report errors clearly and avoid modifying files when an operation fails.
+The design, the propagation paths, and the RAII resource handling are described in [docs/project-report.md](docs/project-report.md#7-exception-handling-design).
 
-## 13. Testing Strategy
+## 13. Testing
 
-Testing will cover:
+```bash
+ctest --test-dir build --output-on-failure   # 206 C++ tests in 20 suites
+node --test frontend/tests/*.test.mjs        # 78 frontend tests
+scripts/smoke-test.sh                         # installed command, end to end
+```
 
-* File reading and writing.
-* Command parsing and argument validation.
-* Prompt construction.
-* JSON response parsing.
-* API request and error handling.
-* Code-generation output.
-* Refactoring diff generation.
-* Approval and file-saving behavior.
-* Build and execution on supported operating systems.
-
-Where possible, core modules should be tested independently of the external LLM API using mocked responses.
+The C++ tests replace the Gemini transport, the GUI handlers, the clock, and the native dialogs with test doubles, so they need no network and no API key. The frontend DOM integration test runs the real frontend modules against a small, dependency-free test DOM; it does not replace a browser test. The smoke test exercises the installed binary from a folder outside the repository, including one real request to Gemini with an invalid key. Details per suite are in [docs/project-report.md](docs/project-report.md#10-testing).
 
 ## 14. Future Enhancements
 
-* Recursive project analysis with configurable file filters.
-* Context management for multi-file projects.
-* Git diff integration and optional Git-based rollback.
-* Automated code-quality checks.
-* Configurable LLM providers and models.
-* Streaming responses in the terminal.
-* Interactive review of individual changes.
-* Automated cross-platform builds and release packages.
-* Unit-test generation and documentation generation.
+* Multi-file and project-level refactoring with context management.
+* Configurable model and provider.
+* Streaming responses.
+* Syntax highlighting in the editor.
+* A packaged release and continuous integration builds.
 
 ## 15. Limitations
 
-* The application depends on the configured LLM provider and its availability.
-* API usage may incur costs and is subject to provider rate limits.
-* Generated code may contain errors or security vulnerabilities and must be reviewed.
-* Large projects may require file selection, context reduction, or multiple requests.
-* The tool suggests or applies textual changes; it does not guarantee that the resulting program compiles or behaves correctly.
-* Cross-platform compatibility must be verified on actual target environments.
+* Requires the Gemini API and network access; usage is subject to Gemini's quotas and rate limits.
+* Generated code may be wrong or insecure and must be reviewed; CodeAgent does not compile or run it.
+* One file at a time, up to 512 KiB, C and C++ source extensions only.
+* The editor is a plain text area without syntax highlighting.
+* Linux/WSL2 only (see [Platform Support](#11-platform-support)).
+* The WSL PowerShell file dialog has not been exercised with a real click in automated tests.
 
 ## 16. License
 
 The project license has not yet been selected. Choose and document a license before distributing the application.
-
----
-
-**Project summary:** A modular, cross-platform C++ terminal application that integrates an external LLM API to generate code, analyze source files, and propose reviewable refactoring changes while preserving user control over file modifications.

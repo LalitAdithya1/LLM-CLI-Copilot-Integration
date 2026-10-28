@@ -43,8 +43,10 @@ public:
     int httpStatus() const noexcept override;
 
     // "Configuration error: <name> is not configured. Set it in your
-    // environment or .env file."
-    static ConfigurationError missingSetting(const std::string& name);
+    // environment or .env file." searchedLocations, when given, lists the
+    // .env files that were checked; it only goes into the diagnostic.
+    static ConfigurationError missingSetting(const std::string& name,
+                                             const std::string& searchedLocations = {});
 };
 
 // ---------------------------------------------------------------------------

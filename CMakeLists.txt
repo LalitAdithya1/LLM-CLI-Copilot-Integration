@@ -36,6 +36,9 @@ FetchContent_Declare(
 )
 
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+# GoogleTest is only needed to build the tests; `cmake --install` must not
+# copy its headers and libraries into the user's prefix.
+set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 # This loopback server does not use TLS or compression.

@@ -5,6 +5,7 @@
 #include "FileManager.hpp"
 #include "GuiHttpServer.hpp"
 #include "PromptBuilder.hpp"
+#include "EnvLoader.hpp"
 #include "LLMClient.hpp"
 #include "UnifiedDiff.hpp"
 
@@ -109,13 +110,14 @@ int runGuiCommand(std::ostream& output, std::ostream& error) {
     const int port = resolveGuiPort();
 
     // Report a missing key at startup instead of only on the first request.
-    // The key itself is never printed or sent to the browser. .env is loaded
-    // here, once, before any request thread exists.
-    LLMClient::loadDotEnvOnce();
+    // The key itself is never printed or sent to the browser. The .env files
+    // are loaded here, once, before any request thread exists.
+    loadConfigurationFilesOnce();
     if (!isSetEnvironmentValue(std::getenv("GEMINI_API_KEY"))) {
-        error << "Warning: GEMINI_API_KEY is not set. Add it to a .env file in "
-              << "the launch directory or export it; generation and "
-              << "refactoring will fail until it is configured.\n";
+        error << "Warning: GEMINI_API_KEY is not set. Export it, or add it to "
+              << ".env in the launch directory or to "
+              << "~/.config/codeagent/.env; generation and refactoring will "
+              << "fail until it is configured.\n";
     }
 
     GuiHttpServer::GenerationHandler generationHandler =
@@ -252,7 +254,7 @@ int runGuiCommand(std::ostream& output, std::ostream& error) {
 
 void displayHelp(std::ostream& output) {
     output
-        << "CodingCLI - AI Coding Assistant\n\n"
+        << "CodeAgent - AI Coding Assistant\n\n"
         << "Usage:\n"
         << "  codeagent help\n"
         << "  codeagent gui\n"
@@ -266,10 +268,16 @@ void displayHelp(std::ostream& output) {
         << "Options:\n"
         << "  -h, --help Display this help message\n\n"
         << "Environment:\n"
-        << "  GEMINI_API_KEY          Gemini API key (or set it in ./.env)\n"
+        << "  GEMINI_API_KEY          Gemini API key\n"
+        << "  CODEAGENT_ENV_FILE      A specific .env file to read first\n"
         << "  CODEAGENT_GUI_PORT      GUI port (default 8080)\n"
         << "  CODEAGENT_NO_BROWSER    Set to 1 to skip opening a browser\n"
-        << "  CODEAGENT_FRONTEND_DIR  Directory containing the frontend index.html\n";
+        << "  CODEAGENT_FRONTEND_DIR  Directory containing the frontend index.html\n\n"
+        << "Configuration lookup (the first value found wins):\n"
+        << "  1. variables already set in the environment\n"
+        << "  2. the file named by CODEAGENT_ENV_FILE\n"
+        << "  3. .env in the current directory\n"
+        << "  4. ~/.config/codeagent/.env (or $XDG_CONFIG_HOME/codeagent/.env)\n";
 }
 
 void displayUsageError(std::ostream& error, const std::string& message) {

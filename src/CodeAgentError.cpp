@@ -74,11 +74,16 @@ ConfigurationError::ConfigurationError(const std::string& userMessage, std::stri
 const char* ConfigurationError::code() const noexcept { return "CONFIGURATION_ERROR"; }
 int ConfigurationError::httpStatus() const noexcept { return 503; }
 
-ConfigurationError ConfigurationError::missingSetting(const std::string& name) {
+ConfigurationError ConfigurationError::missingSetting(const std::string& name,
+                                                     const std::string& searchedLocations) {
+    std::string diagnostic = name + " is unset or empty";
+    if (!searchedLocations.empty()) {
+        diagnostic += "; .env files checked: " + searchedLocations;
+    }
     return ConfigurationError(
         "Configuration error: " + name + " is not configured. "
         "Set it in your environment or .env file.",
-        name + " is unset or empty");
+        std::move(diagnostic));
 }
 
 ProviderError::ProviderError(const std::string& userMessage, std::string diagnostic)
