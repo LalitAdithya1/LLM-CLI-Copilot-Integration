@@ -37,6 +37,12 @@ const MAX_LOADED_FILE_BYTES = 512 * 1024;
 // Name shown for editor content that is not tied to a file yet. It uses a
 // supported extension so Save As can keep it.
 const UNTITLED_DOCUMENT_NAME = 'untitled.cpp';
+// What to do next while a review decision is open. States after a decision
+// (accepted, rejected, saved) show their own next step instead.
+const AFTER_ACCEPT_NOTE = 'After accepting, review or edit the code, then select Save or Save As to write it to disk. Complete your review before starting another generation or proposal.';
+const REVIEW_NOTE = `Review the proposed changes carefully. Select Accept to apply the proposal to the editor, or Reject to discard it. ${AFTER_ACCEPT_NOTE}`;
+const UNREVIEWED_PROPOSAL_NOTE = `Select Review changes to load the diff, then review the proposed changes carefully. Select Accept to apply the proposal to the editor, or Reject to discard it. ${AFTER_ACCEPT_NOTE}`;
+const GENERATED_REVIEW_NOTE = `Review the generated code carefully. Select Accept to apply it to the editor, or Reject to discard it. ${AFTER_ACCEPT_NOTE}`;
 // How long the Copy button shows "Copied!".
 const COPY_FEEDBACK_MS = 1800;
 
@@ -234,7 +240,7 @@ function initializeApp() {
     const proposal = state.proposal;
     if (!proposal) {
       proposalReviewStatus.textContent = 'No proposal available';
-      proposalReviewAvailability.textContent = 'Refactoring proposals and generated code appear here for review before anything is saved.';
+      proposalReviewAvailability.textContent = REVIEW_NOTE;
       proposalDiffContent.textContent = 'No diff loaded.';
       renderDecisionControls();
       return;
@@ -278,8 +284,8 @@ function initializeApp() {
       proposalReviewAvailability.textContent = state.decisionBlocked
         ? 'The last decision was not confirmed. No proposal-status lookup is available, so further decisions are disabled.'
         : proposal.reviewed
-          ? 'Review the diff, then Accept it into the editor or Reject it.'
-          : 'Select Review changes to load the diff before accepting or rejecting this proposal.';
+          ? REVIEW_NOTE
+          : UNREVIEWED_PROPOSAL_NOTE;
     } else if (proposal.status === 'APPROVED') {
       proposalReviewAvailability.textContent = 'The backend confirmed approval, but the proposal was not applied to the editor.';
     } else if (proposal.status === 'REJECTED') {
@@ -1068,7 +1074,7 @@ function initializeApp() {
         });
         promptInput.value = '';
         proposalReviewStatus.textContent = 'Generated output · not saved';
-        proposalReviewAvailability.textContent = 'Accept puts the generated code into the editor; edit it there, then Save As writes it to the output directory. Nothing is written until you save.';
+        proposalReviewAvailability.textContent = GENERATED_REVIEW_NOTE;
         renderStatus('Generated code is displayed. It has not been saved.');
       }
     } catch (error) {

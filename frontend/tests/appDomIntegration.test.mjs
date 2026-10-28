@@ -1354,3 +1354,52 @@ test('layout rules: aligned cards, a 45-line editor viewport, and screen-reader-
   assert.match(main, /\.visually-hidden \{[^}]*position: absolute;[^}]*clip: rect\(0 0 0 0\);/);
   assert.match(main, /\[hidden\] \{\s*display: none !important;/);
 });
+
+test('the proposal NOTE explains the next step and never contradicts the current state', async () => {
+  assert.match(htmlSource,
+    /<p class="proposal-review__notice" role="note">\s*<span class="proposal-review__notice-label">NOTE:<\/span>\s*<span id="proposal-review-availability">Review the proposed changes carefully\./);
+  assert.match(htmlSource, /<p class="proposal-review__status" id="proposal-review-status" role="status">/,
+    'the status stays a separate element');
+  const offersDecision = /Select Accept to apply .* or Reject to discard it\..*Save or Save As.*Complete your review before starting another generation or proposal\./;
+
+  // Generated code: pending, then accepted.
+  const generated = await createApp((path, body, fallback) => {
+    if (path === '/api/generate') return jsonResponse({ generatedCode: 'int g;\n', language: body.language });
+    return fallback(`http://127.0.0.1:8080${path}`, { method: body ? 'POST' : 'GET', body: body && JSON.stringify(body) });
+  });
+  const note = () => generated.elements.get('#proposal-review-availability').textContent;
+  assert.match(note(), offersDecision, 'idle: the general instructions');
+  generated.elements.get('#prompt-input').value = 'Write g';
+  generated.elements.get('#language-input').value = 'C++';
+  generated.elements.get('#prompt-form').dispatch('submit');
+  await settle();
+  assert.equal(generated.elements.get('#proposal-review-status').textContent, 'Generated output · not saved');
+  assert.match(note(), /^Review the generated code carefully\./);
+  assert.match(note(), offersDecision);
+  generated.elements.get('#accept-proposal-button').dispatch('click');
+  assert.equal(generated.elements.get('#proposal-review-status').textContent, 'Accepted into the editor · not saved');
+  assert.doesNotMatch(note(), /Select Accept/, 'not asked to accept twice');
+  assert.match(note(), /Save \(Ctrl\+S\) or Save As/);
+
+  // Refactoring: unreviewed, reviewed, rejected.
+  const refactor = await createApp();
+  await createPendingProposal(refactor);
+  const proposalNote = () => refactor.elements.get('#proposal-review-availability').textContent;
+  assert.match(proposalNote(), /^Select Review changes to load the diff/);
+  assert.match(proposalNote(), offersDecision);
+  refactor.elements.get('#review-changes-button').dispatch('click');
+  await settle();
+  assert.match(proposalNote(), /^Review the proposed changes carefully\./);
+  refactor.elements.get('#reject-proposal-button').dispatch('click');
+  await settle();
+  assert.equal(refactor.elements.get('#proposal-review-status').textContent, 'Rejected');
+  assert.doesNotMatch(proposalNote(), /Select Accept|Save or Save As/, 'a rejected proposal is not to be accepted or saved');
+  assert.match(proposalNote(), /editor and files on disk are unchanged/);
+});
+
+test('the NOTE is styled as an accent notice, separate from the status', () => {
+  const components = readFileSync(new URL('../css/components.css', import.meta.url), 'utf8');
+  assert.match(components, /\.proposal-review__notice \{[^}]*border-left: 3px solid var\(--color-accent\);[^}]*color: var\(--color-text\);[^}]*overflow-wrap: anywhere;/);
+  assert.match(components, /\.proposal-review__notice-label \{[^}]*font-weight: 700;/);
+  assert.equal(components.includes('.proposal-review__availability'), false, 'the old grey style is gone');
+});
