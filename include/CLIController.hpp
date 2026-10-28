@@ -31,6 +31,8 @@ public:
 private:
     // Runs the command; may throw CodeAgentError or other exceptions.
     int dispatch(int argc, char* argv[]);
+    // Asks whether and where to save code from the generate command.
+    int offerToSave(const std::string& generatedCode);
 
     LLMCall llmCall_;
     std::istream& input_;

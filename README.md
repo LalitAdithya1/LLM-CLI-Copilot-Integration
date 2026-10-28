@@ -52,6 +52,8 @@ node --test frontend/tests/*.test.mjs
 ./build/codeagent gui
 ```
 
+After `generate` prints the code, it asks `Do you want to save the generated code to a file? (y/n):`. Answer `y` and enter a path ending in a C/C++ source extension (`.cpp`, `.hpp`, …) inside an existing folder. An empty or invalid path is explained and asked again; an existing file is only replaced after you confirm. Answering `n`, or ending input, saves nothing.
+
 `codeagent gui` is the only process you need to start. It:
 
 1. Starts the C++ server on `127.0.0.1:8080`. It binds to loopback only, never to `0.0.0.0`.

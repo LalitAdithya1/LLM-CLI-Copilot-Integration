@@ -505,4 +505,160 @@ TEST_F(CLIControllerTest, InvalidGuiPortIsAConfigurationError) {
     EXPECT_EQ(output.str().find("GUI running"), std::string::npos);
 }
 
+// --------------------------------------------------------------------------
+// generate: offering to save the generated code
+// --------------------------------------------------------------------------
+
+constexpr const char* kGeneratedCode = "int main() { return 0; }\n";
+
+int runGenerate(
+    const std::string& inputText,
+    std::ostringstream& output,
+    std::ostringstream& error,
+    bool generationSucceeds = true
+) {
+    std::istringstream input(inputText);
+    CLIController controller(
+        [generationSucceeds](const std::string&, std::string& response, bool) {
+            response = generationSucceeds ? kGeneratedCode : "";
+            return generationSucceeds;
+        },
+        input, output, error);
+    return runWithArguments(controller, {"codeagent", "generate", "write main"});
+}
+
+std::size_t filesInCurrentDirectory() {
+    std::size_t count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(".")) {
+        (void)entry;
+        ++count;
+    }
+    return count;
+}
+
+TEST_F(CLIControllerTest, DecliningToSaveWritesNothing) {
+    std::ostringstream output;
+    std::ostringstream error;
+
+    EXPECT_EQ(runGenerate("n\n", output, error), 0);
+    EXPECT_NE(output.str().find(
+        "Do you want to save the generated code to a file? (y/n): "), std::string::npos);
+    EXPECT_NE(output.str().find("The generated code was not saved."), std::string::npos);
+    EXPECT_EQ(output.str().find("Enter the output file path:"), std::string::npos);
+    EXPECT_EQ(filesInCurrentDirectory(), 0u);
+    EXPECT_TRUE(error.str().empty());
+}
+
+TEST_F(CLIControllerTest, AcceptingSavesTheExactGeneratedCodeToTheGivenPath) {
+    std::ostringstream output;
+    std::ostringstream error;
+
+    EXPECT_EQ(runGenerate("y\n  generated.cpp \n", output, error), 0);
+    EXPECT_EQ(readFile("generated.cpp"), kGeneratedCode);
+    const auto expectedPath =
+        std::filesystem::absolute("generated.cpp").lexically_normal().string();
+    EXPECT_NE(output.str().find("Generated code saved successfully to: " + expectedPath),
+              std::string::npos);
+    EXPECT_EQ(output.str().find("wants permission"), std::string::npos);
+    EXPECT_TRUE(error.str().empty());
+}
+
+TEST_F(CLIControllerTest, EmptyAndInvalidPathsAreExplainedAndAskedAgain) {
+    std::ostringstream output;
+    std::ostringstream error;
+
+    EXPECT_EQ(runGenerate("y\n\nnotes.txt\nmissing/main.cpp\n\"generated.cpp\"\n", output, error), 0);
+    EXPECT_NE(error.str().find("Output file path cannot be empty."), std::string::npos);
+    EXPECT_NE(error.str().find("not a supported source file name"), std::string::npos);
+    EXPECT_NE(error.str().find("does not exist. Create it first or choose another path."),
+              std::string::npos);
+    EXPECT_FALSE(std::filesystem::exists("notes.txt"));
+    EXPECT_FALSE(std::filesystem::exists("missing"));
+    EXPECT_EQ(readFile("generated.cpp"), kGeneratedCode);
+}
+
+TEST_F(CLIControllerTest, AnExistingFileIsReplacedOnlyAfterConfirmation) {
+    std::ofstream("existing.cpp", std::ios::binary) << "int old;\n";
+    std::ostringstream output;
+    std::ostringstream error;
+
+    // Declining keeps the file and lets the user choose another path.
+    EXPECT_EQ(runGenerate("y\nexisting.cpp\nn\nother.cpp\n", output, error), 0);
+    EXPECT_NE(output.str().find("Overwrite this file? [y/N]"), std::string::npos);
+    EXPECT_NE(output.str().find("Enter a different path"), std::string::npos);
+    EXPECT_EQ(readFile("existing.cpp"), "int old;\n");
+    EXPECT_EQ(readFile("other.cpp"), kGeneratedCode);
+
+    std::ostringstream confirmedOutput;
+    std::ostringstream confirmedError;
+    EXPECT_EQ(runGenerate("y\nexisting.cpp\ny\n", confirmedOutput, confirmedError), 0);
+    EXPECT_EQ(readFile("existing.cpp"), kGeneratedCode);
+    EXPECT_NE(confirmedOutput.str().find("Generated code saved successfully to:"),
+              std::string::npos);
+}
+
+TEST_F(CLIControllerTest, AFailedWriteIsReportedAndNeverClaimedAsSaved) {
+    // A directory at the temporary path makes the write itself fail.
+    std::filesystem::create_directory("generated.cpp.codeagent.tmp");
+    std::ostringstream output;
+    std::ostringstream error;
+
+    EXPECT_EQ(runGenerate("y\ngenerated.cpp\n", output, error), 1);
+    EXPECT_NE(error.str().find("Error: Could not write"), std::string::npos);
+    EXPECT_NE(error.str().find("Error: The generated code was not saved."), std::string::npos);
+    EXPECT_EQ(output.str().find("saved successfully"), std::string::npos);
+    EXPECT_FALSE(std::filesystem::exists("generated.cpp"));
+}
+
+TEST_F(CLIControllerTest, FailedGenerationNeverOffersToSave) {
+    std::ostringstream output;
+    std::ostringstream error;
+
+    EXPECT_EQ(runGenerate("y\ngenerated.cpp\n", output, error, false), 1);
+    EXPECT_EQ(output.str().find("Do you want to save"), std::string::npos);
+    EXPECT_NE(error.str().find("Code generation failed"), std::string::npos);
+    EXPECT_EQ(filesInCurrentDirectory(), 0u);
+}
+
+TEST_F(CLIControllerTest, EndOfInputOrAnUnclearAnswerSavesNothing) {
+    std::ostringstream output;
+    std::ostringstream error;
+    EXPECT_EQ(runGenerate("y\n", output, error), 0);
+    EXPECT_NE(output.str().find("No path received; the generated code was not saved."),
+              std::string::npos);
+
+    std::ostringstream unclearOutput;
+    std::ostringstream unclearError;
+    EXPECT_EQ(runGenerate("maybe\n", unclearOutput, unclearError), 0);
+    EXPECT_NE(unclearOutput.str().find("Please answer y or n."), std::string::npos);
+    EXPECT_NE(unclearOutput.str().find("No answer received; the generated code was not saved."),
+              std::string::npos);
+    EXPECT_EQ(filesInCurrentDirectory(), 0u);
+}
+
+TEST_F(CLIControllerTest, FencedGeminiOutputIsSavedWithoutTheFence) {
+    ScopedApiKey apiKey;
+    const std::string fenced =
+        R"({"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"```cpp\nint main() { return 0; }\n```"}]}}]})";
+    std::istringstream input("y\ngenerated.cpp\n");
+    std::ostringstream output;
+    std::ostringstream error;
+    CLIController controller(
+        [&fenced](const std::string& prompt, std::string& response, bool) {
+            response = LLMClient([&fenced](const std::string&, const std::string&,
+                                           const std::string&, std::string& body, long& status) {
+                body = fenced;
+                status = 200;
+                return true;
+            }).generate(prompt, {}).text;
+            return true;
+        },
+        input, output, error);
+
+    EXPECT_EQ(runWithArguments(controller, {"codeagent", "generate", "write main"}), 0);
+    const std::string saved = readFile("generated.cpp");
+    EXPECT_EQ(saved.find("```"), std::string::npos);
+    EXPECT_EQ(saved.rfind("int main() { return 0; }", 0), 0u);
+}
+
 } // namespace

@@ -260,7 +260,7 @@ void displayHelp(std::ostream& output) {
         << "  codeagent refactor <file-path> \"<instruction>\"\n\n"
         << "Commands:\n"
         << "  gui        Start the browser GUI on 127.0.0.1 and open it (Ctrl+C to stop)\n"
-        << "  generate   Generate code from an instruction\n"
+        << "  generate   Generate code from an instruction, then optionally save it\n"
         << "  refactor   Refactor a source file using AI\n"
         << "  help       Display this help message\n\n"
         << "Options:\n"
@@ -325,6 +325,22 @@ std::string joinArguments(
     return result;
 }
 
+// Removes surrounding whitespace (including a Windows \r) and one pair of
+// matching quotes, which terminals add when a path is dragged in.
+std::filesystem::path cleanPathInput(const std::string& input) {
+    const auto first = input.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return {};
+    }
+    const auto last = input.find_last_not_of(" \t\r\n");
+    std::string path = input.substr(first, last - first + 1);
+    if (path.size() >= 2 && (path.front() == '"' || path.front() == '\'') &&
+        path.back() == path.front()) {
+        path = path.substr(1, path.size() - 2);
+    }
+    return path;
+}
+
 } // namespace
 
 CLIController::CLIController()
@@ -356,6 +372,63 @@ CLIController::CLIController(
       guiCommand_(std::move(guiCommand)) {
     if (!guiCommand_) {
         guiCommand_ = runGuiCommand;
+    }
+}
+
+// Asks whether to save generated code and where. Declining, or input ending
+// before the code is saved, leaves every file untouched and still succeeds;
+// only a failed write is an error.
+int CLIController::offerToSave(const std::string& generatedCode) {
+    for (;;) {
+        output_ << "\nDo you want to save the generated code to a file? (y/n): ";
+        std::string answer;
+        if (!std::getline(input_, answer)) {
+            output_ << "\nNo answer received; the generated code was not saved.\n";
+            return 0;
+        }
+        if (isRejection(answer)) {
+            output_ << "The generated code was not saved.\n";
+            return 0;
+        }
+        if (isApproval(answer)) {
+            break;
+        }
+        output_ << "Please answer y or n.";
+    }
+
+    FileManager fileManager(input_, output_, error_);
+    for (;;) {
+        output_ << "Enter the output file path: ";
+        std::string answer;
+        if (!std::getline(input_, answer)) {
+            output_ << "\nNo path received; the generated code was not saved.\n";
+            return 0;
+        }
+
+        const std::filesystem::path path = cleanPathInput(answer);
+        // The user typed this path, which is their permission to write it;
+        // an existing file still needs confirmation before it is replaced.
+        switch (fileManager.saveFile(
+                    path, generatedCode,
+                    FileManager::PermissionPrompt::AlreadyGranted)) {
+        case FileManager::WriteResult::Written: {
+            std::error_code ignored;
+            const auto shown = path.empty()
+                ? path : std::filesystem::absolute(path, ignored).lexically_normal();
+            output_ << "Generated code saved successfully to: "
+                    << shown.string() << '\n';
+            return 0;
+        }
+        case FileManager::WriteResult::InvalidPath:
+            break;
+        case FileManager::WriteResult::Declined:
+            output_ << "Enter a different path to save the code elsewhere, "
+                    << "or end input (Ctrl+D) to skip saving.\n";
+            break;
+        case FileManager::WriteResult::Failed:
+            error_ << "Error: The generated code was not saved.\n";
+            return 1;
+        }
     }
 }
 
@@ -457,7 +530,7 @@ int CLIController::dispatch(int argc, char* argv[]) {
             << generatedCode
             << '\n';
 
-        return 0;
+        return offerToSave(generatedCode);
     }
 
     // ------------------------------------------------------------

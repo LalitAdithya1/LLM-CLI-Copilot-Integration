@@ -142,6 +142,7 @@ target_include_directories(FileManagerTest
 target_link_libraries(FileManagerTest
     PRIVATE
         GTest::gtest_main
+        CodeAgentError
 )
 
 # --------------------------------------------------
