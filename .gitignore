@@ -1,5 +1,7 @@
 # CMake build files
-build
+/build/
+/build-cli/
+/build-release/
 .codeagent
 .env
 
