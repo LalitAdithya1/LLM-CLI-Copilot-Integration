@@ -72,6 +72,7 @@ const REQUIRED_ELEMENTS = [
   '#select-output-directory-button',
   '#backend-config-error',
   '#generate-submit-button',
+  '#resend-prompt-button',
   '#proposal-review-status',
   '#proposal-review-availability',
   '#proposal-original-code',
@@ -170,6 +171,7 @@ function initializeApp() {
     document.querySelector('#conversation-empty'),
   );
   const submitButton = document.querySelector('#generate-submit-button');
+  const resendPromptButton = document.querySelector('#resend-prompt-button');
   const sourceFileControls = document.querySelector('#source-file-controls');
   let workflowInProgress = false;
   let selectionInProgress = false;
@@ -196,6 +198,10 @@ function initializeApp() {
   let generatedOutput = null;
   // ID of the proposal whose code was accepted into the editor.
   let acceptedProposalId = null;
+  // The last prompt that passed validation and was sent to the backend,
+  // exactly as submitted: { mode, language, instruction }. It is kept after
+  // a failed request so that Resend prompt can retry it.
+  let lastSubmittedPrompt = null;
 
   const proposalWorkflow = createProposalWorkflow({
     getProposalDiff,
@@ -223,6 +229,7 @@ function initializeApp() {
       button.disabled = actionLocked;
     });
     submitButton.disabled = actionLocked;
+    resendPromptButton.disabled = actionLocked || lastSubmittedPrompt === null;
     const canDecideProposal = hasPendingProposal && state.proposal.reviewed
       && state.proposal.sourceMatches && !state.decisionBlocked;
     const canDecideGenerated = !state.proposal && generatedOutput !== null
@@ -296,7 +303,7 @@ function initializeApp() {
     renderDecisionControls();
   }
 
-  function setWorkflowInProgress(isInProgress, actionLabel = '') {
+  function setWorkflowInProgress(isInProgress, actionLabel = '', isResend = false) {
     workflowInProgress = isInProgress;
     promptInput.disabled = isInProgress;
     languageInput.disabled = isInProgress;
@@ -307,6 +314,7 @@ function initializeApp() {
     submitButton.textContent = isInProgress
       ? actionLabel
       : selectedMode === 'refactor' ? 'Create proposal' : 'Generate code';
+    resendPromptButton.textContent = isInProgress && isResend ? 'Resending…' : 'Resend prompt';
     renderDecisionControls();
   }
 
@@ -988,14 +996,14 @@ function initializeApp() {
       : `Diff review failed. ${state.error}`);
   }
 
-  async function submitWorkflow() {
-    if (editorIsBusy()) {
-      return;
-    }
+  function proposalAwaitsDecision() {
+    if (proposalWorkflow.getState().proposal?.status !== 'PENDING') return false;
+    renderStatus('Review and accept or reject the current proposal before starting another request.');
+    return true;
+  }
 
-    const currentProposal = proposalWorkflow.getState().proposal;
-    if (currentProposal?.status === 'PENDING') {
-      renderStatus('Review and accept or reject the current proposal before starting another request.');
+  async function submitWorkflow() {
+    if (editorIsBusy() || proposalAwaitsDecision()) {
       return;
     }
 
@@ -1018,20 +1026,42 @@ function initializeApp() {
     }
 
     languageInput.removeAttribute('aria-invalid');
-    const originalSource = codeEditor.value;
-    if (selectedMode === 'refactor' && originalSource.trim().length === 0) {
+    if (selectedMode === 'refactor' && codeEditor.value.trim().length === 0) {
       renderValidationError('Enter source code before creating a proposal.', codeEditor);
       return;
     }
 
-    const requestMode = selectedMode;
+    await sendPrompt({ mode: selectedMode, language, instruction });
+  }
+
+  // Sends the last submitted prompt again, unchanged, as a new exchange. A
+  // refactoring works on the current editor contents, like any new request.
+  async function resendLastPrompt() {
+    const prompt = lastSubmittedPrompt;
+    if (prompt === null || editorIsBusy() || proposalAwaitsDecision()) {
+      return;
+    }
+    clearValidationError();
+    if (prompt.mode === 'refactor' && codeEditor.value.trim().length === 0) {
+      renderValidationError('Enter source code before resending the refactoring prompt.', codeEditor);
+      return;
+    }
+    await sendPrompt(prompt, { isResend: true });
+  }
+
+  // Runs one generation or refactoring request and records it as a new
+  // exchange in the chat. The prompt is sent exactly as given.
+  async function sendPrompt(prompt, { isResend = false } = {}) {
+    const { mode: requestMode, language, instruction } = prompt;
+    const originalSource = codeEditor.value;
+    lastSubmittedPrompt = prompt;
     chat.addUserMessage({ mode: requestMode, language, instruction });
     const reply = chat.addPendingReply(requestMode === 'refactor'
       ? 'Thinking about the refactoring…'
       : 'Thinking about the code…');
     generatedOutput = null;
     proposalWorkflow.reset();
-    setWorkflowInProgress(true, requestMode === 'refactor' ? 'Creating…' : 'Generating…');
+    setWorkflowInProgress(true, requestMode === 'refactor' ? 'Creating…' : 'Generating…', isResend);
     proposalOriginalCode.textContent = originalSource;
     proposalProposedCode.textContent = requestMode === 'refactor'
       ? 'Creating proposal…'
@@ -1060,7 +1090,7 @@ function initializeApp() {
           code: proposal.proposedCode,
           thoughts: proposal.thoughts ?? '',
         });
-        promptInput.value = '';
+        if (!isResend) promptInput.value = '';
         renderStatus('Refactoring proposal is ready for review. It has not been approved or saved.');
       } else {
         const response = await generateCode({ instruction, language });
@@ -1072,7 +1102,7 @@ function initializeApp() {
           code: response.generatedCode,
           thoughts: response.thoughts ?? '',
         });
-        promptInput.value = '';
+        if (!isResend) promptInput.value = '';
         proposalReviewStatus.textContent = 'Generated output · not saved';
         proposalReviewAvailability.textContent = GENERATED_REVIEW_NOTE;
         renderStatus('Generated code is displayed. It has not been saved.');
@@ -1094,7 +1124,7 @@ function initializeApp() {
         ? 'No confirmed proposal ID is available, so review decisions are disabled.'
         : 'Generation did not produce reviewable proposal state.';
       reply.fail(message);
-      promptFeedback.textContent = message;
+      promptFeedback.textContent = `${message} Select Resend prompt to try again.`;
       promptFeedback.hidden = false;
       renderStatus(message);
     } finally {
@@ -1207,6 +1237,10 @@ function initializeApp() {
       event.preventDefault();
       void submitWorkflow();
     }
+  });
+
+  resendPromptButton.addEventListener('click', () => {
+    void resendLastPrompt();
   });
 
   clearChatButton.addEventListener('click', () => {

@@ -123,7 +123,10 @@
               <textarea id="prompt-input" name="prompt" rows="3" placeholder="Describe the code to generate. Enter sends, Shift+Enter adds a line." aria-describedby="prompt-help prompt-feedback"></textarea>
               <p class="visually-hidden" id="prompt-help">Enter a programming language and an instruction. Refactoring creates a proposal for diff review. Accepting it replaces the editor contents; save them with Save or Save As.</p>
               <p class="prompt-feedback" id="prompt-feedback" role="alert" aria-live="assertive" hidden></p>
-              <button class="action-button action-button--primary" id="generate-submit-button" type="submit">Generate code</button>
+              <div class="prompt-actions">
+                <button class="action-button action-button--primary" id="generate-submit-button" type="submit">Generate code</button>
+                <button class="action-button" id="resend-prompt-button" type="button" title="Send your last prompt to Gemini again, unchanged, as a new exchange" disabled>Resend prompt</button>
+              </div>
             </form>
           </section>
 

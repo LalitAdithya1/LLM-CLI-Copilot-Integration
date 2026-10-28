@@ -591,7 +591,10 @@
   line-height: 1.45;
 }
 
-.prompt-form .action-button {
+.prompt-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
   margin-top: var(--space-3);
 }
 

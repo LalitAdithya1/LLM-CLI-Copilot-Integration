@@ -1037,6 +1037,167 @@ test('Enter in the prompt sends it and Shift+Enter does not', async () => {
   assert.equal(requests.filter((request) => request.path === '/api/generate').length, 1);
 });
 
+test('Resend prompt is disabled until a prompt has been sent', async () => {
+  const { elements, requests } = await createApp();
+  const resendButton = elements.get('#resend-prompt-button');
+  assert.equal(resendButton.disabled, true);
+  resendButton.dispatch('click');
+
+  // A prompt rejected by validation is not sent, so there is nothing to resend.
+  elements.get('#prompt-input').value = '   ';
+  elements.get('#language-input').value = 'C++';
+  elements.get('#prompt-form').dispatch('submit');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(resendButton.disabled, true);
+  assert.equal(requests.filter((request) => request.path === '/api/generate').length, 0);
+
+  elements.get('#prompt-input').value = 'Write main';
+  elements.get('#prompt-form').dispatch('submit');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(resendButton.disabled, false);
+});
+
+test('Resend prompt sends the exact stored prompt, not the current input or mode', async () => {
+  const { elements, modeButtons, requests } = await createApp();
+  const instruction = '  Write main\n\twith  tabs and trailing spaces  \n';
+  const language = ' C++ ';
+  elements.get('#prompt-input').value = instruction;
+  elements.get('#language-input').value = language;
+  elements.get('#prompt-form').dispatch('submit');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  // Later edits to the form do not change what is resent, and stay in place.
+  modeButtons.find((button) => button.dataset.mode === 'refactor').dispatch('click');
+  elements.get('#prompt-input').value = 'a new draft';
+  elements.get('#language-input').value = 'Rust';
+  elements.get('#resend-prompt-button').dispatch('click');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const sent = requests.filter((request) => request.path === '/api/generate').map((request) => request.body);
+  assert.equal(requests.filter((request) => request.path === '/api/refactor').length, 0);
+  assert.deepEqual(sent, [{ instruction, language }, { instruction, language }]);
+  assert.equal(elements.get('#prompt-input').value, 'a new draft', 'the draft is not cleared by a resend');
+  assert.equal(elements.get('#language-input').value, 'Rust');
+});
+
+test('a resend is a new exchange, shows progress, and ignores repeated clicks', async () => {
+  let call = 0;
+  const second = deferred();
+  const app = await createApp((path, body, fallback) => {
+    if (path === '/api/generate') {
+      call += 1;
+      return call === 1
+        ? jsonResponse({ generatedCode: 'first\n', language: body.language })
+        : second.promise;
+    }
+    return fallback(`http://127.0.0.1:8080${path}`, { method: body ? 'POST' : 'GET', body: body && JSON.stringify(body) });
+  });
+  const { elements, requests } = app;
+  const conversation = elements.get('#conversation');
+  const resendButton = elements.get('#resend-prompt-button');
+  elements.get('#prompt-input').value = 'Write main';
+  elements.get('#language-input').value = 'C++';
+  elements.get('#prompt-form').dispatch('submit');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const [firstUser, firstReply] = conversation.children;
+
+  resendButton.dispatch('click');
+  assert.equal(resendButton.disabled, true);
+  assert.equal(resendButton.textContent, 'Resending…');
+  assert.equal(elements.get('#generate-submit-button').disabled, true);
+  assert.equal(elements.get('#generate-submit-button').textContent, 'Generating…');
+  assert.equal(elements.get('#proposal-review-status').textContent, 'Generating code…');
+  resendButton.dispatch('click');
+  elements.get('#prompt-form').dispatch('submit');
+  assert.equal(requests.filter((request) => request.path === '/api/generate').length, 2);
+  assert.equal(conversation.children.length, 4);
+  assert.equal(conversation.children[3].dataset.state, 'pending');
+
+  second.resolve(jsonResponse({ generatedCode: 'second\n', language: 'C++' }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(resendButton.disabled, false);
+  assert.equal(resendButton.textContent, 'Resend prompt');
+  assert.equal(conversation.children[0], firstUser);
+  assert.equal(conversation.children[1], firstReply);
+  assert.equal(firstReply.children.find((child) => child.className === 'message-code').textContent, 'first\n');
+  assert.match(textOf(conversation.children[2]), /YOU · Generate · C\+\+/);
+  assert.match(textOf(conversation.children[2]), /Write main/);
+  assert.equal(conversation.children[3].dataset.state, 'done');
+  assert.equal(conversation.children[3].children.find((child) => child.className === 'message-code').textContent, 'second\n');
+  // The review panel shows the new output and it can be accepted as usual.
+  assert.equal(elements.get('#proposal-proposed-code').textContent, 'second\n');
+  elements.get('#accept-proposal-button').dispatch('click');
+  assert.equal(elements.get('#code-editor').value, 'second\n');
+});
+
+test('a failed request can be retried with Resend prompt', async () => {
+  let call = 0;
+  const app = await createApp((path, body, fallback) => {
+    if (path === '/api/generate') {
+      call += 1;
+      return call === 1
+        ? jsonResponse({ error: { code: 'GENERATION_FAILED', message: 'Code generation failed.' } }, 502)
+        : jsonResponse({ generatedCode: 'int main() {}\n', language: body.language });
+    }
+    return fallback(`http://127.0.0.1:8080${path}`, { method: body ? 'POST' : 'GET', body: body && JSON.stringify(body) });
+  });
+  const { elements, requests } = app;
+  const conversation = elements.get('#conversation');
+  elements.get('#prompt-input').value = 'Write main';
+  elements.get('#language-input').value = 'C++';
+  elements.get('#prompt-form').dispatch('submit');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(conversation.children[1].dataset.state, 'error');
+  assert.match(elements.get('#prompt-feedback').textContent, /GENERATION_FAILED.*Select Resend prompt to try again\./);
+  assert.equal(elements.get('#resend-prompt-button').disabled, false);
+
+  elements.get('#resend-prompt-button').dispatch('click');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(requests.filter((request) => request.path === '/api/generate').map((request) => request.body), [
+    { instruction: 'Write main', language: 'C++' },
+    { instruction: 'Write main', language: 'C++' },
+  ]);
+  assert.equal(conversation.children.length, 4);
+  assert.equal(conversation.children[1].dataset.state, 'error', 'the failed exchange stays in the history');
+  assert.equal(conversation.children[3].dataset.state, 'done');
+  assert.equal(elements.get('#prompt-feedback').hidden, true);
+});
+
+test('a refactoring resend waits for the pending proposal and uses the current editor', async () => {
+  const app = await createApp((path, body, fallback) => {
+    if (path === '/api/diff') return jsonResponse({ diff: 'diff' });
+    if (path.endsWith('/approve')) return jsonResponse({ proposalId: 'prop-1', status: 'APPROVED' });
+    return fallback(`http://127.0.0.1:8080${path}`, { method: body ? 'POST' : 'GET', body: body && JSON.stringify(body) });
+  });
+  await createPendingProposal(app);
+  const { elements, requests } = app;
+  const refactorRequests = () => requests.filter((request) => request.path === '/api/refactor');
+  elements.get('#resend-prompt-button').dispatch('click');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(refactorRequests().length, 1);
+  assert.match(elements.get('#notification-area').textContent, /accept or reject the current proposal/);
+
+  elements.get('#review-changes-button').dispatch('click');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  elements.get('#accept-proposal-button').dispatch('click');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  elements.get('#resend-prompt-button').dispatch('click');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(refactorRequests().length, 2);
+  const { editorRevision: _first, ...firstBody } = refactorRequests()[0].body;
+  const { editorRevision: _second, ...secondBody } = refactorRequests()[1].body;
+  assert.deepEqual({ instruction: secondBody.instruction, language: secondBody.language },
+    { instruction: firstBody.instruction, language: firstBody.language });
+  assert.equal(secondBody.sourceCode, 'refactored <script>unsafe()</script>');
+  assert.equal(elements.get('#proposal-review-status').textContent, 'Proposal pending review');
+});
+
+test('the Resend prompt button sits next to the submit button and is not a submit button', () => {
+  assert.match(htmlSource,
+    /<div class="prompt-actions">\s*<button[^>]*id="generate-submit-button" type="submit"[^>]*>[^<]*<\/button>\s*<button[^>]*id="resend-prompt-button" type="button"[^>]*disabled>Resend prompt<\/button>/);
+  assert.match(readCss('components.css'), /\.prompt-actions \{[^}]*display: flex;/);
+});
+
 // Lets pending promise callbacks run without using timers, for tests that
 // mock setTimeout.
 async function flushMicrotasks() {
