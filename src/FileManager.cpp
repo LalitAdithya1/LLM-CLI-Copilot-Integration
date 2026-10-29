@@ -2,11 +2,11 @@
 
 #include "CodeAgentError.hpp"
 #include "detail/FileReplacement.hpp"
+#include "detail/TextFile.hpp"
 
 #include <cerrno>
 #include <fstream>
 #include <iostream>
-#include <set>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -77,8 +77,14 @@ bool FileManager::readFile(
 
     if (!isValidSourceFile(filePath)) {
         error_
-            << "Error: Invalid or unsupported source file: "
+            << "Error: Invalid or unsupported file: "
             << filePath << '\n';
+
+        if (codeagent::detail::isProtectedSecretFile(filePath)) {
+            error_
+                << "Environment files can hold API keys, so CodeAgent "
+                << "does not open them.\n";
+        }
 
         return false;
     }
@@ -91,7 +97,9 @@ bool FileManager::readFile(
         return false;
     }
 
-    std::ifstream inputFile(filePath);
+    // Binary mode keeps the bytes, including CRLF line endings, exactly as
+    // writeAtomically will write them back.
+    std::ifstream inputFile(filePath, std::ios::binary);
 
     if (!inputFile.is_open()) {
         error_
@@ -110,6 +118,16 @@ bool FileManager::readFile(
         error_
             << "Error: Failed while reading file: "
             << filePath << '\n';
+
+        content.clear();
+        return false;
+    }
+
+    if (!codeagent::detail::isUtf8Text(content)) {
+        error_
+            << "Error: " << filePath << " is binary or not UTF-8 text. "
+            << "CodeAgent only edits UTF-8 text files; the file was "
+            << "not changed.\n";
 
         content.clear();
         return false;
@@ -138,11 +156,11 @@ FileManager::WriteResult FileManager::saveFile(
         return WriteResult::InvalidPath;
     }
 
-    if (!isSupportedExtension(filePath)) {
+    if (!isSupportedFileName(filePath)) {
         error_
-            << "Error: " << filePath << " is not a supported source file "
-            << "name. Use a name ending in .c, .cc, .cpp, .cxx, .h, .hh, "
-            << ".hpp, or .hxx.\n";
+            << "Error: " << filePath << " is an environment file that can "
+            << "hold API keys, so CodeAgent does not write it. Choose "
+            << "another file name.\n";
 
         return WriteResult::InvalidPath;
     }
@@ -304,7 +322,7 @@ bool FileManager::isValidSourceFile(
         return false;
     }
 
-    return isSupportedExtension(filePath);
+    return isSupportedFileName(filePath);
 }
 
 bool FileManager::requestPermission(
@@ -477,25 +495,12 @@ bool FileManager::requestOverwritePermission(
     return selected == 'y';
 }
 
-bool FileManager::isSupportedExtension(
+// Any extension is accepted; whether a file is text is decided by its
+// content when it is read. Only secret-bearing environment files are refused.
+bool FileManager::isSupportedFileName(
     const std::filesystem::path& filePath
 ) const {
-    const std::string extension =
-        filePath.extension().string();
-
-    static const std::set<std::string> supportedExtensions = {
-        ".c",
-        ".cc",
-        ".cpp",
-        ".cxx",
-        ".h",
-        ".hh",
-        ".hpp",
-        ".hxx"
-    };
-
-    return supportedExtensions.find(extension) !=
-           supportedExtensions.end();
+    return !codeagent::detail::isProtectedSecretFile(filePath);
 }
 
 std::filesystem::path FileManager::normalizePath(

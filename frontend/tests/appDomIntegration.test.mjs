@@ -413,11 +413,11 @@ test('opening a local file loads it into the editor and refactors that content',
   assert.match(elements.get('#code-language').textContent, /location unknown/);
   assert.equal(elements.get('#save-document-button').disabled, true);
 
-  input.files = [{ name: 'notes.txt', size: 3, text: async () => 'abc' }];
+  input.files = [{ name: 'image.cpp', size: 3, text: async () => 'a\u0000b' }];
   input.dispatch('change');
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(elements.get('#code-editor').value, source);
-  assert.match(elements.get('#notification-area').textContent, /not a supported source file/);
+  assert.match(elements.get('#notification-area').textContent, /binary or not UTF-8 text/);
 
   modeButtons.find((button) => button.dataset.mode === 'refactor').dispatch('click');
   elements.get('#prompt-input').value = 'Add spaces';
@@ -1250,10 +1250,35 @@ test('the supported-extension list is no longer displayed, but uploads are still
   assert.equal(elements.get('#backend-config-output-directory').textContent, '/tmp');
   assert.equal(elements.get('#backend-config-values').hidden, false);
 
-  elements.get('#load-source-file-input').files = [{ name: 'notes.txt', size: 4, text: async () => 'x' }];
+  elements.get('#load-source-file-input').files = [{ name: '.env', size: 4, text: async () => 'KEY=x' }];
   elements.get('#load-source-file-input').dispatch('change');
   await settle();
-  assert.match(elements.get('#file-status').textContent, /notes\.txt is not a supported source file/);
+  assert.match(elements.get('#file-status').textContent, /\.env is an environment file that can hold API keys/);
+  assert.notEqual(elements.get('#code-editor').value, 'KEY=x');
+});
+
+test('text files of any extension load unchanged, and undecodable files are refused', async () => {
+  assert.equal(htmlSource.includes('accept='), false, 'the file picker is not limited to C++ extensions');
+  const { elements } = await createApp();
+  const input = elements.get('#load-source-file-input');
+  for (const [name, text] of [
+    ['config.yaml', 'key: value\r\n  nested: "ü ✓"\r\n'],
+    ['script.py', 'def f():\n\treturn 1\n'],
+    ['.env.example', 'GEMINI_API_KEY=\n'],
+    ['Makefile', 'all:\n\techo ok\n'],
+  ]) {
+    input.files = [{ name, size: text.length, text: async () => text }];
+    input.dispatch('change');
+    await settle();
+    assert.equal(elements.get('#code-editor').value, text, name);
+    assert.equal(elements.get('#preview-heading').textContent, name);
+  }
+
+  input.files = [{ name: 'latin1.txt', size: 4, text: async () => 'caf�' }];
+  input.dispatch('change');
+  await settle();
+  assert.equal(elements.get('#code-editor').value, 'all:\n\techo ok\n');
+  assert.match(elements.get('#file-status').textContent, /latin1\.txt is binary or not UTF-8 text/);
 });
 
 test('after Save As the editor is the new file: name, path, Save and Reload all use it', async () => {
@@ -1302,7 +1327,7 @@ test('a failed, cancelled, or repeated Save As keeps the current file', async ()
     '/api/save': (body) => {
       saveCalls.push(body);
       return failSave
-        ? jsonResponse({ error: { code: 'INVALID_FILENAME', message: 'fileName must be a supported source filename without a directory path.' } }, 400)
+        ? jsonResponse({ error: { code: 'INVALID_FILENAME', message: 'fileName must be a file name without a directory path, and not an environment file such as .env.' } }, 400)
         : jsonResponse({ savedPath: `/out/${body.fileName}`, status: 'SAVED' });
     },
   });
@@ -1318,7 +1343,7 @@ test('a failed, cancelled, or repeated Save As keeps the current file', async ()
     assert.equal(elements.get('#code-editor').value, 'int edited;\n');
   };
 
-  globalThis.window.prompt = () => 'notes.txt';
+  globalThis.window.prompt = () => '.env';
   elements.get('#save-document-as-button').dispatch('click');
   await settle();
   unchanged();

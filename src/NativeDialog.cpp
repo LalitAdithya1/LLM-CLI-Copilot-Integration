@@ -221,7 +221,7 @@ std::vector<std::string> windowsDialogArguments(NativeDialogKind kind) {
     const std::string dialog = kind == NativeDialogKind::SourceFile
         ? "$d = New-Object Windows.Forms.OpenFileDialog; "
           "$d.Title = 'CodeAgent - choose a source file'; "
-          "$d.Filter = 'C/C++ source|*.c;*.cc;*.cpp;*.cxx;*.h;*.hh;*.hpp;*.hxx'; "
+          "$d.Filter = 'All files|*.*|C/C++ source|*.c;*.cc;*.cpp;*.cxx;*.h;*.hh;*.hpp;*.hxx'; "
           "$ok = $d.ShowDialog($o) -eq 'OK'; $p = $d.FileName; "
         : "$d = New-Object Windows.Forms.FolderBrowserDialog; "
           "$d.Description = 'CodeAgent - choose the output directory'; "
@@ -245,6 +245,7 @@ public:
             const NativeDialogResult result = runDialogProcess(
                 kind == NativeDialogKind::SourceFile
                     ? std::vector<std::string>{"zenity", "--file-selection",
+                          "--file-filter=All files | *",
                           "--file-filter=Source files | *.c *.cc *.cpp *.cxx *.h *.hh *.hpp *.hxx"}
                     : std::vector<std::string>{"zenity", "--file-selection", "--directory"}
             );

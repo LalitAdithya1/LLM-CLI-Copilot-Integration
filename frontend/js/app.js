@@ -30,12 +30,18 @@ int main() {
 }
 `;
 
-// Mirrors the supported extensions of the backend, which validates saves again.
-const SOURCE_FILE_EXTENSIONS = ['.c', '.cc', '.cpp', '.cxx', '.h', '.hh', '.hpp', '.hxx'];
+// Text files of any extension can be edited. Like the backend, which checks
+// again, environment files are refused because they can hold API keys:
+// ".env" and ".env.<name>", but not templates such as ".env.example".
+function isProtectedSecretFileName(name) {
+  const lower = name.toLowerCase();
+  return lower === '.env'
+    || (lower.startsWith('.env.') && !/\.(example|sample|template)$/.test(lower));
+}
 // Keeps a loaded file and its refactoring instruction under the 1 MiB API limit.
 const MAX_LOADED_FILE_BYTES = 512 * 1024;
-// Name shown for editor content that is not tied to a file yet. It uses a
-// supported extension so Save As can keep it.
+// Name shown for editor content that is not tied to a file yet; the sample
+// it starts with is C++.
 const UNTITLED_DOCUMENT_NAME = 'untitled.cpp';
 // What to do next while a review decision is open. States after a decision
 // (accepted, rejected, saved) show their own next step instead.
@@ -534,10 +540,8 @@ function initializeApp() {
     if (!file || editorIsBusy()) {
       return;
     }
-    const dot = file.name.lastIndexOf('.');
-    const extension = dot >= 0 ? file.name.slice(dot).toLowerCase() : '';
-    if (!SOURCE_FILE_EXTENSIONS.includes(extension)) {
-      renderMessage(fileStatus, `${file.name} is not a supported source file (${SOURCE_FILE_EXTENSIONS.join(', ')}).`, 'error');
+    if (isProtectedSecretFileName(file.name)) {
+      renderMessage(fileStatus, `${file.name} is an environment file that can hold API keys, so it cannot be opened.`, 'error');
       return;
     }
     if (file.size > MAX_LOADED_FILE_BYTES) {
@@ -553,6 +557,12 @@ function initializeApp() {
       text = await file.text();
     } catch {
       renderMessage(fileStatus, `${file.name} could not be read.`, 'error');
+      return;
+    }
+    // Blob.text() decodes as UTF-8 and replaces invalid bytes with U+FFFD;
+    // NUL marks binary content. Either would corrupt the file once saved.
+    if (text.includes('\u0000') || text.includes('�')) {
+      renderMessage(fileStatus, `${file.name} is binary or not UTF-8 text, so it cannot be edited.`, 'error');
       return;
     }
     loadDocument({ name: file.name, path: null, revision: null, savedContent: text, origin: 'upload' });
@@ -712,7 +722,7 @@ function initializeApp() {
     if (editorIsBusy()) return false;
     const outputDirectory = backendConfigOutputDirectory.textContent.trim();
     const answer = window.prompt(
-      `Save as (supported: ${SOURCE_FILE_EXTENSIONS.join(' ')}).\nThe file is written to the active output directory:\n${outputDirectory || '(not loaded)'}`,
+      `Save as (any text file name, for example main.cpp, script.py, or notes.md).\nThe file is written to the active output directory:\n${outputDirectory || '(not loaded)'}`,
       currentDocument.name,
     );
     if (typeof answer !== 'string' || answer.trim().length === 0) {

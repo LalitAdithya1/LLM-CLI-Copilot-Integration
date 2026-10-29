@@ -1,6 +1,7 @@
 #include "GuiHttpServer.hpp"
 #include "CodeAgentError.hpp"
 #include "UnifiedDiff.hpp"
+#include "detail/TextFile.hpp"
 
 #include <iostream>
 #include <httplib.h>
@@ -109,7 +110,7 @@ bool isLoopbackOrigin(const std::string& origin) {
     return false;
 }
 
-const std::vector<std::string>& supportedExtensions();
+bool isEditableFileName(const std::filesystem::path& path);
 
 bool isWhitespaceOnly(const std::string& value) {
     for (unsigned char character : value) {
@@ -258,8 +259,7 @@ bool validSaveFileName(const std::string& name) {
         std::filesystem::path(name).filename().string() != name ||
         name.find('/') != std::string::npos || name.find('\\') != std::string::npos || name.find(':') != std::string::npos) return false;
     for (unsigned char c : name) if (c < 32 || c == 127) return false;
-    const auto& extensions = supportedExtensions();
-    return std::find(extensions.begin(), extensions.end(), std::filesystem::path(name).extension().string()) != extensions.end();
+    return isEditableFileName(name);
 }
 
 // Writes through a temporary file and an atomic rename. The system calls
@@ -541,13 +541,6 @@ bool parseDiffRequest(
     return false;
 }
 
-const std::vector<std::string>& supportedExtensions() {
-    static const std::vector<std::string> extensions = {
-        ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"
-    };
-    return extensions;
-}
-
 bool parseEmptyObject(
     const std::string& requestBody,
     httplib::Response& response
@@ -573,9 +566,7 @@ bool resolveSelectedSourcePath(
     if (!std::filesystem::is_regular_file(selectedPath, error) || error) {
         return false;
     }
-    const std::string extension = selectedPath.extension().string();
-    const auto& extensions = supportedExtensions();
-    if (std::find(extensions.begin(), extensions.end(), extension) == extensions.end()) {
+    if (!isEditableFileName(selectedPath)) {
         return false;
     }
     normalizedPath = std::filesystem::absolute(selectedPath, error).lexically_normal();
@@ -603,10 +594,11 @@ bool isWritableDirectory(const std::filesystem::path& directory) {
 #endif
 }
 
-bool hasSupportedExtension(const std::filesystem::path& path) {
-    const auto& extensions = supportedExtensions();
-    return std::find(extensions.begin(), extensions.end(), path.extension().string()) !=
-           extensions.end();
+// Files of any extension can be edited; their content is checked to be text
+// when read. Environment files are refused because they can hold the Gemini
+// API key, and editor content may be sent to Gemini.
+bool isEditableFileName(const std::filesystem::path& path) {
+    return !codeagent::detail::isProtectedSecretFile(path);
 }
 
 enum class ReadResult { Ok, Failed, TooLarge };
@@ -863,7 +855,7 @@ public:
 
             std::filesystem::path selectedPath;
             if (!resolveSelectedSourcePath(result.selectedPath, selectedPath)) {
-                setJsonError(response, 422, "INVALID_SOURCE_FILE", "Selected path is not a supported source file.");
+                setJsonError(response, 422, "INVALID_SOURCE_FILE", "Selected path is not a regular file, or is an environment file that can hold API keys.");
                 return;
             }
             response.set_content(
@@ -904,8 +896,8 @@ public:
             if (resolveSelectedSourcePath(toHostPath(requestedPath), selectedPath)) {
                 canonicalPath = std::filesystem::canonical(selectedPath, error);
             }
-            if (canonicalPath.empty() || error || !hasSupportedExtension(canonicalPath)) {
-                setJsonError(response, 422, "INVALID_SOURCE_FILE", "Path is not an existing file with a supported source extension.");
+            if (canonicalPath.empty() || error || !isEditableFileName(canonicalPath)) {
+                setJsonError(response, 422, "INVALID_SOURCE_FILE", "Path is not an existing regular file, or is an environment file that can hold API keys.");
                 return;
             }
             const auto size = std::filesystem::file_size(canonicalPath, error);
@@ -927,6 +919,10 @@ public:
                 }
             } catch (const FileError& error) {
                 respondWithError(response, error);
+                return;
+            }
+            if (!codeagent::detail::isUtf8Text(content)) {
+                setJsonError(response, 422, "UNSUPPORTED_ENCODING", "The file is binary or not valid UTF-8 text, so it cannot be edited. It was not changed.");
                 return;
             }
             std::string serializedResponse;
@@ -983,8 +979,8 @@ public:
                 }
             }
             const std::filesystem::path target(path);
-            if (!hasSupportedExtension(target)) {
-                setJsonError(response, 400, "INVALID_FILENAME", "Only supported source files can be saved.");
+            if (!isEditableFileName(target)) {
+                setJsonError(response, 400, "INVALID_FILENAME", "Environment files that can hold API keys cannot be saved.");
                 return;
             }
 
@@ -1180,7 +1176,7 @@ public:
             SaveRequest save;
             if (!parseSaveRequest(request.body, save, response)) return;
             if (!validSaveFileName(save.fileName)) {
-                setJsonError(response, 400, "INVALID_FILENAME", "fileName must be a supported source filename without a directory path."); return;
+                setJsonError(response, 400, "INVALID_FILENAME", "fileName must be a file name without a directory path, and not an environment file such as .env."); return;
             }
             std::filesystem::path outputDirectory;
             { std::lock_guard<std::mutex> lock(configMutex_); outputDirectory = activeOutputDirectory_; }

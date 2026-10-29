@@ -1337,6 +1337,24 @@ TEST_F(GuiHttpServerSaveTest, SavesGeneratedCodeExplicitlyAndRequiresOverwriteCo
     ASSERT_TRUE(replaced); EXPECT_EQ(replaced->status, 200);
 }
 
+TEST_F(GuiHttpServerSaveTest, SavesTextOfAnyFormatUnderTheExactNameGiven) {
+    auto http = client();
+    for (const std::string name : {"notes.txt", "page.html", "settings.toml", ".env.example", "README"}) {
+        const std::string content = "line one\r\n\tü ✓\n";
+        auto saved = http.Post("/api/save", nlohmann::json{{"fileName", name}, {"content", content},
+            {"overwriteConfirmed", false}}.dump(), "application/json");
+        ASSERT_TRUE(saved) << name;
+        ASSERT_EQ(saved->status, 200) << name << ": " << saved->body;
+        std::ifstream file(directory_ / name, std::ios::binary);
+        EXPECT_EQ(std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()), content) << name;
+        EXPECT_FALSE(std::filesystem::exists(directory_ / (name + ".cpp"))) << name;
+    }
+    auto id = approvedProposal(); ASSERT_FALSE(id.empty());
+    auto proposal = http.Post("/api/save", nlohmann::json{{"proposalId",id},{"fileName","proposal.yaml"}}.dump(), "application/json");
+    ASSERT_TRUE(proposal); EXPECT_EQ(proposal->status, 200);
+    EXPECT_TRUE(std::filesystem::exists(directory_ / "proposal.yaml"));
+}
+
 TEST_F(GuiHttpServerSaveTest, SavesOnlyApprovedProposalAndPreventsDuplicateApplication) {
     auto http = client();
     auto pending = http.Post("/api/refactor", R"({"sourceCode":"base","instruction":"edit","language":"C++","editorRevision":"r"})", "application/json");
@@ -1356,7 +1374,7 @@ TEST_F(GuiHttpServerSaveTest, SavesOnlyApprovedProposalAndPreventsDuplicateAppli
 
 TEST_F(GuiHttpServerSaveTest, RejectsMalformedRequestsUnsupportedMediaUnsafeNamesAndOversizedBodies) {
     auto http = client();
-    for (const std::string body : {"{bad", "{}", R"({"fileName":"../x.cpp","content":"x","overwriteConfirmed":false})", R"({"fileName":"/tmp/x.cpp","content":"x","overwriteConfirmed":false})", R"({"fileName":"x.txt","content":"x","overwriteConfirmed":false})", R"({"fileName":"x.cpp","content":"x","overwriteConfirmed":false,"extra":true})"}) {
+    for (const std::string body : {"{bad", "{}", R"({"fileName":"../x.cpp","content":"x","overwriteConfirmed":false})", R"({"fileName":"/tmp/x.cpp","content":"x","overwriteConfirmed":false})", R"({"fileName":".env","content":"x","overwriteConfirmed":false})", R"({"fileName":".env.local","content":"x","overwriteConfirmed":false})", R"({"fileName":"x.cpp","content":"x","overwriteConfirmed":false,"extra":true})"}) {
         auto response = http.Post("/api/save", body, "application/json"); ASSERT_TRUE(response); EXPECT_EQ(response->status, 400);
     }
     auto media = http.Post("/api/save", "{}", "text/plain"); ASSERT_TRUE(media); EXPECT_EQ(media->status, 415);
@@ -1643,7 +1661,9 @@ TEST(GuiHttpServerDialogTest, CancellationAndDialogFailuresAreSafeAndDoNotChange
 }
 
 TEST(GuiHttpServerDialogTest, RejectsInvalidSelectionsAndRequestsWithoutLeakingPaths) {
-    const auto invalidPath = repositoryRoot() / "docs/gui-api-contract.md";
+    // Any extension is a valid source file now, so a missing file is used: it
+    // is neither a regular file nor a directory.
+    const auto invalidPath = repositoryRoot() / "docs/missing-selection.md";
     auto provider = std::make_shared<ScriptedNativeDialogProvider>(
         [invalidPath](NativeDialogKind) {
             return NativeDialogResult{
@@ -1798,6 +1818,45 @@ protected:
     std::unique_ptr<httplib::Client> http_;
 };
 
+TEST_F(GuiHttpServerDocumentTest, OpensAndSavesTextFilesOfAnyExtensionExactly) {
+    const std::vector<std::pair<std::string, std::string>> files = {
+        {"config.yaml", "key: value\r\nname: \"ü ✓ 中文\"\r\n"},
+        {"query.sql", "SELECT 1;\n\t-- trailing spaces   \n"},
+        {"Makefile", "all:\n\techo ok\n"},
+        {".env.example", "GEMINI_API_KEY=\n"},
+        {"data.custom-ext", "no trailing newline"},
+        {"empty.log", ""},
+    };
+    for (const auto& [name, original] : files) {
+        const auto path = directory_ / name;
+        write(path, original);
+        const auto opened = post("/api/files/read", {{"path", path.string()}});
+        ASSERT_TRUE(opened) << name;
+        ASSERT_EQ(opened->status, 200) << name << ": " << opened->body;
+        const auto document = nlohmann::json::parse(opened->body);
+        EXPECT_EQ(document.at("content"), original) << name;
+        EXPECT_EQ(document.at("path"), std::filesystem::canonical(path).string()) << name;
+
+        const std::string edited = original + "\r\nedited ✓\n";
+        const auto saved = post("/api/files/write", {
+            {"path", document.at("path")}, {"content", edited},
+            {"baseRevision", document.at("revision")}, {"overwriteConfirmed", false}});
+        ASSERT_TRUE(saved) << name;
+        ASSERT_EQ(saved->status, 200) << name << ": " << saved->body;
+        EXPECT_EQ(read(path), edited) << name;
+
+        // External changes are still detected for these files.
+        write(path, "changed elsewhere\n");
+        const auto conflict = post("/api/files/write", {
+            {"path", document.at("path")}, {"content", "lost?\n"},
+            {"baseRevision", nlohmann::json::parse(saved->body).at("revision")},
+            {"overwriteConfirmed", false}});
+        ASSERT_TRUE(conflict) << name;
+        EXPECT_EQ(conflict->status, 409) << name;
+        EXPECT_EQ(read(path), "changed elsewhere\n") << name;
+    }
+}
+
 TEST_F(GuiHttpServerDocumentTest, OpensEditsAndSavesBackToTheSameFile) {
     const auto opened = post("/api/files/read", {{"path", source_.string()}});
     ASSERT_TRUE(opened);
@@ -1883,18 +1942,24 @@ TEST_F(GuiHttpServerDocumentTest, RefusesToWriteFilesThatWereNotOpened) {
 }
 
 TEST_F(GuiHttpServerDocumentTest, RejectsUnsupportedLargeAndNonUtf8Files) {
-    write(directory_ / "notes.txt", "text");
-    write(directory_ / "big.cpp", std::string(512 * 1024 + 1, 'x'));
+    write(directory_ / ".env", "GEMINI_API_KEY=secret\n");
+    write(directory_ / "big.txt", std::string(512 * 1024 + 1, 'x'));
     write(directory_ / "binary.cpp", std::string("\xff\xfe\x00", 3));
-    std::filesystem::create_symlink(directory_ / "notes.txt", directory_ / "link.cpp");
+    write(directory_ / "nul.json", std::string("{\"a\":\x00}", 7));
+    write(directory_ / "latin1.csv", "caf\xe9,1\n");
+    std::filesystem::create_symlink(directory_ / "missing.txt", directory_ / "dangling.md");
+    std::filesystem::create_symlink(directory_ / ".env", directory_ / "env-link.txt");
 
     const std::vector<std::pair<std::string, std::string>> cases = {
-        {(directory_ / "notes.txt").string(), "INVALID_SOURCE_FILE"},
+        {(directory_ / ".env").string(), "INVALID_SOURCE_FILE"},
+        {(directory_ / "env-link.txt").string(), "INVALID_SOURCE_FILE"},
         {(directory_ / "missing.cpp").string(), "INVALID_SOURCE_FILE"},
         {directory_.string(), "INVALID_SOURCE_FILE"},
-        {(directory_ / "link.cpp").string(), "INVALID_SOURCE_FILE"},
-        {(directory_ / "big.cpp").string(), "FILE_TOO_LARGE"},
+        {(directory_ / "dangling.md").string(), "INVALID_SOURCE_FILE"},
+        {(directory_ / "big.txt").string(), "FILE_TOO_LARGE"},
         {(directory_ / "binary.cpp").string(), "UNSUPPORTED_ENCODING"},
+        {(directory_ / "nul.json").string(), "UNSUPPORTED_ENCODING"},
+        {(directory_ / "latin1.csv").string(), "UNSUPPORTED_ENCODING"},
     };
     for (const auto& [path, code] : cases) {
         const auto response = post("/api/files/read", {{"path", path}});

@@ -37,7 +37,7 @@ public:
         const std::string& content
     ) const;
 
-    // Writes content to a supported source file atomically. An existing
+    // Writes content to a text file of any extension atomically. An existing
     // file is only replaced after the user confirms overwriting it, whatever
     // the prompt setting. Every outcome except Written is explained on the
     // error stream; success is left to the caller to report.
@@ -83,7 +83,7 @@ private:
         const std::string& content
     ) const;
 
-    bool isSupportedExtension(
+    bool isSupportedFileName(
         const std::filesystem::path& filePath
     ) const;
 

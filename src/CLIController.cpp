@@ -263,7 +263,7 @@ void displayHelp(std::ostream& output) {
         << "Commands:\n"
         << "  gui        Start the browser GUI on 127.0.0.1 and open it (Ctrl+C to stop)\n"
         << "  generate   Generate code from an instruction, then optionally save it\n"
-        << "  refactor   Refactor a source file using AI\n"
+        << "  refactor   Refactor a UTF-8 text file of any type using AI\n"
         << "  help       Display this help message\n\n"
         << "Options:\n"
         << "  -h, --help Display this help message\n\n"
@@ -347,6 +347,21 @@ std::filesystem::path cleanPathInput(const std::string& input) {
         path = path.substr(1, path.size() - 2);
     }
     return path;
+}
+
+// The language named in a refactoring prompt. C and C++ files keep the
+// "C++" label they always had; any other file is described by its extension
+// (for example "py" or "yaml"), so Gemini keeps the file's own format.
+std::string languageForFile(const std::filesystem::path& filePath) {
+    std::string extension = filePath.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    for (const char* cppExtension : {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}) {
+        if (extension == cppExtension) {
+            return "C++";
+        }
+    }
+    return extension.size() > 1 ? extension.substr(1) : "plain text";
 }
 
 } // namespace
@@ -570,7 +585,7 @@ int CLIController::dispatch(int argc, char* argv[]) {
 
         PromptBuilder promptBuilder;
         std::string prompt;
-        const std::string language = "C++";
+        const std::string language = languageForFile(filePath);
 
         if (!promptBuilder.buildRefactoringPrompt(
                 instruction,

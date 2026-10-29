@@ -13,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -196,6 +197,66 @@ TEST_F(CLIControllerTest, AppliesOnlyAfterApprovalAndFileManagerSafeguards) {
     EXPECT_NE(output.str().find("+int value() { return 2; }"), std::string::npos);
     EXPECT_NE(output.str().find("Refactoring applied successfully."), std::string::npos);
     EXPECT_TRUE(error.str().empty());
+}
+
+TEST_F(CLIControllerTest, RefactorsTextFilesOfAnyExtensionInTheirOwnFormat) {
+    const std::vector<std::tuple<std::string, std::string, std::string>> files = {
+        {"config.yaml", "key: 1\r\nname: \"ü\"\r\n", "yaml"},
+        {"script.PY", "def f():\n\treturn 1\n", "py"},
+        {"Makefile", "all:\n\techo ok\n", "plain text"},
+        {"header.hpp", "int value();\n", "C++"},
+    };
+    for (const auto& [name, original, language] : files) {
+        const std::string proposed = original + "# changed\n";
+        std::ofstream(name, std::ios::binary) << original;
+        std::istringstream input("y\nyes\ny\ny\n");
+        std::ostringstream output;
+        std::ostringstream error;
+        std::string sentPrompt;
+
+        CLIController controller(
+            [&proposed, &sentPrompt](const std::string& prompt, std::string& response, bool) {
+                sentPrompt = prompt;
+                response = proposed;
+                return true;
+            },
+            input, output, error);
+        std::vector<std::string> arguments = {"codeagent", "refactor", name, "improve it"};
+        std::vector<char*> argv;
+        for (std::string& argument : arguments) {
+            argv.push_back(argument.data());
+        }
+
+        ASSERT_EQ(controller.run(static_cast<int>(argv.size()), argv.data()), 0)
+            << name << ": " << error.str();
+        EXPECT_NE(sentPrompt.find("Programming language:\n" + language + "\n"), std::string::npos)
+            << name;
+        EXPECT_NE(sentPrompt.find(original), std::string::npos) << name;
+        EXPECT_EQ(readFile(name), proposed) << name;
+        EXPECT_FALSE(std::filesystem::exists(name + ".cpp")) << name;
+    }
+}
+
+TEST_F(CLIControllerTest, BinaryFilesAreNeverSentForRefactoring) {
+    const std::string binary("\x7f" "ELF\x02\x01\x00\x00", 8);
+    std::ofstream("program.bin", std::ios::binary) << binary;
+    std::istringstream input("y\n");
+    std::ostringstream output;
+    std::ostringstream error;
+    bool called = false;
+    CLIController controller(
+        [&called](const std::string&, std::string&, bool) { called = true; return true; },
+        input, output, error);
+    std::vector<std::string> arguments = {"codeagent", "refactor", "program.bin", "improve it"};
+    std::vector<char*> argv;
+    for (std::string& argument : arguments) {
+        argv.push_back(argument.data());
+    }
+
+    EXPECT_EQ(controller.run(static_cast<int>(argv.size()), argv.data()), 1);
+    EXPECT_FALSE(called);
+    EXPECT_NE(error.str().find("is binary or not UTF-8 text"), std::string::npos);
+    EXPECT_EQ(readFile("program.bin"), binary);
 }
 
 TEST_F(CLIControllerTest, RejectionNeverWritesProposal) {
@@ -567,14 +628,25 @@ TEST_F(CLIControllerTest, EmptyAndInvalidPathsAreExplainedAndAskedAgain) {
     std::ostringstream output;
     std::ostringstream error;
 
-    EXPECT_EQ(runGenerate("y\n\nnotes.txt\nmissing/main.cpp\n\"generated.cpp\"\n", output, error), 0);
+    EXPECT_EQ(runGenerate("y\n\n.env\nmissing/main.cpp\n\"generated.cpp\"\n", output, error), 0);
     EXPECT_NE(error.str().find("Output file path cannot be empty."), std::string::npos);
-    EXPECT_NE(error.str().find("not a supported source file name"), std::string::npos);
+    EXPECT_NE(error.str().find("environment file that can hold API keys"), std::string::npos);
     EXPECT_NE(error.str().find("does not exist. Create it first or choose another path."),
               std::string::npos);
-    EXPECT_FALSE(std::filesystem::exists("notes.txt"));
+    EXPECT_FALSE(std::filesystem::exists(".env"));
     EXPECT_FALSE(std::filesystem::exists("missing"));
     EXPECT_EQ(readFile("generated.cpp"), kGeneratedCode);
+}
+
+TEST_F(CLIControllerTest, GeneratedTextIsSavedUnderTheExactNameGiven) {
+    for (const std::string name : {"notes.txt", "settings.toml", ".env.example", "README"}) {
+        std::ostringstream output;
+        std::ostringstream error;
+        EXPECT_EQ(runGenerate("y\n" + name + "\n", output, error), 0) << name;
+        EXPECT_EQ(readFile(name), kGeneratedCode) << name;
+        EXPECT_FALSE(std::filesystem::exists(name + ".cpp")) << name;
+        EXPECT_TRUE(error.str().empty()) << name << ": " << error.str();
+    }
 }
 
 TEST_F(CLIControllerTest, AnExistingFileIsReplacedOnlyAfterConfirmation) {

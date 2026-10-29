@@ -6,6 +6,8 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <utility>
+#include <vector>
 #include <unistd.h>
 #include "FileManager.hpp"
 #include "../src/detail/FileReplacement.hpp"
@@ -53,10 +55,10 @@ protected:
     }
 };
 
-// 1. Verify extension validation for supported source files
+// 1. Any extension is valid; only secret-bearing environment files are not
 TEST_F(FileManagerTestFixture, ValidSourceFileExtensions) {
     FileManager manager;
-    
+
     std::filesystem::path cppFile = testDir / "sample.cpp";
     std::ofstream(cppFile) << "int main() { return 0; }";
 
@@ -64,7 +66,93 @@ TEST_F(FileManagerTestFixture, ValidSourceFileExtensions) {
     std::ofstream(txtFile) << "Plain text content";
 
     EXPECT_TRUE(manager.isValidSourceFile(cppFile));
-    EXPECT_FALSE(manager.isValidSourceFile(txtFile));
+    EXPECT_TRUE(manager.isValidSourceFile(txtFile));
+
+    for (const char* name : {"config.yaml", "query.sql", "app.config.json",
+                             "Makefile", ".env.example", "data.custom-ext"}) {
+        std::ofstream(testDir / name) << "text\n";
+        EXPECT_TRUE(manager.isValidSourceFile(testDir / name)) << name;
+    }
+    for (const char* name : {".env", ".ENV", ".env.local", ".env.production"}) {
+        std::ofstream(testDir / name) << "GEMINI_API_KEY=secret\n";
+        EXPECT_FALSE(manager.isValidSourceFile(testDir / name)) << name;
+    }
+}
+
+TEST_F(FileManagerTestFixture, TextFilesOfAnyExtensionRoundTripExactly) {
+    const std::vector<std::pair<std::string, std::string>> files = {
+        {"config.yaml", "key: value\r\nlist:\r\n  - \"ü ✓ 中文\"\r\n"},
+        {"script.py", "def f():\n\treturn 1  \n\n"},
+        {"notes", "no extension, no trailing newline"},
+        {"bom.txt", "\xEF\xBB\xBFwith byte-order mark\n"},
+        {"empty.md", ""},
+    };
+    for (const auto& [name, original] : files) {
+        const auto path = testDir / name;
+        std::ofstream(path, std::ios::binary) << original;
+
+        std::istringstream answers("y\n");
+        std::ostringstream output;
+        std::ostringstream error;
+        FileManager manager(answers, output, error);
+        std::string content;
+        ASSERT_TRUE(manager.readFile(path, content)) << name << ": " << error.str();
+        EXPECT_EQ(content, original) << name;
+
+        std::istringstream saveAnswers("y\n");
+        FileManager saver(saveAnswers, output, error);
+        const auto copy = testDir / ("copy-" + name);
+        ASSERT_EQ(saver.saveFile(copy, content, FileManager::PermissionPrompt::AlreadyGranted),
+                  FileManager::WriteResult::Written) << name;
+        EXPECT_EQ(readContents(copy), original) << name;
+        EXPECT_EQ(copy.filename().string(), "copy-" + name) << "no extension is appended";
+    }
+}
+
+TEST_F(FileManagerTestFixture, BinaryAndNonUtf8FilesAreRefusedAndLeftUnchanged) {
+    const std::vector<std::pair<std::string, std::string>> files = {
+        {"image.png", std::string("\x89PNG\r\n\x1a\n\x00\x00", 10)},
+        {"nul.cpp", std::string("int a;\x00int b;", 13)},
+        {"latin1.txt", "caf\xE9\n"},
+        {"utf16.txt", std::string("\xFF\xFEh\x00i\x00", 6)},
+        {"truncated.txt", "ok \xE2\x9C"},
+        {"surrogate.txt", "\xED\xA0\x80"},
+        {"overlong.txt", "\xC0\xAF"},
+    };
+    for (const auto& [name, original] : files) {
+        const auto path = testDir / name;
+        std::ofstream(path, std::ios::binary) << original;
+
+        std::istringstream answers("y\n");
+        std::ostringstream output;
+        std::ostringstream error;
+        FileManager manager(answers, output, error);
+        std::string content = "stale";
+        EXPECT_FALSE(manager.readFile(path, content)) << name;
+        EXPECT_TRUE(content.empty()) << name;
+        EXPECT_NE(error.str().find("is binary or not UTF-8 text"), std::string::npos) << name;
+        EXPECT_EQ(readContents(path), original) << name;
+    }
+}
+
+TEST_F(FileManagerTestFixture, EnvironmentFilesAreNeitherReadNorWritten) {
+    const auto env = testDir / ".env";
+    std::ofstream(env) << "GEMINI_API_KEY=secret\n";
+    std::istringstream answers("y\ny\n");
+    std::ostringstream output;
+    std::ostringstream error;
+    FileManager manager(answers, output, error);
+
+    std::string content;
+    EXPECT_FALSE(manager.readFile(env, content));
+    EXPECT_TRUE(content.empty());
+    EXPECT_NE(error.str().find("can hold API keys"), std::string::npos);
+    EXPECT_EQ(output.str().find("wants permission"), std::string::npos);
+
+    EXPECT_EQ(manager.saveFile(env, "GEMINI_API_KEY=other\n",
+                               FileManager::PermissionPrompt::AlreadyGranted),
+              FileManager::WriteResult::InvalidPath);
+    EXPECT_EQ(readContents(env), "GEMINI_API_KEY=secret\n");
 }
 
 // 2. Non-existent file should fail validation
@@ -173,9 +261,9 @@ TEST_F(SaveFileTest, InvalidPathsAreRejectedBeforeAnythingIsWritten) {
     EXPECT_EQ(save("", ""), FileManager::WriteResult::InvalidPath);
     EXPECT_NE(error.str().find("cannot be empty"), std::string::npos);
 
-    EXPECT_EQ(save(testDir / "notes.txt", ""), FileManager::WriteResult::InvalidPath);
-    EXPECT_NE(error.str().find("not a supported source file name"), std::string::npos);
-    EXPECT_FALSE(std::filesystem::exists(testDir / "notes.txt"));
+    EXPECT_EQ(save(testDir / ".env.local", ""), FileManager::WriteResult::InvalidPath);
+    EXPECT_NE(error.str().find("environment file that can hold API keys"), std::string::npos);
+    EXPECT_FALSE(std::filesystem::exists(testDir / ".env.local"));
 
     EXPECT_EQ(save(testDir / "missing" / "main.cpp", ""), FileManager::WriteResult::InvalidPath);
     EXPECT_NE(error.str().find("does not exist. Create it first or choose another path."),
