@@ -12,7 +12,8 @@ state diagram shows the life of a GUI refactoring proposal.
   points to the interface being implemented. A dashed dependency arrow means
   one part uses another. `<<utility>>` marks a group of utility functions.
 - In sequence diagrams, time moves downward. Arrows show calls and returned
-  results. `alt` shows either/or paths and `opt` marks an optional step.
+  results. `alt` shows either/or paths, `opt` marks an optional step, and
+  `break` marks a path that ends the flow early.
 - In the state diagram, arrows show allowed status changes. `[*]` represents
   the start or end of the proposal lifecycle.
 - Names such as `PromptBuilder` and `LLMClient` refer to the C++ classes;
@@ -24,6 +25,11 @@ state diagram shows the life of a GUI refactoring proposal.
 This is a map of the main C++ types. It highlights who is responsible for
 commands, files, prompts, model requests, GUI requests, and errors. It leaves
 out small helpers and detailed method parameters to keep the map readable.
+
+`TextFile` holds the shared file policy used by both the CLI and the GUI:
+files of any extension can be edited if their content is UTF-8 text, but
+environment files such as `.env` are never opened or written because they can
+hold the API key.
 
 `GuiHttpServer` does not call `PromptBuilder` or `LLMClient` itself. It is
 given generation and refactoring handlers, and those handlers (defined next to
@@ -56,6 +62,13 @@ classDiagram
         -writeAtomically(filePath, content) void
         -requestPermission(filePath, permission) bool
         -requestOverwritePermission(filePath) bool
+        -isSupportedFileName(filePath) bool
+    }
+
+    class TextFile {
+        <<utility>>
+        +isUtf8Text(content)$ bool
+        +isProtectedSecretFile(path)$ bool
     }
 
     class PromptBuilder {
@@ -197,6 +210,8 @@ classDiagram
     CLIController ..> UnifiedDiff : uses
     CLIController ..> GuiHttpServer : starts and supplies handlers
 
+    FileManager ..> TextFile : checks file name and content
+    GuiHttpServer ..> TextFile : checks file name and content
     GuiHttpServer ..> UnifiedDiff : computes diff
     GuiHttpServer ..> NativeDialogProvider : uses
     LLMClient ..> ResponseParser : parses responses
@@ -238,10 +253,14 @@ sequenceDiagram
 
 ## CLI refactoring
 
-This shows the `refactor` command. The original file is read first, and the
-proposed changes are displayed as a diff. The model must report the response
-as complete (`requireExplicitCompletion`). The file is written only after the
-user approves; a proposal identical to the source ends without asking.
+This shows the `refactor` command. The original file is read first; it may
+have any extension, but it must be UTF-8 text and not an environment file such
+as `.env`. The language named in the prompt comes from the file extension:
+C and C++ files are described as `C++`, other files by their extension (for
+example `py`). The proposed changes are displayed as a diff. The model must
+report the response as complete (`requireExplicitCompletion`). The file is
+written only after the user approves; a proposal identical to the source ends
+without asking.
 
 ```mermaid
 sequenceDiagram
@@ -254,7 +273,12 @@ sequenceDiagram
 
     User->>CLI: refactor path instruction
     CLI->>Files: readFile(path)
+    break File is .env, binary, or not UTF-8
+        Files-->>CLI: read fails
+        CLI-->>User: refactoring cancelled (exit code 1)
+    end
     Files-->>CLI: source code
+    CLI->>CLI: languageForFile(path)
     CLI->>Builder: buildRefactoringPrompt(instruction, language, source)
     Builder-->>CLI: prompt
     CLI->>LLM: generate(prompt, requireExplicitCompletion) via llmCall_
