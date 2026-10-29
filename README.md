@@ -1,6 +1,6 @@
 # CodeAgent: AI Code Generation and Refactoring Assistant
 
-CodeAgent is a C++17 assistant that uses Google's Gemini API to generate C++ code and to propose refactorings of existing source files, from the terminal or from a local browser GUI. It exists to make LLM help safe to use on real files: you always see the generated code or a diff first, nothing is written to disk without your explicit approval, and AI-generated code is never executed. CodeAgent calls an external model; it does not train or host one.
+CodeAgent is a C++17 assistant that uses Google's Gemini API to generate code and to propose refactorings of existing text files of any type (C++, Python, JavaScript, HTML, JSON, YAML, SQL, Markdown, configuration files, and so on), from the terminal or from a local browser GUI. It exists to make LLM help safe to use on real files: you always see the generated code or a diff first, nothing is written to disk without your explicit approval, and AI-generated code is never executed. CodeAgent calls an external model; it does not train or host one.
 
 It has two front ends over one C++ core:
 
@@ -40,6 +40,10 @@ Detailed design documentation: [docs/project-report.md](docs/project-report.md) 
   * [Error messages](#error-messages)
   * [Security](#security)
 
+* [Contributing Guidelines](#contributing-guidelines)
+
+* [License](#license)
+
 * [Credits / Contact](#credits--contact)
 
 ## Key Features
@@ -48,7 +52,8 @@ Detailed design documentation: [docs/project-report.md](docs/project-report.md) 
 * **Refactoring with diff review:** `codeagent refactor <file> "<instruction>"` shows a unified diff and writes the file only after `y`. The GUI creates a proposal; *Review changes* shows a colored diff; *Accept* puts it into the editor, *Reject* discards it.
 * **Browser editor:** a line-numbered editor that scrolls up to 45 visible lines and keeps the complete document; open by path or dialog, Save (with external-change detection), Save As, Reload, Copy.
 * **Chat:** prompts, Gemini replies with their thought summaries, decisions, and errors stay in the conversation; *Resend prompt* sends the last prompt again unchanged.
-* **Safe file handling:** atomic writes through a temporary file and rename, supported C/C++ extensions only, 512 KiB editor limit, explicit overwrite confirmation everywhere.
+* **Any text-file extension:** `.cpp`, `.py`, `.ts`, `.json`, `.yaml`, `.toml`, `.csv`, `.sql`, `.md`, `.env.example`, files without an extension such as `Makefile`, or your own extensions. Filenames and extensions are kept exactly as given, nothing is ever appended, and content (indentation, Unicode, CRLF line endings) round-trips unchanged.
+* **Safe file handling:** atomic writes through a temporary file and rename, binary and non-UTF-8 files refused without being changed, `.env` secret files never opened or written, 512 KiB editor limit, explicit overwrite confirmation everywhere.
 * **Actionable errors:** a typed C++ exception hierarchy turns failures into specific messages that explain the cause and the next step, in the terminal and the browser.
 * **Security:** loopback-only server, per-session token, origin and host checks, request size limits, redacted diagnostics; the API key never leaves the backend except to Gemini.
 * **Runs from any directory:** `scripts/install.sh` installs a `codeagent` command with a documented configuration lookup.
@@ -66,7 +71,9 @@ Detailed design documentation: [docs/project-report.md](docs/project-report.md) 
 
 * Requires the Gemini API and network access; usage is subject to Gemini's quotas and rate limits.
 * Generated code may be wrong or insecure and must be reviewed; CodeAgent does not compile or run it.
-* One file at a time, up to 512 KiB, C and C++ source extensions only.
+* One file at a time, up to 512 KiB in the GUI. Only UTF-8 text is supported; binary files and other encodings (UTF-16, Latin-1, …) are refused.
+* `codeagent generate` in the terminal always asks Gemini for C++, because the command has no option to name another format; the result can still be saved under any filename. The GUI's *Generate* mode takes any language or format.
+* `.env` files are recognised by name only. A key file with another name, for example one named by `CODEAGENT_ENV_FILE`, is not blocked.
 * The editor is a plain text area without syntax highlighting.
 * Linux/WSL2 only (see [Supported platforms](#supported-platforms)).
 * The WSL PowerShell file dialog has not been exercised with a real click in automated tests.
@@ -144,7 +151,7 @@ LLM-CLI-Copilot-Integration/
 │   ├── PromptBuilder.hpp      generation and refactoring prompts
 │   ├── ResponseParser.hpp     Gemini response and error parsing
 │   └── UnifiedDiff.hpp        unified diff generation
-├── src/                implementations, main.cpp, detail/FileReplacement.hpp
+├── src/                implementations, main.cpp, detail/ (FileReplacement.hpp, TextFile.hpp)
 ├── tests/              GoogleTest suites (one per component)
 ├── frontend/           index.html, css/, js/, tests/ (Node test runner)
 ├── scripts/            install.sh, smoke-test.sh
@@ -255,8 +262,8 @@ To check an installation end to end, run `bash scripts/smoke-test.sh`. It runs `
 ```bash
 cmake -S . -B build
 cmake --build build -j2
-ctest --test-dir build --output-on-failure   # 206 C++ tests in 20 suites
-node --test frontend/tests/*.test.mjs        # 78 frontend tests
+ctest --test-dir build --output-on-failure   # 214 C++ tests in 29 suites
+node --test frontend/tests/*.test.mjs        # 79 frontend tests
 bash scripts/smoke-test.sh                    # installed command, end to end
 ```
 
@@ -280,6 +287,8 @@ The C++ tests replace the Gemini transport, the GUI handlers, the clock, and the
 | *Choose source path* / *Choose output directory* say no dialog is available | On Linux, install zenity (`sudo apt install zenity`) and run in a graphical session. Under WSL, the Windows dialog needs `powershell.exe` to be reachable through WSL interop. Either way, typing the path and selecting *Open path* / *Set directory* always works. |
 | The dialog seems not to open | Under WSL the Windows dialog can open behind the browser window; check the taskbar. It closes itself after 2 minutes. |
 | *Save* says `FILE_NOT_OPENED` | Only files opened by path in this session can be saved in place. Use *Save As*, or open the file by path. |
+| `UNSUPPORTED_ENCODING` / `is binary or not UTF-8 text` | The file is binary or uses another encoding. Convert it to UTF-8 (for example `iconv -f latin1 -t utf-8`) if it is text; binary files cannot be edited. The file was not changed. |
+| `environment file that can hold API keys` | `.env` and `.env.<name>` files are never opened, sent to Gemini, or written. Use a template name such as `.env.example`, or edit the file in another editor. |
 
 ## Usage Instructions
 
@@ -289,14 +298,16 @@ The C++ tests replace the Gemini transport, the GUI handlers, the clock, and the
 codeagent help
 codeagent generate "Implement binary search in C++"
 codeagent refactor src/example.cpp "Improve readability"
+codeagent refactor config/settings.yaml "Sort the keys alphabetically"
+codeagent refactor scripts/report.py "Add type hints"
 codeagent gui
 ```
 
 The CLI commands are `help` (also `-h`, `--help`), `gui`, `generate "<instruction>"`, and `refactor <file> "<instruction>"`. Unknown commands and missing arguments print a usage error and exit with status 1.
 
-After `generate` prints the code, it asks `Do you want to save the generated code to a file? (y/n):`. Answer `y` and enter a path ending in a C/C++ source extension (`.cpp`, `.hpp`, …) inside an existing folder. An empty or invalid path is explained and asked again; an existing file is only replaced after you confirm. Answering `n`, or ending input, saves nothing.
+After `generate` prints the code, it asks `Do you want to save the generated code to a file? (y/n):`. Answer `y` and enter a path inside an existing folder, with any filename and extension (`main.cpp`, `notes.md`, `settings.toml`, `Makefile`, …); the file is saved under exactly that name. An empty or invalid path, or a `.env` file, is explained and asked again; an existing file is only replaced after you confirm. Answering `n`, or ending input, saves nothing.
 
-`refactor` prints a unified diff and writes the file only after you answer `y`.
+`refactor` works on any UTF-8 text file. It tells Gemini the file's format from its extension (C and C++ files as `C++`, otherwise for example `py` or `yaml`, and `plain text` for files without an extension), prints a unified diff, and writes the file only after you answer `y`. Binary or non-UTF-8 files are refused before anything is sent to Gemini.
 
 ### Starting the GUI
 
@@ -330,16 +341,16 @@ The top of the page switches between two modes, **Generate** and **Refactor**. T
 
 * **Open a file to edit it in place** (in Refactor mode).
   * Type its path in *Source file* and select *Open path* (or press Enter). Both WSL paths (`/mnt/d/project/insertion_sort.cpp`) and Windows paths (`D:\project\insertion_sort.cpp`, `\\wsl.localhost\Ubuntu\home\me\x.cpp`) work; under WSL the backend translates Windows paths.
-  * Alternatively, select *Choose source path* to pick the file in a native dialog. It uses zenity when installed; under WSL without zenity it opens a Windows file dialog through `powershell.exe`, which may appear behind the browser. If no dialog is available, the page says so and focuses the path field.
+  * Alternatively, select *Choose source path* to pick the file in a native dialog. It shows all files by default, with a C/C++ filter still available. It uses zenity when installed; under WSL without zenity it opens a Windows file dialog through `powershell.exe`, which may appear behind the browser. If no dialog is available, the page says so and focuses the path field.
   * The editor heading shows the file name. A `●` and *Unsaved changes* mark edits that are not yet on disk. A new document is shown as `untitled.cpp`.
 * **Save** (or Ctrl+S) writes the editor back to the file you opened, atomically. Its read/write/execute permission bits are kept; setuid, setgid, and sticky bits are cleared.
   * If the file changed on disk since you opened or last saved it (for example, you saved it in VS Code), Save asks before overwriting. *Reload* re-reads the file from disk.
   * Opening another file, reloading, or uploading over unsaved edits asks for confirmation first.
 * **Save As** asks for a filename and writes it to the active output directory, asking before replacing an existing file. Once the backend confirms the save, the editor *is* the new file: its name, the *Source file* path, Save, Reload, and change detection all use the new path. The original file is not modified. If the save fails or you cancel, the editor keeps the current file. If the saved file cannot be reopened for in-place saving, the page says so; open it by path to keep editing it.
-* *Open file in editor* loads a copy through the browser file picker. Browsers do not reveal where such a file lives, so it can only be written with Save As.
+* *Open file in editor* loads a copy through the browser file picker. Browsers do not reveal where such a file lives, so it can only be written with Save As. The page refuses `.env` files and files that are binary or not UTF-8 text.
 * **Resend prompt**, next to the submit button, sends your last prompt to Gemini again exactly as it was submitted (same instruction, language, and mode), through the same request as the submit button. The reply appears as a new exchange below the earlier ones. It is disabled until a prompt has been sent and while a request is running; it also retries a request that failed. A resent refactoring works on the current editor contents, and like any request it waits until a pending proposal has been accepted or rejected. The prompt field is left as it is, so a draft you are typing is kept.
 * *Copy* copies the current editor text. The button shows *Copied!* with a check mark for about 2 seconds once the copy succeeded. It uses the Clipboard API and falls back to the browser's copy command; if both fail, the button keeps saying *Copy* and the failure is reported next to the editor.
-* **Generate:** enter a language and an instruction, then select *Generate code*. Gemini's output is shown for review.
+* **Generate:** enter a language or format (for example `C++`, `Python`, `YAML`, `SQL`) and an instruction, then select *Generate code*. Gemini's output is shown for review.
   * *Accept* puts it into the editor (replacing the editor contents) to edit and save with Save or Save As.
   * *Reject* discards it.
 * **Refactor:** with code in the editor, switch to *Refactor* and describe the change. The backend creates a **proposal**. Select *Review changes* to load the unified diff, colored like `git diff`: removed lines red, added lines green, headers blue.
@@ -348,7 +359,7 @@ The top of the page switches between two modes, **Generate** and **Refactor**. T
   * *Reject* leaves the editor and the files on disk unchanged.
 * **Save As** writes `<active output directory>/<filename>`.
   * The output directory defaults to the launch directory. Type a WSL or Windows path and select *Set directory*, or use *Choose output directory* for a native dialog. The backend accepts only existing, writable directories, and the active directory is always displayed.
-  * Filenames must be plain names with a supported extension (see [Supported files](#supported-files)). Paths and `..` are rejected.
+  * Filenames must be plain names; any extension is allowed and kept exactly (see [Supported files](#supported-files)). Paths, `..`, and `.env` files are rejected.
   * Replacing an existing file always asks for confirmation.
   * Writes are atomic: the content goes to a temporary file that is then renamed into place.
   * Buttons are disabled while a request is in flight, so double clicks cannot approve or save twice.
@@ -357,7 +368,16 @@ The top of the page switches between two modes, **Generate** and **Refactor**. T
 
 #### Supported files
 
-The backend opens, saves in place, and writes only C and C++ source files: `.c .cc .cpp .cxx .h .hh .hpp .hxx`. It enforces this on every open and save; the page no longer lists the extensions, and *Open file in editor* checks the same list before loading a file. Files are limited to 512 KiB of UTF-8 text.
+CodeAgent opens, saves in place, and writes **text files of any extension**: source code (`.cpp`, `.py`, `.js`, `.ts`, …), markup and data (`.html`, `.css`, `.json`, `.yaml`, `.toml`, `.csv`, `.sql`, `.md`), configuration and logs (`.ini`, `.conf`, `.log`, `.env.example`), files without an extension, and user-defined extensions. There is no extension allowlist; whether a file can be edited is decided by its content:
+
+| Content | Result |
+| --- | --- |
+| UTF-8 text, including an optional byte-order mark, and empty files | Opened and saved byte for byte: indentation, trailing spaces, Unicode, and LF or CRLF line endings are kept. |
+| Binary data (contains a NUL byte) | Refused with `UNSUPPORTED_ENCODING` (GUI) or `is binary or not UTF-8 text` (CLI). The file is not changed. |
+| Other encodings (UTF-16, Latin-1, invalid or truncated UTF-8) | Refused the same way, never silently re-encoded. |
+| `.env` and `.env.<name>` (for example `.env.local`) | Never opened, sent to Gemini, or written, because they can hold the API key. Templates ending in `.example`, `.sample`, or `.template` are allowed. |
+
+The same rules apply in the terminal, in the GUI backend on every open and save, and in *Open file in editor*. GUI files are limited to 512 KiB. The original filename and extension are always kept; CodeAgent never appends `.cpp` or any other extension.
 
 #### Editing the same file in VS Code
 
@@ -376,6 +396,8 @@ Every failure that the user can act on is thrown as a subclass of `CodeAgentErro
 | Gemini 5xx | `Gemini is temporarily unavailable. Retry in a moment.` |
 | No write permission | `Permission denied: CodeAgent cannot access this file. …` (GUI) / `Permission denied: CodeAgent cannot write to <path>. …` (CLI) |
 | File changed since it was opened | `The file changed externally. Reload it or save to another path.` |
+| Binary or non-UTF-8 file | `The file is binary or not valid UTF-8 text, so it cannot be edited. It was not changed.` (GUI) / `Error: <path> is binary or not UTF-8 text. …` (CLI) |
+| `.env` file | `… is an environment file that can hold API keys, so CodeAgent does not write it. Choose another file name.` |
 
 The design, the propagation paths, and the RAII resource handling are described in [docs/project-report.md](docs/project-report.md#7-exception-handling-design).
 
@@ -383,7 +405,7 @@ The design, the propagation paths, and the RAII resource handling are described 
 
 Security rules the implementation follows:
 
-* API keys are never committed (`.env` and `.codeagent/` are git-ignored), printed, logged, or sent to the browser.
+* API keys are never committed (`.env` and `.codeagent/` are git-ignored), printed, logged, or sent to the browser. `.env` and `.env.<name>` files cannot be opened, refactored, or overwritten through CodeAgent, so their contents never reach the editor or Gemini.
 * Diagnostics are passed through `redactSecrets`, which removes the configured key, Google-style keys, and key-carrying URL parameters and headers.
 * Gemini's free-text error messages are never shown or logged; only validated, structured fields (status, reason, quota identifiers, retry delay) are.
 * Source files and LLM responses are treated as untrusted input; generated code is never executed and is rendered in the browser as text, never as HTML.
@@ -398,7 +420,7 @@ Every API request must also carry a `Host` of `127.0.0.1:<port>` or `localhost:<
 
 **Limits of this protection.** The token stops other websites and other local users' processes from using the API, as long as they cannot read your files or memory. It does not protect against malicious software running as your own user. Such software can read the browser's memory or profile, the terminal output, or attach to the server process. The bootstrap code is passed to the browser launcher on its command line, where other local users can briefly see it in the process list until the page uses it. It is also printed when no browser can be opened. Both cases are limited by the code being single-use and expiring after 5 minutes.
 
-**File access.** The backend reads a file only when the user explicitly opens it by path or through the dialog (`POST /api/files/read`). Only regular files with a supported source extension, up to 512 KiB of UTF-8 text, are accepted. Symbolic links must resolve to a supported source file. The size limit is enforced while reading, so a file that grows after the check cannot be read beyond it, and FIFOs and devices are refused without blocking. The 256 most recently opened or saved files can be saved in place; beyond that, the least recently used one must be opened again. It writes back in place only to files opened that way in the current session (`POST /api/files/write`), checking that the file has not changed since; every other write goes through the output-directory rules above. Settings is a disabled placeholder.
+**File access.** The backend reads a file only when the user explicitly opens it by path or through the dialog (`POST /api/files/read`). Only regular files of up to 512 KiB of UTF-8 text are accepted, whatever their extension; binary content, other encodings, and `.env` files are refused. A symbolic link is resolved to its target, which must itself be an acceptable file, so a link to a `.env` file is refused too, and saving never writes through a symbolic link. The size limit is enforced while reading, so a file that grows after the check cannot be read beyond it, and FIFOs and devices are refused without blocking. The 256 most recently opened or saved files can be saved in place; beyond that, the least recently used one must be opened again. It writes back in place only to files opened that way in the current session (`POST /api/files/write`), checking that the file has not changed since; every other write goes through the output-directory rules above. Settings is a disabled placeholder.
 
 **Proposals.** The backend retains at most 128 proposals and in-flight creation reservations combined. Refactor capacity is reserved before provider work begins. Proposals are only removed when a new one needs the slot. The backend then picks one in this order:
 
@@ -408,6 +430,25 @@ Every API request must also carry a `Host` of `127.0.0.1:<port>` or `localhost:<
 Proposals reserved for another in-flight request are skipped. The choice is made, and checked again when the new proposal is stored, under the same lock that every proposal request and the proposal save hold. A proposal is therefore never removed while it is being saved or changing state. If a proposal reserved for replacement was used again while Gemini was working, another eligible proposal is replaced instead, or the request fails. If no slot is available, the request receives `503 PROPOSAL_CAPACITY`, without invoking the provider when this is known up front. An idle proposal stays fully usable until it is actually replaced. Failed provider or response-preparation work releases its reservation and keeps the proposal selected for replacement.
 
 **Native dialogs.** On POSIX systems, native dialogs use `zenity` when it is installed and a graphical `DISPLAY` or `WAYLAND_DISPLAY` exists. Under WSL without zenity, they use a Windows Forms dialog started through `powershell.exe`, and the returned Windows path is translated to its WSL path. Dialogs time out after 2 minutes. A native Windows build reports dialogs unavailable. macOS has no native dialog integration. Automated tests cover dialog outcomes through an injected provider. The WSL PowerShell dialog has not been exercised with a real click in automated testing; only its launch, path translation, and script syntax have been verified.
+
+## Contributing Guidelines
+
+* **Report bugs** and request features in [GitHub Issues](https://github.com/LalitAdithya1/LLM-CLI-Copilot-Integration/issues). Include the command or GUI steps, the exact error message, and your platform. Never paste your API key or the contents of a `.env` file.
+* **Submit changes** as a pull request from a feature branch against `main`. Keep each pull request focused on one change, and use the commit style already in the history (`feat(gui): …`, `fix: …`, `docs: …`).
+* **Run the tests** before opening a pull request, and add tests for new behaviour:
+
+  ```bash
+  cmake --build build -j2
+  ctest --test-dir build --output-on-failure
+  node --test frontend/tests/*.test.mjs
+  git diff --check
+  ```
+
+  The tests need no network access and no API key (see [Build and test (development)](#build-and-test-development)).
+
+## License
+
+CodeAgent is released under the [MIT License](LICENSE.md). Copyright (c) 2026 Lalitadithya Kariyam and Samuel John Dasi.
 
 ## Credits / Contact
 
@@ -419,5 +460,3 @@ CodeAgent was built by:
 Source code, issues, and questions: [github.com/LalitAdithya1/LLM-CLI-Copilot-Integration](https://github.com/LalitAdithya1/LLM-CLI-Copilot-Integration).
 
 Built with [Google Gemini](https://ai.google.dev/), [cpp-httplib](https://github.com/yhirose/cpp-httplib), [nlohmann/json](https://github.com/nlohmann/json), [libcurl](https://curl.se/libcurl/), and [GoogleTest](https://github.com/google/googletest).
-
-**License:** released under the [MIT License](LICENSE).
