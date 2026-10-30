@@ -1,13 +1,13 @@
 # UML diagrams
 
 These diagrams show the main parts of CodeAgent and how its generation and
-refactoring flows work. Read them from top to bottom: the class diagram shows
+refactoring flows work. Read them from top to bottom: the class diagrams show
 the code structure, sequence diagrams show messages in time order, and the
 state diagram shows the life of a GUI refactoring proposal.
 
 ## How to read these diagrams
 
-- In the class diagram, `+` means public and `-` means private. A solid
+- In the class diagrams, `+` means public and `-` means private. A solid
   inheritance arrow points to the parent class; a dashed implementation arrow
   points to the interface being implemented. A dashed dependency arrow means
   one part uses another. `<<utility>>` marks a group of utility functions.
@@ -20,11 +20,19 @@ state diagram shows the life of a GUI refactoring proposal.
   `UI` refers to the browser frontend and `API` to the local HTTP server.
   `<<std>>` marks a C++ standard library class.
 
-## Class diagram
+## Class diagrams
 
-This is a map of the main C++ types. It highlights who is responsible for
-commands, files, prompts, model requests, GUI requests, and errors. It leaves
-out small helpers and detailed method parameters to keep the map readable.
+The C++ types are shown in two views so each stays readable:
+
+1. **Application classes**: who is responsible for commands, files,
+   prompts, model requests and GUI requests, and how they depend on each
+   other.
+2. **Error hierarchy**: the exception classes every part uses to report
+   failures.
+
+Both views leave out small helpers and detailed method parameters.
+
+### View 1: Application classes
 
 `TextFile` holds the shared file policy used by both the CLI and the GUI:
 files of any extension can be edited if their content is UTF-8 text, but
@@ -34,6 +42,9 @@ hold the API key.
 `GuiHttpServer` does not call `PromptBuilder` or `LLMClient` itself. It is
 given generation and refactoring handlers, and those handlers (defined next to
 `CLIController`, which starts the server) build the prompt and call the model.
+
+`CodeAgentError` appears here as one box to show who throws and who reports
+errors; its subclasses are in View 2.
 
 ```mermaid
 classDiagram
@@ -119,6 +130,41 @@ classDiagram
         +setClock(clock) bool
     }
 
+    class CodeAgentError {
+        <<abstract>>
+    }
+
+    NativeDialogProvider <|.. SystemNativeDialogProvider : implements
+
+    CLIController ..> FileManager : uses
+    CLIController ..> PromptBuilder : uses
+    CLIController ..> LLMClient : uses
+    CLIController ..> UnifiedDiff : uses
+    CLIController ..> GuiHttpServer : starts and supplies handlers
+
+    FileManager ..> TextFile : checks file name and content
+    GuiHttpServer ..> TextFile : checks file name and content
+    GuiHttpServer ..> UnifiedDiff : computes diff
+    GuiHttpServer ..> NativeDialogProvider : uses
+    LLMClient ..> ResponseParser : parses responses
+
+    LLMClient ..> CodeAgentError : throws
+    CLIController ..> CodeAgentError : reports in the terminal
+    GuiHttpServer ..> CodeAgentError : reports as JSON errors
+```
+
+### View 2: Error hierarchy
+
+Every failure CodeAgent reports is a `CodeAgentError`. It is abstract:
+`code()` and `httpStatus()` are pure virtual, and each subclass overrides
+them, so the CLI and the GUI server can report any error without knowing its
+concrete type. Catching a parent class also catches its children; for
+example, catching `NetworkError` also catches `TimeoutError`.
+
+```mermaid
+classDiagram
+    direction TB
+
     class runtime_error {
         <<std>>
         +what() const char*
@@ -189,7 +235,6 @@ classDiagram
         +code() const char*
     }
 
-    NativeDialogProvider <|.. SystemNativeDialogProvider : implements
     runtime_error <|-- CodeAgentError : inherits
     CodeAgentError <|-- ConfigurationError : inherits
     CodeAgentError <|-- FileError : inherits
@@ -203,18 +248,6 @@ classDiagram
     ProviderError <|-- NetworkError : inherits
     NetworkError <|-- TimeoutError : inherits
     ProviderError <|-- ProviderResponseError : inherits
-
-    CLIController ..> FileManager : uses
-    CLIController ..> PromptBuilder : uses
-    CLIController ..> LLMClient : uses
-    CLIController ..> UnifiedDiff : uses
-    CLIController ..> GuiHttpServer : starts and supplies handlers
-
-    FileManager ..> TextFile : checks file name and content
-    GuiHttpServer ..> TextFile : checks file name and content
-    GuiHttpServer ..> UnifiedDiff : computes diff
-    GuiHttpServer ..> NativeDialogProvider : uses
-    LLMClient ..> ResponseParser : parses responses
 ```
 
 ## CLI code generation
