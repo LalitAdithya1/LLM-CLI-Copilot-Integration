@@ -1,8 +1,0 @@
-/* Passed to Mermaid as themeCSS (mmdc -C) when exporting PDFs for the report.
-   Chrome rasterises elements that use SVG filters when printing to PDF, so
-   filters (drop shadows) are switched off to keep every diagram vector. */
-* { filter: none !important; }
-
-/* Mermaid draws some long dependency edges with one huge dash, which renders
-   them solid; force a regular dash so ..> stays visibly dashed. */
-.edge-pattern-dashed { stroke-dasharray: 2 2 !important; }
