@@ -10,6 +10,7 @@
 \usepackage{xcolor}
 \usepackage{listings}
 \usepackage{microtype}
+\usepackage{needspace}
 
 \geometry{margin=1in}
 
@@ -40,6 +41,7 @@
   stringstyle=\color{red!60!black},
   numbers=left, numberstyle=\tiny\color{gray}, numbersep=6pt,
   frame=single, rulecolor=\color{gray!60},
+  xleftmargin=3.4pt, xrightmargin=3.4pt,
   breaklines=true, breakatwhitespace=false,
   showstringspaces=false, tabsize=4, columns=fullflexible,
   captionpos=b, upquote=true
@@ -47,16 +49,40 @@
 \lstdefinestyle{codeagentplain}{
   basicstyle=\ttfamily\footnotesize,
   frame=single, rulecolor=\color{gray!60},
+  xleftmargin=3.4pt, xrightmargin=3.4pt,
   breaklines=true, showstringspaces=false, columns=fullflexible,
   captionpos=b, upquote=true
+}
+% Sets \codeagentFile to #1, or to report/#1 for builds run from the project
+% root (e.g. Overleaf); leaves it empty if neither exists.
+\newcommand{\codeagentFind}[1]{%
+  \def\codeagentFile{}%
+  \IfFileExists{#1}{\def\codeagentFile{#1}}%
+    {\IfFileExists{report/#1}{\def\codeagentFile{report/#1}}{}}%
 }
 % Inserts a screenshot if the file exists; otherwise draws a labelled
 % placeholder box so the chapter always compiles.
 \newcommand{\codeagentShot}[3][0.6]{%
-  \IfFileExists{#2}%
-    {\includegraphics[width=0.95\linewidth,height=#1\textheight,keepaspectratio]{#2}}%
-    {\fbox{\parbox[c][4.5cm][c]{0.9\linewidth}{\centering\small
-      \textbf{Screenshot placeholder}\\[4pt] \texttt{#2}\\[4pt] #3}}}%
+  \codeagentFind{#2}%
+  \ifx\codeagentFile\empty
+    \fbox{\parbox[c][4.5cm][c]{0.9\linewidth}{\centering\small
+      \textbf{Screenshot placeholder}\\[4pt] \texttt{#2}\\[4pt] #3}}%
+  \else
+    \includegraphics[width=0.95\linewidth,height=#1\textheight,keepaspectratio]{\codeagentFile}%
+  \fi
+}
+% UML diagrams are vector PDFs rendered from UML-diagrams.md by
+% report/uml/export-uml.sh. A missing diagram is an error, never a placeholder.
+% Optional #1: extra \includegraphics keys (e.g. trim/clip); #2 is the
+% maximum width, #3 the maximum height, #4 the file.
+\newcommand{\codeagentUml}[4][]{%
+  \codeagentFind{#4}%
+  \ifx\codeagentFile\empty
+    \PackageError{CodeAgent}{UML diagram #4 not found}%
+      {Run report/uml/export-uml.sh to render it from UML-diagrams.md.}%
+  \else
+    \includegraphics[#1,width=#2,height=#3,keepaspectratio]{\codeagentFile}%
+  \fi
 }
 % Float placement for this chapter: fewer half-empty float pages. The
 % previous values are restored at the end of the chapter.
@@ -72,7 +98,23 @@
 \renewcommand{\floatpagefraction}{0.8}
 \setcounter{topnumber}{3}
 \setcounter{totalnumber}{5}
+% A float alone on a float page starts at the top of the page instead of
+% being centred, e.g. the last float before a \clearpage.
+\makeatletter
+\edef\codeagentOldFptop{\the\@fptop}
+\setlength{\@fptop}{0pt}
+\makeatother
+% Monospace identifiers have fixed-width spaces, so lines full of \texttt
+% cannot stretch and overflowed. A higher tolerance plus emergency stretch
+% lets TeX set those paragraphs slightly loose instead; paragraphs that
+% already fit at the default tolerance are unaffected.
+\edef\codeagentOldEmergencystretch{\the\emergencystretch}
+\edef\codeagentOldTolerance{\the\tolerance}
+\setlength{\emergencystretch}{3em}
+\tolerance=2000
 
+% Problem statement 14: \chapter steps the counter, so this is chapter 14.
+\setcounter{chapter}{13}
 \chapter[CodeAgent: An LLM-Powered C++ Coding Copilot]{CodeAgent: An LLM-Powered C++ Coding Copilot with CLI and Browser GUI}
 \chapterauthor{Lalitadithya Kariyam (251130) \\ Samuel John (251118)}
 
@@ -291,6 +333,7 @@ CodeAgent is a \textbf{single executable} built in three layers:
     (failure model) and \texttt{NativeDialog\allowbreak{}Provider} (OS dialogs).
 \end{description}
 
+\Needspace{\dimexpr\baselineskip*1745/100\relax}% 15 code lines
 \begin{lstlisting}[style=codeagentplain,caption={Layered architecture of CodeAgent},label={lst:ca-arch}]
  Terminal user                          Browser user (frontend/js/app.js, api.js)
       |                                        |  HTTP + JSON + X-CodeAgent-Token
@@ -337,7 +380,7 @@ each.
 \texttt{GuiHttpServer} (+ \texttt{Impl}) & Local HTTP API, session security, proposal store, GUI file I/O & \texttt{GuiHttpServer.hpp/\allowbreak{}.cpp} \\ \hline
 \texttt{NativeDialog\allowbreak{}Provider} (abstract) and \texttt{SystemNative\allowbreak{}DialogProvider} & Interface and implementation for OS file and folder pickers & \texttt{NativeDialog.hpp/\allowbreak{}.cpp} \\ \hline
 \texttt{CodeAgentError} (abstract) + 12 subclasses & Typed, safe failure model with \texttt{code()} and \texttt{httpStatus()} & \texttt{CodeAgentError.hpp/\allowbreak{}.cpp} \\ \hline
-Data types: \texttt{ParsedResponse}, \texttt{ProviderError\allowbreak{}Details}, \texttt{GenerationResult}, \texttt{NativeDialogResult}, \texttt{PendingProposal} & Plain structures that carry results between classes & various \\ \hline
+Data types: \texttt{ParsedResponse}, \texttt{ProviderError\allowbreak{}Details}, \texttt{GenerationResult}, \texttt{NativeDialog\allowbreak{}Result}, \texttt{PendingProposal} & Plain structures that carry results between classes & various \\ \hline
 \end{tabular}
 \caption{Primary classes and responsibilities}
 \label{tab:ca-classes}
@@ -353,6 +396,7 @@ Data types: \texttt{ParsedResponse}, \texttt{ProviderError\allowbreak{}Details},
     same interface.
 \end{itemize}
 
+\Needspace{\dimexpr\baselineskip*1745/100\relax}% 15 code lines
 \begin{lstlisting}[style=codeagentplain,caption={Exception inheritance hierarchy (is-a relationships)},label={lst:ca-hier}]
 std::runtime_error
  +-- CodeAgentError                  <<abstract>>  code(), httpStatus() pure virtual
@@ -412,6 +456,7 @@ write paths (\texttt{saveFile}, \texttt{writeFile}) always call the private
 \texttt{requestOverwritePermission} before the private
 \texttt{writeAtomically}.
 
+\Needspace{\dimexpr\baselineskip*2658/100\relax}% 26 code lines
 \begin{lstlisting}[style=codeagentcpp,caption={Access modifiers in \texttt{FileManager} (abridged)},label={lst:ca-fm}]
 class FileManager {
 public:
@@ -476,6 +521,7 @@ pure virtual, so it cannot be instantiated. Each concrete subclass overrides
 them, and \texttt{final} prevents further derivation where that would be
 meaningless.
 
+\Needspace{\dimexpr\baselineskip*1994/100\relax}% 18 code lines
 \begin{lstlisting}[style=codeagentcpp,caption={Abstract base class and an overriding subclass},label={lst:ca-virtual}]
 class CodeAgentError : public std::runtime_error {
 public:
@@ -502,6 +548,7 @@ The HTTP server converts \emph{any} error into a JSON response with one
 function and no type checks. Adding a new error class requires no change here
 (the open/closed principle):
 
+\Needspace{\dimexpr\baselineskip*915/100\relax}% 5 code lines
 \begin{lstlisting}[style=codeagentcpp,caption={One handler for every error type through virtual calls},label={lst:ca-dispatch}]
 void respondWithError(httplib::Response& response, const CodeAgentError& error) {
     logError(std::cerr, error);                       // redacted diagnostic -> terminal
@@ -515,6 +562,7 @@ Catching by base-class reference is polymorphic too.
 \texttt{CLIController::\allowbreak{}run} catches every project error with one
 \texttt{catch (const CodeAgentError\&)}.
 
+\Needspace{\dimexpr\baselineskip*1496/100\relax}% 12 code lines
 \paragraph{Interface polymorphism.}
 \begin{lstlisting}[style=codeagentcpp,caption={Interface with a virtual destructor and two implementations},label={lst:ca-iface}]
 class NativeDialogProvider {
@@ -549,7 +597,7 @@ component replaceable and lets all tests run offline (requirement R8).
 \begin{tabular}{|p{2.9cm}|p{3.6cm}|p{3.6cm}|p{3.6cm}|}
 \hline
 \textbf{Class} & \textbf{Injected dependency} & \textbf{Production} & \textbf{Test} \\ \hline
-\texttt{LLMClient} & \texttt{HttpTransport} (\texttt{std::\allowbreak{}function}) & libcurl \texttt{performHttpRequest} & lambda returning canned JSON \\ \hline
+\texttt{LLMClient} & \texttt{HttpTransport} (\texttt{std::\allowbreak{}function}) & libcurl \texttt{performHttp\allowbreak{}Request} & lambda returning canned JSON \\ \hline
 \texttt{CLIController} & \texttt{LLMCall}, streams, \texttt{GuiCommand} & \texttt{LLMClient}, \texttt{cin}/\texttt{cout}/\texttt{cerr} & fake LLM, string streams \\ \hline
 \texttt{GuiHttpServer} & handlers, \texttt{NativeDialog\allowbreak{}Provider}, clock & lambdas calling the core, zenity provider, \texttt{steady\_clock} & fakes, scripted provider, fake clock \\ \hline
 \texttt{FileManager} & streams & terminal & string streams \\ \hline
@@ -607,48 +655,55 @@ GuiHttpServer & Dependency & makeUnifiedDiff, CodeAgentError & uses \\ \hline
 \label{tab:ca-uml-rel}
 \end{table}
 
+% The large sequence diagrams fill about two thirds of a page; allow them a
+% float page of their own instead of drifting on top of the next section's
+% listings. Reset to the chapter value after those listings (Section 14.8.2).
+\renewcommand{\floatpagefraction}{0.6}
+% Both class-diagram views are wide (horizontal) diagrams on normal portrait
+% pages. Each is the complete Mermaid PDF, centred and scaled proportionally
+% (keepaspectratio) to the largest size that fits; like the original
+% view 1, they may extend into the side margins to gain width.
 \begin{figure}[htbp]
 \centering
-% The diagram is much wider than tall, so it is allowed to extend into the
-% side margins (nearly the full paper width), centred on the page.
-\IfFileExists{screenshots/uml-class.png}%
-  {\makebox[\linewidth][c]{\includegraphics[width=\dimexpr\paperwidth-1.5cm\relax]{screenshots/uml-class.png}}}%
-  {\codeagentShot{screenshots/uml-class.png}{Class diagram, view 1}}
+\makebox[\linewidth][c]{\codeagentUml{\dimexpr\paperwidth-1.5cm\relax}{0.75\textheight}{screenshots/uml-class.pdf}}
 \caption{UML class diagram, view 1: application classes and their dependencies}
 \label{fig:ca-uml-class}
 \end{figure}
 
 \begin{figure}[htbp]
 \centering
-\codeagentShot{screenshots/uml-errors.png}{Class diagram, view 2}
+\makebox[\linewidth][c]{\codeagentUml{\dimexpr\paperwidth-1.5cm\relax}{0.75\textheight}{screenshots/uml-errors.pdf}}
 \caption{UML class diagram, view 2: the \texttt{CodeAgentError} exception hierarchy}
 \label{fig:ca-uml-errors}
 \end{figure}
 
 \begin{figure}[htbp]
 \centering
-\codeagentShot{screenshots/uml-seq-cli-generate.png}{CLI code generation sequence}
+\codeagentUml{\linewidth}{0.6\textheight}{screenshots/uml-seq-cli-generate.pdf}
 \caption{UML sequence diagram: CLI code generation with optional save}
 \label{fig:ca-uml-seq-gen}
 \end{figure}
 
-\begin{figure}[htbp]
+% The two dense sequence diagrams may extend into the side margins (as the
+% class diagram did originally). This one fills most of a page, so it gets a
+% float page of its own rather than sitting above an unbreakable listing.
+\begin{figure}[p]
 \centering
-\codeagentShot{screenshots/uml-seq-cli-refactor.png}{CLI refactoring sequence}
+\makebox[\linewidth][c]{\codeagentUml{\dimexpr\paperwidth-1.5cm\relax}{0.85\textheight}{screenshots/uml-seq-cli-refactor.pdf}}
 \caption{UML sequence diagram: CLI refactoring with diff and approval}
 \label{fig:ca-uml-seq-cli}
 \end{figure}
 
 \begin{figure}[htbp]
 \centering
-\codeagentShot{screenshots/uml-seq-gui-refactor.png}{GUI refactoring sequence}
+\makebox[\linewidth][c]{\codeagentUml{\dimexpr\paperwidth-1.5cm\relax}{0.85\textheight}{screenshots/uml-seq-gui-refactor.pdf}}
 \caption{UML sequence diagram: GUI refactoring proposal lifecycle}
 \label{fig:ca-uml-seq-gui}
 \end{figure}
 
 \begin{figure}[htbp]
 \centering
-\codeagentShot[0.42]{screenshots/uml-state.png}{Proposal state diagram}
+\codeagentUml{0.75\linewidth}{0.45\textheight}{screenshots/uml-state.pdf}
 \caption{UML state diagram: refactoring proposal states}
 \label{fig:ca-uml-state}
 \end{figure}
@@ -670,6 +725,7 @@ Errors are \emph{thrown} as typed exceptions at the point of failure and
     failure becomes a JSON error and the server keeps running).
 \end{itemize}
 
+\Needspace{\dimexpr\baselineskip*2243/100\relax}% 21 code lines
 \begin{lstlisting}[style=codeagentcpp,caption={Throwing typed exceptions from HTTP status codes (\texttt{LLMClient.cpp}, abridged)},label={lst:ca-throw}]
 [[noreturn]] void throwHttpError(long httpStatus, const std::string& responseBody,
                                  const std::string& model) {
@@ -694,6 +750,7 @@ Errors are \emph{thrown} as typed exceptions at the point of failure and
 }
 \end{lstlisting}
 
+\Needspace{\dimexpr\baselineskip*1745/100\relax}% 15 code lines
 \begin{lstlisting}[style=codeagentcpp,caption={The CLI error boundary: catch from most specific to most general},label={lst:ca-catch}]
 int CLIController::run(int argc, char* argv[]) {
     try {
@@ -728,6 +785,7 @@ Advanced exception techniques used:
     through \texttt{redactSecrets}, so no catch site can leak the API key.
 \end{itemize}
 
+\renewcommand{\floatpagefraction}{0.8}
 \subsection{Memory and Resource Management (RAII and Smart Pointers)}
 
 The code base contains \textbf{no raw \texttt{new} or \texttt{delete}}. Every
@@ -743,15 +801,16 @@ that destructors run on every exit path, including exceptions.
 \texttt{std::\allowbreak{}unique\_ptr<curl\_slist, CurlHeaderListDeleter>} & libcurl header list & \texttt{LLMClient.cpp} \\ \hline
 \texttt{TemporaryFileGuard} & temporary file on disk & \texttt{FileManager.cpp} \\ \hline
 \texttt{FileDescriptor} & POSIX file descriptor & \texttt{GuiHttpServer.cpp} \\ \hline
-\texttt{ProposalCapacityReservation} & reserved proposal slot & \texttt{GuiHttpServer.cpp} \\ \hline
+\texttt{ProposalCapacity\allowbreak{}Reservation} & reserved proposal slot & \texttt{GuiHttpServer.cpp} \\ \hline
 \texttt{std::\allowbreak{}lock\_guard<std::\allowbreak{}mutex>} & mutex lock & \texttt{GuiHttpServer.cpp} \\ \hline
 \texttt{std::\allowbreak{}unique\_ptr<Impl>} + destructor calling \texttt{stop()} & server socket and listener thread & \texttt{GuiHttpServer.cpp} \\ \hline
-\texttt{std::\allowbreak{}shared\_ptr<NativeDialogProvider>} & shared dialog provider & \texttt{GuiHttpServer.hpp} \\ \hline
+\texttt{std::\allowbreak{}shared\_ptr<\allowbreak{}NativeDialog\allowbreak{}Provider>} & shared dialog provider & \texttt{GuiHttpServer.hpp} \\ \hline
 \end{tabular}
 \caption{RAII and smart-pointer ownership}
 \label{tab:ca-raii}
 \end{table}
 
+\Needspace{\dimexpr\baselineskip*1828/100\relax}% 16 code lines
 \begin{lstlisting}[style=codeagentcpp,caption={A scope guard: the temporary file is removed on any failure path},label={lst:ca-guard}]
 class TemporaryFileGuard {
 public:
@@ -817,6 +876,7 @@ its dependencies, choosing template arguments to model ownership and policy:
 \begin{itemize}
   \item \textbf{Function-call operator} \texttt{operator()} is overloaded to
     create function objects (functors) that act as custom deleters:
+\Needspace{\dimexpr\baselineskip*1164/100\relax}% 8 code lines
 \begin{lstlisting}[style=codeagentcpp,caption={Overloaded \texttt{operator()} used as a smart-pointer deleter},label={lst:ca-functor}]
 struct CurlEasyDeleter {
     void operator()(CURL* handle) const noexcept { curl_easy_cleanup(handle); }
@@ -850,7 +910,8 @@ using CurlHeaderList = std::unique_ptr<curl_slist, CurlHeaderListDeleter>;
     thread-safely.
   \item Ctrl+C is handled with a \texttt{volatile std::\allowbreak{}sig\_atomic\_t} flag,
     the only async-signal-safe way to communicate with the main loop.
-  \item Tests prove correctness under contention:
+  \item \raggedright % last item: two long test names cannot be justified
+    Tests prove correctness under contention:
     \texttt{ConcurrentApprovalAndRejectionHaveOneWinner} and
     \texttt{ConcurrentRefactorsCannotOverbookLastCapacitySlot}.
 \end{itemize}
@@ -909,6 +970,7 @@ The browser and the C++ server communicate with JSON over HTTP on
     rebinding), the Origin header (against other websites) and the token.
 \end{enumerate}
 
+\Needspace{\dimexpr\baselineskip*1911/100\relax}% 17 code lines
 \begin{lstlisting}[style=codeagentplain,caption={The single HTTP function of the frontend (\texttt{frontend/js/api.js}, abridged)},label={lst:ca-fetch}]
 async function requestJson(path, { method = 'GET', body, session = false } = {}) {
   const options = { method, headers: { Accept: 'application/json' } };
@@ -1001,7 +1063,7 @@ single format: \texttt{\{"error":\{"code":...,\allowbreak{}"message":...\}\}}.
   \item It builds the JSON body
     \texttt{\{"contents":[\{"parts":[\{"text": prompt\}]\}]\}}.
   \item It POSTs to
-    \texttt{https:/\allowbreak{}/\allowbreak{}generativelanguage.googleapis.com/\allowbreak{}v1beta/\allowbreak{}models/\allowbreak{}gemini-3.5-flash:generateContent}
+    \url{https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent}
     through libcurl:
     \begin{itemize}
       \item the key is sent in the \texttt{x-goog-api-key} header, never in
@@ -1082,6 +1144,7 @@ extensions off) and warnings (\texttt{-Wall -Wextra -Wpedantic}).
     \texttt{codeagent} works from any folder.
 \end{itemize}
 
+\Needspace{\dimexpr\baselineskip*1247/100\relax}% 9 code lines
 \begin{lstlisting}[style=codeagentplain,caption={Build, test and run},label={lst:ca-build}]
 cmake -S . -B build
 cmake --build build
@@ -1177,18 +1240,21 @@ Hardening (28--29 Oct) & Integration merge (\texttt{bfa1bad}), UML diagrams, REA
 
 \begin{figure}[htbp]
 \centering
-\begin{minipage}[t]{0.49\linewidth}\centering
-\codeagentShot{screenshots/cli-generated-file.png}{Saved generated file}\\[2pt]
+% The two screenshots are stacked at full width so both stay readable.
+\begin{minipage}[t]{\linewidth}\centering
+\codeagentShot[0.45]{screenshots/cli-generated-file.png}{Saved generated file}\\[2pt]
 \small (a) \texttt{text.cpp} saved by \texttt{generate}
-\end{minipage}\hfill
-\begin{minipage}[t]{0.49\linewidth}\centering
-\codeagentShot{screenshots/cli-refactored-file.png}{Refactored file}\\[2pt]
+\end{minipage}\\[10pt]
+\begin{minipage}[t]{\linewidth}\centering
+\codeagentShot[0.3]{screenshots/cli-refactored-file.png}{Refactored file}\\[2pt]
 \small (b) \texttt{source.dat} after \texttt{refactor}: commas became tabs
 \end{minipage}
 \caption{Files written by the CLI, each only after the user's explicit approval}
 \label{fig:ca-cli-files}
 \end{figure}
 
+% Start on a new page so the heading is followed by its first screenshot.
+\clearpage
 \subsection{Browser GUI}
 
 \begin{figure}[htbp]
@@ -1299,5 +1365,10 @@ and parallel work by both members.
 \let\floatpagefraction\codeagentOldFloatpagefraction
 \setcounter{topnumber}{\codeagentOldTopnumber}
 \setcounter{totalnumber}{\codeagentOldTotalnumber}
+\makeatletter
+\setlength{\@fptop}{\codeagentOldFptop}
+\makeatother
+\setlength{\emergencystretch}{\codeagentOldEmergencystretch}
+\tolerance=\codeagentOldTolerance
 
 \end{document}

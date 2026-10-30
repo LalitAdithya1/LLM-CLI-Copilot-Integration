@@ -1,0 +1,11 @@
+{
+  "htmlLabels": false,
+  "class": { "htmlLabels": false, "useMaxWidth": false },
+  "state": { "useMaxWidth": false },
+  "sequence": {
+    "useMaxWidth": false,
+    "diagramMarginX": 4, "diagramMarginY": 4,
+    "actorMargin": 20, "boxMargin": 6, "messageMargin": 30,
+    "messageFontSize": 20, "actorFontSize": 20, "noteFontSize": 20
+  }
+}
